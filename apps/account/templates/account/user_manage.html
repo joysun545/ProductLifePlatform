@@ -1,0 +1,282 @@
+<!-- apps/account/templates/account/user_manage.html -->
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>用户管理 - 系统管理员</title>
+
+    <style>
+        body{
+            font-family:"Microsoft YaHei",Arial,sans-serif;
+            background:#f5f5f5;
+            margin:0;
+            padding:20px;
+        }
+
+        .card{
+            background:#fff;
+            border-radius:8px;
+            padding:25px;
+            box-shadow:0 2px 8px rgba(0,0,0,.08);
+        }
+
+        .header{
+            display:flex;
+            justify-content:space-between;
+            align-items:center;
+            margin-bottom:20px;
+            flex-wrap:wrap;
+            gap:15px;
+        }
+
+        .search-box{
+            display:flex;
+            gap:10px;
+            align-items:center;
+            flex-wrap:wrap;
+        }
+
+        input,
+        select{
+            padding:8px 12px;
+            border:1px solid #ddd;
+            border-radius:4px;
+            font-size:14px;
+        }
+
+        button{
+            background:#05c46b;
+            color:#fff;
+            border:none;
+            padding:8px 16px;
+            border-radius:4px;
+            cursor:pointer;
+        }
+
+        button:hover{
+            background:#04b25f;
+        }
+
+        table{
+            width:100%;
+            border-collapse:collapse;
+            margin-top:15px;
+        }
+
+        th,
+        td{
+            padding:12px;
+            border-bottom:1px solid #eee;
+            text-align:left;
+            vertical-align:middle;
+        }
+
+        th{
+            background:#f8f9fa;
+            font-weight:600;
+            white-space:nowrap;
+        }
+
+        tr:hover{
+            background:#fafafa;
+        }
+
+        .btn-edit{
+            display:inline-block;
+            background:#007bff;
+            color:#fff;
+            padding:6px 14px;
+            border-radius:4px;
+            text-decoration:none;
+            font-size:14px;
+        }
+
+        .btn-edit:hover{
+            background:#0069d9;
+        }
+
+        .pagination{
+            margin-top:20px;
+            text-align:center;
+        }
+
+        .pagination a{
+            text-decoration:none;
+            color:#007bff;
+            margin:0 10px;
+        }
+
+        .text-center{
+            text-align:center;
+        }
+
+        .text-muted{
+            color:#999;
+        }
+    </style>
+
+</head>
+
+<body>
+
+<div class="card">
+
+    <div class="header">
+
+        <h2>用户管理</h2>
+
+        <form method="get" class="search-box">
+
+            <input
+                    type="text"
+                    name="search"
+                    placeholder="搜索姓名/微信昵称/手机号/OpenID"
+                    value="{{ search }}">
+
+            <select name="role">
+
+                <option value="">全部角色</option>
+
+                {% for value, label in role_choices %}
+                    <option
+                            value="{{ value }}"
+                            {% if role == value %}selected{% endif %}>
+                        {{ label }}
+                    </option>
+                {% endfor %}
+
+            </select>
+
+            <button type="submit">
+                搜索
+            </button>
+
+        </form>
+
+    </div>
+
+    <table>
+
+        <thead>
+
+        <tr>
+
+            <th>姓名</th>
+
+            <th>微信昵称</th>
+
+            <th>手机号</th>
+
+            <th>上级用户</th>
+
+            <th>角色</th>
+
+            <th>所属组织</th>
+
+            <th>注册时间</th>
+
+            <th>操作</th>
+
+        </tr>
+
+        </thead>
+
+        <tbody>
+
+        {% for user in page_obj %}
+
+            <tr>
+
+                <td>
+                    {{ user.name|default:"-" }}
+                </td>
+
+                <td>
+                    {{ user.wx_nickname|default:"-" }}
+                </td>
+
+                <td>
+                    {{ user.phone|default:"-" }}
+                </td>
+
+                <td>
+                    {% if user.parent_user %}
+                        {{ user.parent_user.name|default:user.parent_user.wx_nickname|default:"-" }}
+                    {% else %}
+                        -
+                    {% endif %}
+                </td>
+
+                <td>
+                    {{ user.get_role_display }}
+                </td>
+
+                <td>
+                    {{ user.organization.name|default:"-" }}
+                </td>
+
+                <td>
+                    {{ user.date_joined|date:"Y-m-d H:i" }}
+                </td>
+
+                <td>
+
+                    <a
+                            href="{% url 'pldp:web:account:user_edit' user.pk %}"
+                            class="btn-edit">
+                        编辑
+                    </a>
+
+                </td>
+
+            </tr>
+
+        {% empty %}
+
+            <tr>
+
+                <td colspan="8" class="text-center text-muted">
+
+                    暂无用户数据
+
+                </td>
+
+            </tr>
+
+        {% endfor %}
+
+        </tbody>
+
+    </table>
+
+    <div class="pagination">
+
+        {% if page_obj.has_previous %}
+
+            <a href="?page={{ page_obj.previous_page_number }}&search={{ search }}&role={{ role }}">
+                上一页
+            </a>
+
+        {% endif %}
+
+        <span>
+
+            第 {{ page_obj.number }} / {{ page_obj.paginator.num_pages }} 页
+
+        </span>
+
+        {% if page_obj.has_next %}
+
+            <a href="?page={{ page_obj.next_page_number }}&search={{ search }}&role={{ role }}">
+                下一页
+            </a>
+
+        {% endif %}
+
+    </div>
+
+</div>
+
+</body>
+</html>

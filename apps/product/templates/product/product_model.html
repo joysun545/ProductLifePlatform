@@ -1,0 +1,156 @@
+<!--
+文件路径：
+apps/product/templates/product/product_model.html
+-->
+
+
+<!-- 商品型号 -->
+
+<div id="model" class="panel active">
+
+
+    <!-- 添加/列表切换按钮 -->
+
+    <div class="list-switch">
+
+        <button
+            onclick="showModelForm()"
+            class="switch-btn active"
+            id="modelFormBtn">
+            添加型号
+        </button>
+
+
+        <button
+            onclick="showModelList()"
+            class="switch-btn"
+            id="modelListBtn">
+            型号列表
+        </button>
+
+    </div>
+
+
+
+    <!-- 添加型号区域 -->
+
+    <div id="modelForm">
+
+
+        <div class="form-item">
+
+            <div class="label">
+                型号编码
+            </div>
+
+            <input
+                id="model_code"
+                placeholder="例如 JL-5000">
+
+        </div>
+
+
+
+        <div class="form-item">
+
+            <div class="label">
+                型号名称
+            </div>
+
+            <input
+                id="model_name"
+                placeholder="例如 5000W静音发电机">
+
+        </div>
+
+
+
+        <div class="form-item">
+
+            <div class="label">
+                所属品牌
+            </div>
+
+
+            <select id="model_brand">
+
+                <option>
+                    请选择品牌
+                </option>
+
+            </select>
+
+        </div>
+
+
+
+        <div class="form-item">
+
+            <div class="label">
+                所属品类
+            </div>
+
+
+            <select id="model_category">
+
+                <option>
+                    请选择品类
+                </option>
+
+            </select>
+
+        </div>
+
+
+
+        <div class="form-item">
+
+            <div class="label">
+                规格描述
+            </div>
+
+
+            <textarea id="model_desc"></textarea>
+
+
+        </div>
+
+
+
+        <button
+            onclick="addModel()"
+            id="btn-model">
+
+            添加型号
+
+        </button>
+
+
+    </div>
+
+
+
+    <!-- 型号列表区域 -->
+
+    <div id="modelList"
+         style="display:none;">
+
+
+        <div id="modelListContent">
+
+
+        </div>
+
+
+    </div>
+
+
+
+    <div id="model_result"
+         class="result">
+
+
+    </div>
+
+
+</div>

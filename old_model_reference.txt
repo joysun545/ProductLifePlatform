@@ -1,0 +1,86 @@
+./apps/product/migrations/0001_initial.py:            name='ProductModel',
+./apps/product/migrations/0001_initial.py:            name='BOMItem',
+./apps/product/web/views.py:# from ..forms import ProductModelForm, BrandForm, CategoryForm
+./apps/product/models/product.py:class ProductModel(models.Model):
+./apps/product/models/bom.py:        "product.ProductModel",
+./apps/product/models/bom.py:class BOMItem(models.Model):
+./apps/product/models/__init__.py:from .product import ProductModel
+./apps/product/models/__init__.py:from .bom import BOM, BOMItem
+./apps/product/models/__init__.py:    "ProductModel",
+./apps/product/models/__init__.py:    "BOMItem",
+./apps/product/models/brand.py:    ProductModel.manufacturer
+./apps/product/api/views.py:    ProductModel,
+./apps/product/api/views.py:# Brand <- ProductModel -> Category
+./apps/product/api/views.py:class ProductModelListAPI(APIView):
+./apps/product/api/views.py:        products = ProductModel.objects.all()
+./apps/product/api/views.py:# 品类关系由 ProductModel 建立
+./apps/product/api/views.py:class ProductModelCreateAPI(APIView):
+./apps/product/api/views.py:        if ProductModel.objects.filter(code=code).exists():
+./apps/product/api/views.py:        product = ProductModel.objects.create(
+./apps/product/api/urls.py:        views.ProductModelListAPI.as_view(),
+./apps/product/api/urls.py:        views.ProductModelCreateAPI.as_view(),
+./apps/product/models.py:- 生命周期(ProductLifecycle)
+./apps/product/models.py:class ProductModel(models.Model):
+./apps/product/models.py:        ProductModel,
+./apps/product/models.py:class BOMItem(models.Model):
+./apps/account/migrations/0002_organization_created_at_organization_parent_and_more.py:            name='Supplier',
+./apps/lifecycle/migrations/0001_initial.py:            name='ProductLifecycle',
+./apps/lifecycle/migrations/0004_qrcode_owner_org_handoverevent_transportorder.py:            name='HandoverEvent',
+./apps/lifecycle/migrations/0004_qrcode_owner_org_handoverevent_transportorder.py:            name='TransportOrder',
+./apps/lifecycle/models/device.py:        "product.ProductModel",
+./apps/lifecycle/models/lifecycle.py:模型：ProductLifecycle
+./apps/lifecycle/models/lifecycle.py:class ProductLifecycle(models.Model):
+./apps/lifecycle/models/lifecycle.py:        'product.ProductModel',
+./apps/lifecycle/models/transport.py:模型：TransportOrder
+./apps/lifecycle/models/transport.py:class TransportOrder(models.Model):
+./apps/lifecycle/models/transport.py:        'lifecycle.ProductLifecycle',
+./apps/lifecycle/models/__init__.py:from .lifecycle import ProductLifecycle
+./apps/lifecycle/models/__init__.py:from .handover import HandoverEvent
+./apps/lifecycle/models/__init__.py:from .transport import TransportOrder
+./apps/lifecycle/models/handover.py:模型：HandoverEvent
+./apps/lifecycle/models/handover.py:class HandoverEvent(models.Model):
+./apps/lifecycle/models/handover.py:        'lifecycle.ProductLifecycle',
+./apps/lifecycle/api/views.py:from product.models import ProductModel
+./apps/lifecycle/api/views.py:        product_model = ProductModel.objects.get(
+./apps/lifecycle/services/handover_service.py:from lifecycle.models.handover import HandoverEvent
+./apps/lifecycle/services/handover_service.py:        return HandoverEvent.objects.create(
+./apps/lifecycle/services/lifecycle_service.py:from lifecycle.models.lifecycle import ProductLifecycle
+./apps/lifecycle/services/lifecycle_service.py:        lifecycle = ProductLifecycle.objects.create(
+./apps/lifecycle/services/transport_service.py:from lifecycle.models.transport import TransportOrder
+./apps/lifecycle/services/transport_service.py:        return TransportOrder.objects.create(
+./apps/supply_chain/templates/supply_chain/material_config.html:                <select id="category" onchange="loadProductModels()">
+./apps/supply_chain/templates/supply_chain/material_config.html:            <button onclick="saveSupplier()">保存供应商</button>
+./apps/supply_chain/templates/supply_chain/material_config.html:        async function loadProductModels() {
+./apps/supply_chain/templates/supply_chain/material_config.html:        async function loadSuppliers() {
+./apps/supply_chain/templates/supply_chain/material_config.html:        async function saveSupplier() {
+./apps/supply_chain/templates/supply_chain/material_config.html:                    loadSuppliers();
+./apps/supply_chain/templates/supply_chain/material_config.html:            loadSuppliers();
+./apps/supply_chain/migrations/0001_initial.py:            name='Supplier',
+./apps/supply_chain/web/views.py:from supply_chain.models import Supplier
+./apps/supply_chain/web/views.py:from product.models import ProductCategory, ProductModel
+./apps/supply_chain/web/views.py:        models_qs = ProductModel.objects.filter(category_id=category_id).values('id', 'name', 'code')
+./apps/supply_chain/web/views.py:        models_qs = ProductModel.objects.all().values('id', 'name', 'code')
+./apps/supply_chain/web/views.py:    suppliers = Supplier.objects.filter(is_active=True).values('id', 'name', 'code')
+./apps/supply_chain/web/views.py:            supplier = Supplier.objects.create(
+./apps/supply_chain/models.py:class MaterialSupplier(models.Model):
+./apps/manufacturing/models.py:        "product.ProductModel",
+./apps/sales/models/sales_plan.py:    product_model = models.ForeignKey("product.ProductModel", on_delete=models.PROTECT)
+./apps/sales/models/batch.py:    product_model = models.ForeignKey('product.ProductModel', on_delete=models.PROTECT)
+./apps/print/views.py:from product.models import ProductModel
+./apps/print/views.py:        products = ProductModel.objects.all()
+./pldp/api/views.py:    # TODO: 这里实现具体逻辑（查询 ProductLifecycle 等）
+./scripts/reset_dev_db.py:    ProductLifecycle,
+./scripts/reset_dev_db.py:    HandoverEvent,
+./scripts/reset_dev_db.py:    TransportOrder,
+./scripts/reset_dev_db.py:    BOMItem,
+./scripts/reset_dev_db.py:    ProductModel,
+./scripts/reset_dev_db.py:print("删除 HandoverEvent ...")
+./scripts/reset_dev_db.py:HandoverEvent.objects.all().delete()
+./scripts/reset_dev_db.py:print("删除 TransportOrder ...")
+./scripts/reset_dev_db.py:TransportOrder.objects.all().delete()
+./scripts/reset_dev_db.py:print("删除 ProductLifecycle ...")
+./scripts/reset_dev_db.py:ProductLifecycle.objects.all().delete()
+./scripts/reset_dev_db.py:print("删除 BOMItem ...")
+./scripts/reset_dev_db.py:BOMItem.objects.all().delete()
+./scripts/reset_dev_db.py:print("删除 ProductModel ...")
+./scripts/reset_dev_db.py:ProductModel.objects.all().delete()

@@ -1,0 +1,1046 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ title }}</title>
+    <style>
+        :root {
+            --green: #08c56b;
+            --green-dark: #079a56;
+            --blue: #1976d2;
+            --red: #d93025;
+            --text: #1f2937;
+            --muted: #6b7280;
+            --line: #e5e7eb;
+            --page: #f4f6f8;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            padding: 24px 20px 48px;
+            color: var(--text);
+            background: var(--page);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+            font-size: 14px;
+        }
+        .page-title { margin: 0 0 18px 10px; font-size: 24px; }
+        .card {
+            max-width: 1880px;
+            min-height: 620px;
+            margin: 0 auto;
+            padding: 28px 30px 42px;
+            border-radius: 10px;
+            background: #fff;
+            box-shadow: 0 2px 12px rgba(0, 0, 0, .08);
+        }
+        .tabs { display: flex; border-bottom: 1px solid var(--line); }
+        .tab {
+            min-width: 165px;
+            padding: 17px 26px;
+            cursor: pointer;
+            text-align: center;
+            color: #4b5563;
+            border-bottom: 3px solid transparent;
+        }
+        .tab.active { color: var(--green); border-bottom-color: var(--green); }
+        .panel { display: none; padding-top: 24px; }
+        .panel.active { display: block; }
+        .view-switch { display: flex; gap: 10px; margin-bottom: 22px; }
+        .view-switch button { flex: 1; }
+        button {
+            min-height: 42px;
+            padding: 9px 22px;
+            color: #fff;
+            cursor: pointer;
+            border: 0;
+            border-radius: 4px;
+            background: var(--green);
+            font-size: 14px;
+        }
+        button:hover { background: var(--green-dark); }
+        button:disabled { cursor: not-allowed; opacity: .58; }
+        button.secondary { background: #64748b; }
+        button.blue { background: var(--blue); }
+        button.danger { background: var(--red); }
+        button.small { min-height: 32px; padding: 5px 12px; }
+        .form-item { margin-bottom: 18px; }
+        .label { margin-bottom: 8px; font-weight: 600; }
+        .required::after { content: " *"; color: var(--red); }
+        input[type="text"], textarea, select {
+            width: 100%;
+            min-height: 40px;
+            padding: 9px 12px;
+            color: var(--text);
+            border: 1px solid #cfd5dc;
+            border-radius: 4px;
+            background: #fff;
+            font: inherit;
+        }
+        textarea { min-height: 86px; resize: vertical; }
+        input:disabled, textarea:disabled, select:disabled { color: #6b7280; background: #f3f4f6; }
+        .hint {
+            margin: 0 0 18px;
+            padding: 11px 14px;
+            color: #0f5132;
+            border: 1px solid #badbcc;
+            border-radius: 5px;
+            background: #d1e7dd;
+        }
+        .bom-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+        .plus-btn {
+            width: 44px;
+            min-width: 44px;
+            padding: 0;
+            font-size: 27px;
+            font-weight: 300;
+        }
+        .primary-bom-btn { min-width: 230px; }
+        .bom-editor {
+            display: none;
+            margin: 8px 0 16px;
+            overflow-x: auto;
+            border: 1px solid var(--line);
+            border-radius: 6px;
+        }
+        .bom-editor.visible { display: block; }
+        .bom-caption {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 13px 15px;
+            background: #f8fafc;
+            border-bottom: 1px solid var(--line);
+        }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 11px 10px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: middle; }
+        th { white-space: nowrap; color: #374151; background: #f8fafc; }
+        tr:last-child td { border-bottom: 0; }
+        tr.excluded td { opacity: .56; background: #fafafa; }
+        .material-cell { min-width: 180px; }
+        .material-code { display: block; margin-top: 3px; color: var(--muted); font-size: 12px; }
+        .spec-cell, .supplier-cell { min-width: 230px; }
+        .remark-cell { min-width: 210px; }
+        .delete-cell { min-width: 82px; text-align: center; }
+        .empty { padding: 34px; color: var(--muted); text-align: center; }
+        .message { display: none; margin-top: 14px; padding: 11px 14px; border-radius: 5px; }
+        .message.show { display: block; }
+        .message.success { color: #0f5132; background: #d1e7dd; }
+        .message.error { color: #842029; background: #f8d7da; }
+        .list-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; }
+        .status-tag { display: inline-block; padding: 3px 8px; border-radius: 12px; font-size: 12px; }
+        .status-tag.ok { color: #067647; background: #d1fadf; }
+        .status-tag.none { color: #7a2e0e; background: #ffead5; }
+        .clickable-row { cursor: pointer; }
+        .clickable-row:hover td { background: #f0fdf4; }
+        .list-hint { margin: 0 0 12px; color: var(--muted); }
+        .detail-heading {
+            display: flex;
+            align-items: flex-start;
+            gap: 18px;
+            margin-bottom: 18px;
+            padding: 16px;
+            border: 1px solid var(--line);
+            border-radius: 6px;
+            background: #f8fafc;
+        }
+        .detail-heading h2 { margin: 0 0 7px; font-size: 20px; }
+        .detail-meta { color: var(--muted); line-height: 1.7; }
+        .document-section {
+            margin: 22px 0;
+            padding: 18px;
+            border: 1px solid var(--line);
+            border-radius: 6px;
+            background: #fbfdfc;
+        }
+        .document-section h3 { margin: 0 0 8px; }
+        .document-hint { margin: 0 0 18px; color: var(--muted); }
+        .document-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+        .document-item { padding: 14px; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
+        .document-item textarea { min-height: 180px; line-height: 1.65; }
+        .file-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; color: var(--muted); font-size: 12px; }
+        .file-row input { max-width: 100%; }
+        .file-info { min-height: 20px; margin-top: 6px; color: #246b52; font-size: 12px; overflow-wrap: anywhere; }
+        .file-info.empty { padding: 0; color: var(--muted); text-align: left; }
+        .hidden { display: none !important; }
+        @media (max-width: 720px) {
+            body { padding: 12px 8px 32px; }
+            .card { padding: 18px 12px 30px; }
+            .tab { min-width: 0; flex: 1; padding: 13px 6px; }
+            .bom-actions button:not(.plus-btn) { flex: 1; min-width: 180px; }
+            .document-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="hidden">{% csrf_token %}</div>
+    <h1 class="page-title">产品基础资料管理中心</h1>
+    <main class="card">
+        <nav class="tabs">
+            <div class="tab active" data-panel="model" onclick="switchTab('model', this)">添加商品型号</div>
+            <div class="tab" data-panel="brand" onclick="switchTab('brand', this)">添加品牌</div>
+            <div class="tab" data-panel="category" onclick="switchTab('category', this)">添加品类</div>
+        </nav>
+
+        <section id="model" class="panel active">
+            <div class="view-switch">
+                <button id="modelFormBtn" onclick="showModelForm()">添加型号</button>
+                <button id="modelListBtn" onclick="showModelList()">型号列表</button>
+            </div>
+
+            <div id="modelForm">
+                <p class="hint">商品型号在本页面不绑定品牌。型号与首版物料清单将一次性创建为 v1 版 BOM。</p>
+                <div class="form-item">
+                    <div class="label required">型号编码</div>
+                    <input id="model_code" type="text" placeholder="例如 JL-5000">
+                </div>
+                <div class="form-item">
+                    <div class="label required">型号名称</div>
+                    <input id="model_name" type="text" placeholder="例如 5000W静音发电机">
+                </div>
+                <div class="form-item">
+                    <div class="label required">所属品类</div>
+                    <select id="model_category" onchange="onModelCategoryChanged()">
+                        <option value="">请选择品类</option>
+                    </select>
+                </div>
+                <div class="form-item">
+                    <div class="label required">规格描述</div>
+                    <textarea id="model_desc" placeholder="请输入该产品型号的规格描述"></textarea>
+                </div>
+
+                <div class="document-section">
+                    <h3>用户必读资料</h3>
+                    <p class="document-hint">三篇资料随产品型号保存，支持 .docx、.pdf、UTF-8编码的 .txt 和 .md；也可以直接输入正文。每篇资料最大20MB。</p>
+                    <div class="document-grid">
+                        <div class="document-item">
+                            <div class="label required">使用说明书</div>
+                            <textarea id="document_user_manual" placeholder="请输入该型号的使用说明书"></textarea>
+                            <label class="file-row">选择资料文件<input id="document_file_user_manual" type="file" accept=".docx,.pdf,.txt,.md,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain,text/markdown" onchange="loadDocumentFile(this, 'document_user_manual', 'document_file_name_user_manual')"></label>
+                            <div id="document_file_name_user_manual" class="file-info empty">尚未选择文件</div>
+                        </div>
+                        <div class="document-item">
+                            <div class="label required">日常维护</div>
+                            <textarea id="document_daily_maintenance" placeholder="请输入该型号的日常维护说明"></textarea>
+                            <label class="file-row">选择资料文件<input id="document_file_daily_maintenance" type="file" accept=".docx,.pdf,.txt,.md,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain,text/markdown" onchange="loadDocumentFile(this, 'document_daily_maintenance', 'document_file_name_daily_maintenance')"></label>
+                            <div id="document_file_name_daily_maintenance" class="file-info empty">尚未选择文件</div>
+                        </div>
+                        <div class="document-item">
+                            <div class="label required">自助故障排除指南</div>
+                            <textarea id="document_troubleshooting_guide" placeholder="请输入该型号的自助故障排除指南"></textarea>
+                            <label class="file-row">选择资料文件<input id="document_file_troubleshooting_guide" type="file" accept=".docx,.pdf,.txt,.md,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain,text/markdown" onchange="loadDocumentFile(this, 'document_troubleshooting_guide', 'document_file_name_troubleshooting_guide')"></label>
+                            <div id="document_file_name_troubleshooting_guide" class="file-info empty">尚未选择文件</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="bomEditor" class="bom-editor">
+                    <div class="bom-caption">
+                        <strong id="bomCaptionTitle">v1版BOM清单</strong>
+                        <span id="bomCaptionTip">物料按物料编码排序</span>
+                    </div>
+                    <div id="bomTableContainer"></div>
+                </div>
+
+                <div class="bom-actions">
+                    <button id="bomPlusBtn" class="plus-btn" type="button" title="展开v1版BOM清单" onclick="toggleCreateBomEditor()">+</button>
+                    <button id="modelPrimaryBtn" class="primary-bom-btn" type="button" onclick="createModelWithV1Bom()">确认添加v1版BOM清单</button>
+                </div>
+                <div id="modelMessage" class="message"></div>
+            </div>
+
+            <div id="modelList" class="hidden">
+                <p class="list-hint">最新创建的商品型号显示在最上方；点击任意型号行查看其 v1 版 BOM 清单。</p>
+                <div id="modelListContent"></div>
+                <div id="modelListMessage" class="message"></div>
+            </div>
+
+            <div id="modelBomDetail" class="hidden">
+                <div class="detail-heading">
+                    <button class="secondary small" type="button" onclick="showModelList()">← 返回型号列表</button>
+                    <div>
+                        <h2 id="detailModelTitle">商品型号</h2>
+                        <div id="detailModelMeta" class="detail-meta"></div>
+                    </div>
+                </div>
+                <div id="detailBomEditor" class="bom-editor visible">
+                    <div class="bom-caption">
+                        <strong id="detailBomCaptionTitle">v1版BOM清单</strong>
+                        <span id="detailBomCaptionTip"></span>
+                    </div>
+                    <div id="detailBomTableContainer"></div>
+                </div>
+                <div class="bom-actions">
+                    <button id="detailEditBtn" type="button" onclick="enterDetailBomEditMode()">编辑</button>
+                    <button id="detailSaveBtn" class="hidden" type="button" onclick="saveDetailBom()">保存</button>
+                    <button id="detailDeleteBtn" class="danger hidden" type="button" onclick="deleteDetailBom()">删除v1版BOM清单</button>
+                </div>
+                <div id="detailBomMessage" class="message"></div>
+
+                <div class="document-section">
+                    <h3>型号必读资料</h3>
+                    <p class="document-hint">修改正文或替换文件都会自动提升文档版本；已经阅读旧版本的用户需要重新阅读新版本。</p>
+                    <div class="document-grid">
+                        <div class="document-item">
+                            <div class="label">使用说明书</div>
+                            <textarea id="detail_document_user_manual" disabled></textarea>
+                            <label class="file-row">替换资料文件<input id="detail_file_user_manual" type="file" disabled accept=".docx,.pdf,.txt,.md,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain,text/markdown" onchange="loadDocumentFile(this, 'detail_document_user_manual', 'detail_file_info_user_manual')"></label>
+                            <div id="detail_file_info_user_manual" class="file-info empty">无原始文件</div>
+                        </div>
+                        <div class="document-item">
+                            <div class="label">日常维护</div>
+                            <textarea id="detail_document_daily_maintenance" disabled></textarea>
+                            <label class="file-row">替换资料文件<input id="detail_file_daily_maintenance" type="file" disabled accept=".docx,.pdf,.txt,.md,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain,text/markdown" onchange="loadDocumentFile(this, 'detail_document_daily_maintenance', 'detail_file_info_daily_maintenance')"></label>
+                            <div id="detail_file_info_daily_maintenance" class="file-info empty">无原始文件</div>
+                        </div>
+                        <div class="document-item">
+                            <div class="label">自助故障排除指南</div>
+                            <textarea id="detail_document_troubleshooting_guide" disabled></textarea>
+                            <label class="file-row">替换资料文件<input id="detail_file_troubleshooting_guide" type="file" disabled accept=".docx,.pdf,.txt,.md,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain,text/markdown" onchange="loadDocumentFile(this, 'detail_document_troubleshooting_guide', 'detail_file_info_troubleshooting_guide')"></label>
+                            <div id="detail_file_info_troubleshooting_guide" class="file-info empty">无原始文件</div>
+                        </div>
+                    </div>
+                    <div class="bom-actions" style="margin-top: 14px;">
+                        <button id="detailDocumentEditBtn" type="button" onclick="enterDocumentEditMode()">编辑必读资料</button>
+                        <button id="detailDocumentSaveBtn" class="hidden" type="button" onclick="saveDetailDocuments()">保存必读资料</button>
+                    </div>
+                    <div id="detailDocumentMessage" class="message"></div>
+                </div>
+            </div>
+        </section>
+
+        <section id="brand" class="panel">
+            <div class="view-switch">
+                <button onclick="showBrandForm()">添加品牌</button>
+                <button onclick="showBrandList()">品牌列表</button>
+            </div>
+            <div id="brandForm">
+                <div class="form-item">
+                    <div class="label required">品牌名称</div>
+                    <input id="brand_name" type="text">
+                </div>
+                <div class="form-item">
+                    <div class="label">品牌编码</div>
+                    <input id="brand_code" type="text" placeholder="留空时按品牌名称生成">
+                </div>
+                <button id="btn-brand" onclick="addBrand()">添加品牌</button>
+            </div>
+            <div id="brandList" class="hidden"></div>
+            <div id="brandMessage" class="message"></div>
+        </section>
+
+        <section id="category" class="panel">
+            <div class="view-switch">
+                <button onclick="showCategoryForm()">添加品类</button>
+                <button onclick="showCategoryList()">品类列表</button>
+            </div>
+            <div id="categoryForm">
+                <div class="form-item">
+                    <div class="label required">品类名称</div>
+                    <input id="category_name" type="text">
+                </div>
+                <div class="form-item">
+                    <div class="label">品类编码</div>
+                    <input id="category_code" type="text" placeholder="留空时按品类名称生成">
+                </div>
+                <button id="btn-category" onclick="addCategory()">添加品类</button>
+            </div>
+            <div id="categoryList" class="hidden"></div>
+            <div id="categoryMessage" class="message"></div>
+        </section>
+    </main>
+
+<script>
+const API_ROOT = "/pldp/api/product";
+const modelState = {
+    productId: null,
+    categoryId: null,
+    bomExists: false,
+    tableMode: "hidden",
+    materials: [],
+    bomItems: [],
+    documents: []
+};
+
+function getCookie(name) {
+    const parts = document.cookie ? document.cookie.split(";") : [];
+    for (const part of parts) {
+        const cookie = part.trim();
+        if (cookie.startsWith(name + "=")) {
+            return decodeURIComponent(cookie.slice(name.length + 1));
+        }
+    }
+    return "";
+}
+
+function escapeHtml(value) {
+    return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+}
+
+const DOCUMENT_FIELDS = [
+    { field: "user_manual", type: "USER_MANUAL" },
+    { field: "daily_maintenance", type: "DAILY_MAINTENANCE" },
+    { field: "troubleshooting_guide", type: "TROUBLESHOOTING_GUIDE" }
+];
+
+function loadDocumentFile(input, targetId, infoId) {
+    const file = input.files && input.files[0];
+    if (!file) return;
+    const extension = file.name.includes(".") ? file.name.split(".").pop().toLowerCase() : "";
+    const allowed = ["docx", "pdf", "txt", "md"];
+    const infoNode = document.getElementById(infoId);
+    if (!allowed.includes(extension)) {
+        input.value = "";
+        infoNode.textContent = "只支持 .docx、.pdf、.txt、.md";
+        infoNode.className = "file-info empty";
+        return;
+    }
+    if (file.size > 20 * 1024 * 1024) {
+        input.value = "";
+        infoNode.textContent = "文件不能超过20MB";
+        infoNode.className = "file-info empty";
+        return;
+    }
+    infoNode.textContent = `已选择：${file.name}（${formatFileSize(file.size)}）`;
+    infoNode.className = "file-info";
+    if (!(["txt", "md"].includes(extension))) return;
+
+    const reader = new FileReader();
+    reader.onload = () => {
+        document.getElementById(targetId).value = String(reader.result || "");
+    };
+    reader.onerror = () => setMessage("modelMessage", "文本文件读取失败，请检查文件编码。", false);
+    reader.readAsText(file, "UTF-8");
+}
+
+function formatFileSize(size) {
+    if (!size) return "0KB";
+    if (size < 1024 * 1024) return `${Math.max(1, Math.round(size / 1024))}KB`;
+    return `${(size / 1024 / 1024).toFixed(1)}MB`;
+}
+
+function collectCreateDocuments() {
+    return {
+        user_manual: document.getElementById("document_user_manual").value.trim(),
+        daily_maintenance: document.getElementById("document_daily_maintenance").value.trim(),
+        troubleshooting_guide: document.getElementById("document_troubleshooting_guide").value.trim()
+    };
+}
+
+function documentsComplete(documents, filePrefix, allowExisting = false) {
+    return DOCUMENT_FIELDS.every(({ field, type }) => {
+        const fileInput = document.getElementById(`${filePrefix}${field}`);
+        const selectedFile = fileInput && fileInput.files && fileInput.files[0];
+        const existingFile = allowExisting && modelState.documents.some(item =>
+            item.document_type === type && item.has_file
+        );
+        return Boolean(documents[field] || selectedFile || existingFile);
+    });
+}
+
+function appendDocumentFiles(formData, filePrefix) {
+    DOCUMENT_FIELDS.forEach(({ field }) => {
+        const input = document.getElementById(`${filePrefix}${field}`);
+        const file = input && input.files && input.files[0];
+        if (file) formData.append(`document_${field}`, file, file.name);
+    });
+}
+
+function documentContent(documentType) {
+    const documentItem = modelState.documents.find(item => item.document_type === documentType);
+    return documentItem ? documentItem.content || "" : "";
+}
+
+function fillDetailDocuments() {
+    DOCUMENT_FIELDS.forEach(({ field, type }) => {
+        const documentItem = modelState.documents.find(item => item.document_type === type);
+        document.getElementById(`detail_document_${field}`).value = documentItem ? documentItem.content || "" : "";
+        const fileInput = document.getElementById(`detail_file_${field}`);
+        fileInput.value = "";
+        fileInput.disabled = true;
+        const infoNode = document.getElementById(`detail_file_info_${field}`);
+        if (documentItem && documentItem.has_file) {
+            const fileLabel = `${documentItem.original_filename}（${formatFileSize(documentItem.file_size)}）`;
+            infoNode.innerHTML = documentItem.file_url
+                ? `当前文件：<a href="${escapeHtml(documentItem.file_url)}" target="_blank" rel="noopener">${escapeHtml(fileLabel)}</a>`
+                : `当前文件：${escapeHtml(fileLabel)}`;
+            infoNode.className = "file-info";
+        } else {
+            infoNode.textContent = "无原始文件";
+            infoNode.className = "file-info empty";
+        }
+    });
+    document.querySelectorAll('[id^="detail_document_"]').forEach(node => { node.disabled = true; });
+    document.getElementById("detailDocumentEditBtn").classList.remove("hidden");
+    document.getElementById("detailDocumentSaveBtn").classList.add("hidden");
+    clearMessage("detailDocumentMessage");
+}
+
+async function apiFetch(url, options = {}) {
+    const config = { ...options };
+    config.headers = { ...(options.headers || {}) };
+    if (config.body && !(config.body instanceof FormData)) {
+        config.headers["Content-Type"] = "application/json";
+    }
+    if (config.method && config.method !== "GET") {
+        config.headers["X-CSRFToken"] = getCookie("csrftoken");
+    }
+    const response = await fetch(url, config);
+    let data = {};
+    try { data = await response.json(); } catch (error) { data = {}; }
+    if (!response.ok) {
+        throw new Error(data.error || data.message || `请求失败（${response.status}）`);
+    }
+    return data;
+}
+
+function setMessage(id, text, success = true) {
+    const node = document.getElementById(id);
+    node.textContent = text;
+    node.className = `message show ${success ? "success" : "error"}`;
+}
+
+function clearMessage(id) {
+    const node = document.getElementById(id);
+    node.textContent = "";
+    node.className = "message";
+}
+
+function switchTab(panelId, tabNode) {
+    document.querySelectorAll(".tab").forEach(node => node.classList.remove("active"));
+    document.querySelectorAll(".panel").forEach(node => node.classList.remove("active"));
+    tabNode.classList.add("active");
+    document.getElementById(panelId).classList.add("active");
+}
+
+async function loadModelCategories(selectedId = "") {
+    const categories = await apiFetch(`${API_ROOT}/categories/`);
+    const select = document.getElementById("model_category");
+    select.innerHTML = '<option value="">请选择品类</option>' + categories.map(category =>
+        `<option value="${category.id}" ${String(category.id) === String(selectedId) ? "selected" : ""}>${escapeHtml(category.code)} - ${escapeHtml(category.name)}</option>`
+    ).join("");
+}
+
+function resetModelWorkspace() {
+    modelState.productId = null;
+    modelState.categoryId = null;
+    modelState.bomExists = false;
+    modelState.tableMode = "hidden";
+    modelState.materials = [];
+    modelState.bomItems = [];
+    modelState.documents = [];
+    document.getElementById("model_code").value = "";
+    document.getElementById("model_name").value = "";
+    document.getElementById("model_category").value = "";
+    document.getElementById("model_desc").value = "";
+    document.getElementById("document_user_manual").value = "";
+    document.getElementById("document_daily_maintenance").value = "";
+    document.getElementById("document_troubleshooting_guide").value = "";
+    DOCUMENT_FIELDS.forEach(({ field }) => {
+        const input = document.getElementById(`document_file_${field}`);
+        input.value = "";
+        const infoNode = document.getElementById(`document_file_name_${field}`);
+        infoNode.textContent = "尚未选择文件";
+        infoNode.className = "file-info empty";
+    });
+    document.getElementById("bomEditor").classList.remove("visible");
+    document.getElementById("bomTableContainer").innerHTML = "";
+    document.getElementById("bomPlusBtn").textContent = "+";
+    document.getElementById("modelPrimaryBtn").disabled = false;
+    clearMessage("modelMessage");
+}
+
+function showModelForm() {
+    document.getElementById("modelForm").classList.remove("hidden");
+    document.getElementById("modelList").classList.add("hidden");
+    document.getElementById("modelBomDetail").classList.add("hidden");
+    resetModelWorkspace();
+}
+
+async function showModelList(successMessage = "") {
+    document.getElementById("modelForm").classList.add("hidden");
+    document.getElementById("modelList").classList.remove("hidden");
+    document.getElementById("modelBomDetail").classList.add("hidden");
+    await loadModels();
+    if (successMessage) setMessage("modelListMessage", successMessage);
+}
+
+function onModelCategoryChanged() {
+    modelState.materials = [];
+    modelState.tableMode = "hidden";
+    document.getElementById("bomEditor").classList.remove("visible");
+    document.getElementById("bomTableContainer").innerHTML = "";
+    document.getElementById("bomPlusBtn").textContent = "+";
+    clearMessage("modelMessage");
+}
+
+async function loadBomOptions(categoryId) {
+    const data = await apiFetch(`${API_ROOT}/category/${categoryId}/bom-options/`);
+    modelState.materials = data.materials || [];
+    return data;
+}
+
+async function toggleCreateBomEditor() {
+    clearMessage("modelMessage");
+    if (modelState.tableMode === "create") {
+        modelState.tableMode = "hidden";
+        document.getElementById("bomEditor").classList.remove("visible");
+        document.getElementById("bomPlusBtn").textContent = "+";
+        return;
+    }
+    const categoryId = document.getElementById("model_category").value;
+    if (!categoryId) {
+        setMessage("modelMessage", "请先选择所属品类，再点击“+”生成物料行。", false);
+        return;
+    }
+    try {
+        await loadBomOptions(categoryId);
+        if (!modelState.materials.length) {
+            setMessage("modelMessage", "当前品类还没有关联物料，请先在供应链资料中为物料设置所属产品分类。", false);
+            return;
+        }
+        modelState.tableMode = "create";
+        renderEditableBom("bomTableContainer", [], false);
+        document.getElementById("bomCaptionTitle").textContent = "创建v1版BOM清单";
+        document.getElementById("bomCaptionTip").textContent = "勾选“是否删除”表示该型号不采用此物料";
+        document.getElementById("bomEditor").classList.add("visible");
+        document.getElementById("bomPlusBtn").textContent = "−";
+    } catch (error) {
+        setMessage("modelMessage", error.message, false);
+    }
+}
+
+function buildSpecOptions(material, selectedId) {
+    let html = '<option value="">请选择物料规格</option>';
+    html += material.specs.map(spec =>
+        `<option value="${spec.id}" ${String(spec.id) === String(selectedId) ? "selected" : ""}>${escapeHtml(spec.code)} - ${escapeHtml(spec.name)}</option>`
+    ).join("");
+    return html;
+}
+
+function buildSupplierOptions(material, specId, selectedId) {
+    const spec = material.specs.find(item => String(item.id) === String(specId));
+    const suppliers = spec ? spec.suppliers : [];
+    let html = '<option value="">请选择供应商</option>';
+    html += suppliers.map(supplier =>
+        `<option value="${supplier.id}" ${String(supplier.id) === String(selectedId) ? "selected" : ""}>${escapeHtml(supplier.name)}</option>`
+    ).join("");
+    return html;
+}
+
+function renderEditableBom(containerId, existingItems, excludeMissing) {
+    const existingMap = new Map(existingItems.map(item => [String(item.material_id), item]));
+    const rows = modelState.materials.map(material => {
+        const saved = existingMap.get(String(material.id));
+        const deleted = !saved && excludeMissing;
+        const selectedSpecId = saved ? saved.material_spec_id : "";
+        const selectedSupplierId = saved ? saved.supplier_id : "";
+        const noSpec = material.specs.length === 0;
+        return `
+            <tr data-material-id="${material.id}" class="${deleted ? "excluded" : ""}">
+                <td class="material-cell">
+                    ${escapeHtml(material.name)}
+                    <span class="material-code">${escapeHtml(material.code)}${noSpec ? " · 暂无规格" : ""}</span>
+                </td>
+                <td class="spec-cell">
+                    <select class="spec-select" onchange="onSpecChanged(this)" ${deleted ? "disabled" : ""}>
+                        ${buildSpecOptions(material, selectedSpecId)}
+                    </select>
+                </td>
+                <td class="supplier-cell">
+                    <select class="supplier-select" ${deleted ? "disabled" : ""}>
+                        ${buildSupplierOptions(material, selectedSpecId, selectedSupplierId)}
+                    </select>
+                </td>
+                <td class="remark-cell">
+                    <input class="remark-input" type="text" value="${escapeHtml(saved ? saved.remark : "")}" placeholder="可填写备注" ${deleted ? "disabled" : ""}>
+                </td>
+                <td class="delete-cell">
+                    <input class="delete-check" type="checkbox" ${deleted ? "checked" : ""} onchange="onDeleteChanged(this)" aria-label="从BOM中删除">
+                </td>
+            </tr>`;
+    }).join("");
+
+    document.getElementById(containerId).innerHTML = `
+        <table>
+            <thead><tr><th>物料名称</th><th>物料规格</th><th>供应商</th><th>备注</th><th class="delete-cell">是否删除</th></tr></thead>
+            <tbody>${rows}</tbody>
+        </table>`;
+}
+
+function onSpecChanged(selectNode) {
+    const row = selectNode.closest("tr");
+    const material = modelState.materials.find(item => String(item.id) === row.dataset.materialId);
+    row.querySelector(".supplier-select").innerHTML = buildSupplierOptions(material, selectNode.value, "");
+}
+
+function onDeleteChanged(checkbox) {
+    const row = checkbox.closest("tr");
+    row.classList.toggle("excluded", checkbox.checked);
+    row.querySelectorAll(".spec-select, .supplier-select, .remark-input").forEach(node => {
+        node.disabled = checkbox.checked;
+    });
+}
+
+function collectBomRows(containerId) {
+    return Array.from(document.querySelectorAll(`#${containerId} tbody tr`)).map(row => ({
+        material_id: Number(row.dataset.materialId),
+        material_spec_id: row.querySelector(".spec-select")?.value || null,
+        supplier_id: row.querySelector(".supplier-select")?.value || null,
+        remark: row.querySelector(".remark-input")?.value.trim() || "",
+        is_deleted: Boolean(row.querySelector(".delete-check")?.checked)
+    }));
+}
+
+function validateClientBom(rows) {
+    const kept = rows.filter(row => !row.is_deleted);
+    if (!kept.length) return "v1版BOM清单至少需要保留一项物料";
+    const missing = kept.find(row => !row.material_spec_id || !row.supplier_id);
+    if (missing) {
+        const material = modelState.materials.find(item => item.id === missing.material_id);
+        return `请为“${material ? material.name : "物料"}”选择物料规格和供应商，或勾选删除`;
+    }
+    return "";
+}
+
+async function createModelWithV1Bom() {
+    clearMessage("modelMessage");
+    const code = document.getElementById("model_code").value.trim();
+    const name = document.getElementById("model_name").value.trim();
+    const categoryId = document.getElementById("model_category").value;
+    const description = document.getElementById("model_desc").value.trim();
+    const documents = collectCreateDocuments();
+    if (!code || !name || !categoryId || !description) {
+        setMessage("modelMessage", "请完整填写型号编码、型号名称、所属品类和规格描述。", false);
+        return;
+    }
+    if (!documentsComplete(documents, "document_file_")) {
+        setMessage("modelMessage", "三篇必读资料都必须填写正文或选择资料文件。", false);
+        return;
+    }
+    if (modelState.tableMode !== "create") {
+        setMessage("modelMessage", "请先点击“+”展开并填写v1版BOM清单。", false);
+        return;
+    }
+    const rows = collectBomRows("bomTableContainer");
+    const validationError = validateClientBom(rows);
+    if (validationError) {
+        setMessage("modelMessage", validationError, false);
+        return;
+    }
+
+    const button = document.getElementById("modelPrimaryBtn");
+    button.disabled = true;
+    try {
+        const formData = new FormData();
+        formData.append("code", code);
+        formData.append("name", name);
+        formData.append("category_id", categoryId);
+        formData.append("description", description);
+        formData.append("bom_items", JSON.stringify(rows));
+        formData.append("documents", JSON.stringify(documents));
+        appendDocumentFiles(formData, "document_file_");
+        const data = await apiFetch(`${API_ROOT}/model/add/`, {
+            method: "POST",
+            body: formData
+        });
+        await showModelList(`商品型号“${data.name}”及v1版BOM创建成功，共保存${data.item_count}项物料。`);
+    } catch (error) {
+        setMessage("modelMessage", error.message, false);
+    } finally {
+        button.disabled = false;
+    }
+}
+
+function renderReadonlyBom(items) {
+    const rows = items.map(item => `
+        <tr>
+            <td class="material-cell">${escapeHtml(item.material_name)}<span class="material-code">${escapeHtml(item.material_code)}</span></td>
+            <td>${escapeHtml(item.material_spec_name)}<span class="material-code">${escapeHtml(item.material_spec_code)}</span></td>
+            <td>${escapeHtml(item.supplier_name)}</td>
+            <td>${escapeHtml(item.remark || "-")}</td>
+        </tr>`).join("");
+    document.getElementById("detailBomTableContainer").innerHTML = `
+        <table>
+            <thead><tr><th>物料名称</th><th>物料规格</th><th>供应商</th><th>备注</th></tr></thead>
+            <tbody>${rows || '<tr><td colspan="4" class="empty">暂无BOM明细</td></tr>'}</tbody>
+        </table>`;
+}
+
+async function openModelBomDetail(modelId) {
+    clearMessage("detailBomMessage");
+    try {
+        const data = await apiFetch(`${API_ROOT}/model/${modelId}/bom/v1/`);
+        modelState.productId = data.model.id;
+        modelState.categoryId = data.model.category_id;
+        modelState.bomExists = Boolean(data.bom);
+        modelState.bomItems = data.bom ? data.bom.items : [];
+        modelState.documents = data.documents || [];
+        modelState.materials = [];
+        modelState.tableMode = "detail-view";
+
+        document.getElementById("modelForm").classList.add("hidden");
+        document.getElementById("modelList").classList.add("hidden");
+        document.getElementById("modelBomDetail").classList.remove("hidden");
+        document.getElementById("detailModelTitle").textContent = `${data.model.code} · ${data.model.name}`;
+        document.getElementById("detailModelMeta").innerHTML =
+            `所属品类：${escapeHtml(data.model.category)}<br>规格描述：${escapeHtml(data.model.description || "-")}`;
+
+        document.getElementById("detailBomCaptionTitle").textContent = "v1版BOM清单";
+        document.getElementById("detailBomCaptionTip").textContent = modelState.bomExists
+            ? `共${modelState.bomItems.length}项物料`
+            : "该型号尚未创建v1版BOM清单";
+        if (modelState.bomExists) {
+            renderReadonlyBom(modelState.bomItems);
+        } else {
+            document.getElementById("detailBomTableContainer").innerHTML =
+                '<div class="empty">该商品型号的v1版BOM清单已删除或尚未创建，商品型号本身仍然保留。</div>';
+        }
+        document.getElementById("detailEditBtn").textContent = modelState.bomExists ? "编辑" : "新增v1版BOM清单";
+        document.getElementById("detailEditBtn").classList.remove("hidden");
+        document.getElementById("detailSaveBtn").classList.add("hidden");
+        document.getElementById("detailDeleteBtn").classList.add("hidden");
+        fillDetailDocuments();
+    } catch (error) {
+        setMessage("modelListMessage", error.message, false);
+    }
+}
+
+function enterDocumentEditMode() {
+    clearMessage("detailDocumentMessage");
+    document.querySelectorAll('[id^="detail_document_"]').forEach(node => { node.disabled = false; });
+    document.querySelectorAll('input[id^="detail_file_"]').forEach(node => { node.disabled = false; });
+    document.getElementById("detailDocumentEditBtn").classList.add("hidden");
+    document.getElementById("detailDocumentSaveBtn").classList.remove("hidden");
+}
+
+async function saveDetailDocuments() {
+    const documents = {
+        user_manual: document.getElementById("detail_document_user_manual").value.trim(),
+        daily_maintenance: document.getElementById("detail_document_daily_maintenance").value.trim(),
+        troubleshooting_guide: document.getElementById("detail_document_troubleshooting_guide").value.trim()
+    };
+    if (!documentsComplete(documents, "detail_file_", true)) {
+        setMessage("detailDocumentMessage", "三篇必读资料都必须填写正文或保留/选择资料文件。", false);
+        return;
+    }
+    const button = document.getElementById("detailDocumentSaveBtn");
+    button.disabled = true;
+    try {
+        const formData = new FormData();
+        formData.append("documents", JSON.stringify(documents));
+        appendDocumentFiles(formData, "detail_file_");
+        const data = await apiFetch(`${API_ROOT}/model/${modelState.productId}/documents/`, {
+            method: "PUT",
+            body: formData
+        });
+        modelState.documents = data.documents || [];
+        fillDetailDocuments();
+        setMessage("detailDocumentMessage", data.message || "型号必读资料已保存");
+    } catch (error) {
+        setMessage("detailDocumentMessage", error.message, false);
+    } finally {
+        button.disabled = false;
+    }
+}
+
+async function enterDetailBomEditMode() {
+    clearMessage("detailBomMessage");
+    try {
+        await loadBomOptions(modelState.categoryId);
+        if (!modelState.materials.length) {
+            setMessage("detailBomMessage", "当前品类没有关联物料，无法编辑BOM。", false);
+            return;
+        }
+        renderEditableBom("detailBomTableContainer", modelState.bomItems, true);
+        modelState.tableMode = "detail-edit";
+        document.getElementById("detailBomCaptionTitle").textContent = modelState.bomExists
+            ? "编辑v1版BOM清单"
+            : "新增v1版BOM清单";
+        document.getElementById("detailBomCaptionTip").textContent =
+            "原有物料默认保留；新增出现的物料默认勾选删除，不做操作直接保存时原清单保持不变";
+        document.getElementById("detailEditBtn").classList.add("hidden");
+        document.getElementById("detailSaveBtn").classList.remove("hidden");
+        document.getElementById("detailDeleteBtn").classList.toggle("hidden", !modelState.bomExists);
+    } catch (error) {
+        setMessage("detailBomMessage", error.message, false);
+    }
+}
+
+async function saveDetailBom() {
+    clearMessage("detailBomMessage");
+    const rows = collectBomRows("detailBomTableContainer");
+    const validationError = validateClientBom(rows);
+    if (validationError) {
+        setMessage("detailBomMessage", validationError, false);
+        return;
+    }
+    const button = document.getElementById("detailSaveBtn");
+    button.disabled = true;
+    try {
+        const data = await apiFetch(`${API_ROOT}/model/${modelState.productId}/bom/v1/`, {
+            method: "PUT",
+            body: JSON.stringify({ bom_items: rows })
+        });
+        const productId = modelState.productId;
+        await openModelBomDetail(productId);
+        setMessage("detailBomMessage", `${data.message}，共${data.item_count}项物料。`);
+    } catch (error) {
+        setMessage("detailBomMessage", error.message, false);
+    } finally {
+        button.disabled = false;
+    }
+}
+
+async function deleteDetailBom() {
+    if (!confirm("确定删除整个v1版BOM清单吗？商品型号将保留。")) return;
+    try {
+        const data = await apiFetch(`${API_ROOT}/model/${modelState.productId}/bom/v1/`, { method: "DELETE" });
+        await showModelList(data.message);
+    } catch (error) {
+        setMessage("detailBomMessage", error.message, false);
+    }
+}
+
+async function loadModels() {
+    const container = document.getElementById("modelListContent");
+    clearMessage("modelListMessage");
+    container.innerHTML = '<div class="empty">正在加载...</div>';
+    try {
+        const products = await apiFetch(`${API_ROOT}/models/`);
+        if (!products.length) {
+            container.innerHTML = '<div class="empty">暂无商品型号</div>';
+            return;
+        }
+        container.innerHTML = `<div class="list-wrap"><table>
+            <thead><tr><th>型号编码</th><th>型号名称</th><th>所属品类</th><th>规格描述</th><th>v1 BOM</th><th>用户资料</th></tr></thead>
+            <tbody>${products.map(product => `
+                <tr class="clickable-row" onclick="openModelBomDetail(${product.id})" title="点击查看v1版BOM清单">
+                    <td>${escapeHtml(product.code)}</td>
+                    <td>${escapeHtml(product.name)}</td>
+                    <td>${escapeHtml(product.category)}</td>
+                    <td>${escapeHtml(product.description || "-")}</td>
+                    <td><span class="status-tag ${product.has_v1_bom ? "ok" : "none"}">${product.has_v1_bom ? "已创建" : "未创建"}</span></td>
+                    <td><span class="status-tag ${product.documents_complete ? "ok" : "none"}">${product.documents_complete ? "三篇完整" : `${product.document_count || 0}/3`}</span></td>
+                </tr>`).join("")}</tbody>
+        </table></div>`;
+    } catch (error) {
+        container.innerHTML = "";
+        setMessage("modelListMessage", error.message, false);
+    }
+}
+
+function showBrandForm() {
+    document.getElementById("brandForm").classList.remove("hidden");
+    document.getElementById("brandList").classList.add("hidden");
+    clearMessage("brandMessage");
+}
+
+async function showBrandList() {
+    document.getElementById("brandForm").classList.add("hidden");
+    document.getElementById("brandList").classList.remove("hidden");
+    await loadBrands();
+}
+
+async function addBrand() {
+    const button = document.getElementById("btn-brand");
+    button.disabled = true;
+    try {
+        const data = await apiFetch(`${API_ROOT}/brand/add/`, {
+            method: "POST",
+            body: JSON.stringify({
+                name: document.getElementById("brand_name").value.trim(),
+                code: document.getElementById("brand_code").value.trim()
+            })
+        });
+        document.getElementById("brand_name").value = "";
+        document.getElementById("brand_code").value = "";
+        setMessage("brandMessage", `品牌添加成功：${data.name}`);
+    } catch (error) {
+        setMessage("brandMessage", error.message, false);
+    } finally { button.disabled = false; }
+}
+
+async function loadBrands() {
+    const container = document.getElementById("brandList");
+    try {
+        const brands = await apiFetch(`${API_ROOT}/brands/`);
+        container.innerHTML = brands.length ? `<div class="list-wrap"><table>
+            <thead><tr><th>品牌编码</th><th>品牌名称</th><th>操作</th></tr></thead>
+            <tbody>${brands.map(brand => `<tr><td>${escapeHtml(brand.code)}</td><td>${escapeHtml(brand.name)}</td><td><button class="small danger" onclick="deleteBrand(${brand.id})">删除</button></td></tr>`).join("")}</tbody>
+        </table></div>` : '<div class="empty">暂无品牌</div>';
+    } catch (error) { setMessage("brandMessage", error.message, false); }
+}
+
+async function deleteBrand(id) {
+    if (!confirm("确定删除该品牌吗？")) return;
+    try {
+        await apiFetch(`${API_ROOT}/brand/delete/`, { method: "POST", body: JSON.stringify({ id }) });
+        await loadBrands();
+    } catch (error) { setMessage("brandMessage", error.message, false); }
+}
+
+function showCategoryForm() {
+    document.getElementById("categoryForm").classList.remove("hidden");
+    document.getElementById("categoryList").classList.add("hidden");
+    clearMessage("categoryMessage");
+}
+
+async function showCategoryList() {
+    document.getElementById("categoryForm").classList.add("hidden");
+    document.getElementById("categoryList").classList.remove("hidden");
+    await loadCategories();
+}
+
+async function addCategory() {
+    const button = document.getElementById("btn-category");
+    button.disabled = true;
+    try {
+        const data = await apiFetch(`${API_ROOT}/category/add/`, {
+            method: "POST",
+            body: JSON.stringify({
+                name: document.getElementById("category_name").value.trim(),
+                code: document.getElementById("category_code").value.trim()
+            })
+        });
+        document.getElementById("category_name").value = "";
+        document.getElementById("category_code").value = "";
+        await loadModelCategories();
+        setMessage("categoryMessage", `品类添加成功：${data.name}`);
+    } catch (error) {
+        setMessage("categoryMessage", error.message, false);
+    } finally { button.disabled = false; }
+}
+
+async function loadCategories() {
+    const container = document.getElementById("categoryList");
+    try {
+        const categories = await apiFetch(`${API_ROOT}/categories/`);
+        container.innerHTML = categories.length ? `<div class="list-wrap"><table>
+            <thead><tr><th>品类编码</th><th>品类名称</th><th>操作</th></tr></thead>
+            <tbody>${categories.map(category => `<tr><td>${escapeHtml(category.code)}</td><td>${escapeHtml(category.name)}</td><td><button class="small danger" onclick="deleteCategory(${category.id})">删除</button></td></tr>`).join("")}</tbody>
+        </table></div>` : '<div class="empty">暂无品类</div>';
+    } catch (error) { setMessage("categoryMessage", error.message, false); }
+}
+
+async function deleteCategory(id) {
+    if (!confirm("确定删除该品类吗？")) return;
+    try {
+        await apiFetch(`${API_ROOT}/category/delete/`, { method: "POST", body: JSON.stringify({ id }) });
+        await loadCategories();
+        await loadModelCategories();
+    } catch (error) { setMessage("categoryMessage", error.message, false); }
+}
+
+window.addEventListener("DOMContentLoaded", async () => {
+    try { await loadModelCategories(); }
+    catch (error) { setMessage("modelMessage", error.message, false); }
+});
+</script>
+</body>
+</html>

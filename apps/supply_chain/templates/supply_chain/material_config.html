@@ -1,0 +1,4676 @@
+<!-- apps/supply_chain/templates/supply_chain/material_config.html -->
+
+
+{% load static %}
+
+
+<!DOCTYPE html>
+
+<html lang="zh-CN">
+
+
+<head>
+
+
+<meta charset="UTF-8">
+
+
+<title>
+物料基础资料管理中心
+</title>
+
+
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+
+
+<style>
+
+
+*{
+
+    box-sizing:border-box;
+
+}
+
+
+
+body{
+
+    margin:0;
+
+    padding:20px;
+
+    background:#f5f6fa;
+
+    font-family:
+    "Microsoft YaHei",
+    Arial,
+    sans-serif;
+
+    color:#333;
+
+}
+
+
+
+.container{
+
+    width:100%;
+
+    max-width:1200px;
+
+    margin:auto;
+
+    background:white;
+
+    border-radius:12px;
+
+    padding:25px;
+
+    box-shadow:
+    0 2px 12px rgba(0,0,0,.08);
+
+}
+
+
+
+.title{
+
+    font-size:26px;
+
+    font-weight:bold;
+
+    margin-bottom:25px;
+
+}
+
+
+
+.tabs{
+
+    display:flex;
+
+    gap:12px;
+
+    margin-bottom:20px;
+
+}
+
+
+
+.tab{
+
+    padding:10px 25px;
+
+    border-radius:8px;
+
+    background:#eee;
+
+    cursor:pointer;
+
+    font-size:15px;
+
+}
+
+
+
+.tab.active{
+
+    background:#00c875;
+
+    color:white;
+
+}
+
+
+
+
+.panel{
+
+    display:none;
+
+}
+
+
+
+.panel.active{
+
+    display:block;
+
+}
+
+
+
+
+.form-item{
+
+    display:flex;
+
+    align-items:center;
+
+    margin-bottom:15px;
+
+}
+
+
+
+.label{
+
+    width:120px;
+
+    font-weight:bold;
+
+}
+
+
+
+input,
+textarea,
+select{
+
+
+    flex:1;
+
+    padding:10px;
+
+    border:1px solid #ddd;
+
+    border-radius:6px;
+
+    font-size:14px;
+
+}
+
+
+.material-code-field{
+
+    flex:1;
+
+}
+
+
+.material-code-row{
+
+    display:flex;
+
+    align-items:stretch;
+
+}
+
+
+.material-code-prefix{
+
+    display:flex;
+
+    align-items:center;
+
+    padding:0 12px;
+
+    border:1px solid #cbd5e1;
+
+    border-right:none;
+
+    border-radius:6px 0 0 6px;
+
+    background:#eef4ff;
+
+    color:#1e5aa8;
+
+    font-weight:bold;
+
+    white-space:nowrap;
+
+}
+
+
+.material-code-row input{
+
+    min-width:0;
+
+    border-radius:0 6px 6px 0;
+
+}
+
+
+.material-code-preview{
+
+    margin-top:6px;
+
+    color:#667085;
+
+    font-size:13px;
+
+}
+
+
+
+textarea{
+
+    height:90px;
+
+    resize:none;
+
+}
+
+
+
+.checkbox{
+
+    width:auto;
+
+    flex:none;
+
+}
+
+
+
+button{
+
+
+    padding:10px 28px;
+
+    border:none;
+
+    border-radius:8px;
+
+    cursor:pointer;
+
+    background:#00c875;
+
+    color:white;
+
+    font-size:15px;
+
+}
+
+
+
+button:hover{
+
+    opacity:.9;
+
+}
+
+
+
+.message{
+
+    margin-top:15px;
+
+    padding:10px;
+
+    border-radius:6px;
+
+    display:none;
+
+}
+
+
+
+.message.success{
+
+    background:#e8fff3;
+
+    color:#00a65a;
+
+}
+
+
+
+.message.error{
+
+    background:#ffecec;
+
+    color:#d63031;
+
+}
+
+
+
+
+.list-title{
+
+
+    margin-top:30px;
+
+    font-size:18px;
+
+    font-weight:bold;
+
+    border-bottom:1px solid #eee;
+
+    padding-bottom:10px;
+
+
+}
+
+
+
+
+.list-item{
+
+
+    display:flex;
+
+    justify-content:space-between;
+
+    align-items:center;
+
+    padding:12px;
+
+    border-bottom:1px solid #eee;
+
+}
+
+
+
+.list-content{
+
+    line-height:26px;
+
+}
+
+
+
+.delete-btn{
+
+
+    background:#ff5b5b;
+
+    padding:6px 15px;
+
+    font-size:13px;
+
+}
+
+
+
+.sub-item{
+
+
+    margin-left:25px;
+
+    margin-top:8px;
+
+    padding:10px;
+
+    background:#f7f7f7;
+
+    border-radius:6px;
+
+}
+
+
+
+.small{
+
+    color:#666;
+
+    font-size:13px;
+
+}
+
+
+
+
+.json-input{
+
+    font-family:
+    Consolas,
+    monospace;
+
+}
+
+
+/* ==========================
+   二级操作按钮
+========================== */
+
+.sub-action-bar {
+
+    display: flex;
+
+    gap: 10px;
+
+    margin-bottom: 24px;
+
+}
+
+
+.sub-action-btn {
+
+    flex: 1;
+
+    height: 46px;
+
+    border: none;
+
+    border-radius: 4px;
+
+    background: #00c875;
+
+    color: #ffffff;
+
+    font-size: 16px;
+
+    cursor: pointer;
+
+}
+
+
+.sub-action-btn.active {
+
+    background: #00b96b;
+
+}
+
+
+/* ==========================
+   列表区域
+========================== */
+
+.data-list {
+
+    width: 100%;
+
+}
+
+
+.data-list-item {
+
+    min-height: 68px;
+
+    display: flex;
+
+    align-items: center;
+
+    justify-content: space-between;
+
+    gap: 20px;
+
+    border-bottom: 1px solid #eeeeee;
+
+}
+
+
+.data-list-main {
+
+    flex: 1;
+
+    line-height: 1.8;
+
+}
+
+
+.data-list-sub {
+
+    color: #888888;
+
+    font-size: 14px;
+
+}
+
+
+.data-delete-btn {
+
+    flex: 0 0 auto;
+
+    padding: 12px 24px;
+
+    border: none;
+
+    border-radius: 4px;
+
+    background: #ff5b61;
+
+    color: #ffffff;
+
+    cursor: pointer;
+
+}
+
+
+/* ==========================
+   二级按钮
+========================== */
+
+
+.sub-action-bar {
+
+    display:flex;
+
+    gap:10px;
+
+    margin-bottom:25px;
+
+}
+
+
+
+.sub-action-btn {
+
+
+    flex:1;
+
+    height:46px;
+
+    border:none;
+
+    border-radius:5px;
+
+    background:#00c875;
+
+    color:white;
+
+    font-size:16px;
+
+    cursor:pointer;
+
+
+}
+
+
+
+.sub-action-btn.active {
+
+
+    background:#00a85a;
+
+
+}
+
+
+
+
+
+/* ==========================
+   列表
+========================== */
+
+
+.data-list-item {
+
+
+    display:flex;
+
+    justify-content:space-between;
+
+    align-items:center;
+
+    padding:18px 10px;
+
+    border-bottom:1px solid #eee;
+
+
+}
+
+
+
+.data-list-main {
+
+
+    line-height:1.8;
+
+
+}
+
+
+
+.data-list-title {
+
+
+    font-size:16px;
+
+    font-weight:bold;
+
+
+}
+
+
+
+.data-list-sub {
+
+
+    color:#888;
+
+    font-size:14px;
+
+
+}
+
+
+
+.data-delete-btn {
+
+
+    background:#ff5b61;
+
+    color:white;
+
+    border:none;
+
+    padding:8px 20px;
+
+    border-radius:5px;
+
+
+}
+
+
+.data-list-item {
+
+    display:flex;
+
+    justify-content:space-between;
+
+    align-items:center;
+
+    padding:18px 10px;
+
+    border-bottom:1px solid #eeeeee;
+
+}
+
+
+.data-list-main {
+
+    line-height:1.8;
+
+}
+
+
+.data-list-title {
+
+    font-size:16px;
+
+    font-weight:bold;
+
+}
+
+
+.data-list-sub {
+
+    color:#888;
+
+    font-size:14px;
+
+}
+
+
+.data-delete-btn {
+
+    background:#ff5b61;
+
+    color:white;
+
+    border:none;
+
+    padding:8px 20px;
+
+    border-radius:5px;
+
+}
+
+
+</style>
+
+
+</head>
+
+
+
+<body>
+
+
+{% csrf_token %}
+
+
+<div class="container">
+
+
+
+<div class="title">
+
+物料基础资料管理中心
+
+</div>
+
+
+
+
+<div class="tabs">
+
+
+<div class="tab active"
+onclick="switchTab('material',this)">
+
+添加物料
+
+</div>
+
+
+
+<div class="tab"
+onclick="switchTab('spec',this)">
+
+物料规格
+
+</div>
+
+
+
+<div class="tab"
+onclick="switchTab('supplier',this)">
+
+供应关系
+
+</div>
+
+
+
+</div>
+
+
+
+
+
+<!-- ==========================
+     添加物料
+========================== -->
+
+
+<div id="material"
+class="panel active">
+
+
+    <!-- ==========================
+         添加 / 列表切换
+    ========================== -->
+
+    <div class="sub-action-bar">
+
+        <button
+            id="materialFormBtn"
+            class="sub-action-btn active"
+            type="button"
+            onclick="showMaterialForm()"
+        >
+            添加物料
+        </button>
+
+
+        <button
+            id="materialListBtn"
+            class="sub-action-btn"
+            type="button"
+            onclick="showMaterialList()"
+        >
+            物料列表
+        </button>
+
+    </div>
+
+
+
+    <!-- ==========================
+         添加物料表单
+    ========================== -->
+
+    <div id="materialFormPanel">
+
+
+        <div class="form-item">
+
+            <div class="label">
+
+                物料编码
+
+            </div>
+
+
+            <div class="material-code-field">
+
+                <div class="material-code-row">
+
+                    <span
+                        id="material_code_prefix"
+                        class="material-code-prefix"
+                    >
+                        品类编码-
+                    </span>
+
+                    <input
+                        id="material_code"
+                        placeholder="例如 CTRL（只输入品类内编码）"
+                        oninput="updateMaterialCodePreview()"
+                        onblur="normalizeMaterialCodeInput()"
+                    >
+
+                </div>
+
+                <div
+                    id="material_code_preview"
+                    class="material-code-preview"
+                >
+                    请先选择所属产品分类
+                </div>
+
+            </div>
+
+        </div>
+
+
+
+
+        <div class="form-item">
+
+            <div class="label">
+
+                物料名称
+
+            </div>
+
+
+            <input
+                id="material_name"
+                placeholder="例如 控制器"
+            >
+
+            <div class="form-item">
+
+
+            <div class="label">
+
+            所属产品分类
+
+            </div>
+
+
+            <select
+                id="material_category"
+                onchange="updateMaterialCodePreview()"
+            >
+
+            <option value="">
+
+                请选择产品分类
+
+            </option>
+
+
+            </select>
+
+
+            </div>
+        </div>
+
+
+
+
+        <div class="form-item">
+
+            <div class="label">
+
+                是否关键件
+
+            </div>
+
+
+            <input
+                class="checkbox"
+                type="checkbox"
+                id="material_key"
+            >
+
+        </div>
+
+
+
+
+        <div class="form-item">
+
+            <div class="label">
+
+                描述
+
+            </div>
+
+
+            <textarea
+                id="material_description"
+            ></textarea>
+
+        </div>
+
+
+
+        <button
+            type="button"
+            onclick="addMaterial()"
+        >
+            保存物料
+        </button>
+
+
+    </div>
+
+
+
+    <!-- ==========================
+         物料列表
+    ========================== -->
+
+    <div
+        id="materialListPanel"
+        style="display:none;"
+    >
+
+        <div class="search-box">
+
+
+        <div class="form-item">
+
+        <div class="label">
+        产品分类
+        </div>
+
+
+        <select
+        id="material_filter_category"
+        onchange="materialCategoryChange()">
+
+        <option value="">
+        全部产品分类
+        </option>
+
+
+        </select>
+
+
+        </div>
+
+
+
+        <div class="form-item">
+
+        <div class="label">
+        关键词
+        </div>
+
+
+        <input
+        id="material_filter_keyword"
+        placeholder="编码/名称">
+
+
+        </div>
+
+
+
+        <button
+        onclick="searchMaterialList()">
+
+        查询
+
+        </button>
+
+
+        </div>
+
+
+
+        <div
+        id="material_list"
+        class="data-list">
+
+        </div>
+
+    </div>
+
+
+</div>
+
+
+
+
+<!-- ==========================
+     物料规格
+========================== -->
+
+
+<div id="spec"
+class="panel">
+
+
+
+    <!-- ==========================
+         添加 / 列表切换
+    ========================== -->
+
+
+    <div class="sub-action-bar">
+
+
+        <button
+            id="specFormBtn"
+            class="sub-action-btn active"
+            type="button"
+            onclick="showSpecForm()"
+        >
+
+            添加规格
+
+        </button>
+
+
+
+        <button
+            id="specListBtn"
+            class="sub-action-btn"
+            type="button"
+            onclick="showSpecList()"
+        >
+
+            规格列表
+
+        </button>
+
+
+    </div>
+
+
+
+
+    <!-- ==========================
+         添加规格表单
+    ========================== -->
+
+
+    <div
+        id="specFormPanel"
+    >
+
+
+
+        <div class="form-item">
+
+
+            <div class="label">
+
+                所属物料
+
+            </div>
+
+
+            <select
+                id="spec_material"
+            >
+
+                <option>
+
+                    请选择物料
+
+                </option>
+
+
+            </select>
+
+
+        </div>
+
+
+
+
+
+        <div class="form-item">
+
+
+            <div class="label">
+
+                规格编码
+
+            </div>
+
+
+            <input
+                id="spec_code"
+                placeholder="例如 CTRL-BT-H"
+            >
+
+
+        </div>
+
+
+
+
+
+        <div class="form-item">
+
+
+            <div class="label">
+
+                规格名称
+
+            </div>
+
+
+            <input
+                id="spec_name"
+                placeholder="例如 蓝牙高性能版"
+            >
+
+
+        </div>
+
+
+
+
+
+        <div class="form-item">
+
+
+            <div class="label">
+
+                性能描述
+
+            </div>
+
+
+            <input
+                id="spec_performance"
+                placeholder="支持蓝牙遥控、CAN通讯、大电流输出"
+            >
+
+
+        </div>
+
+
+
+
+
+        <div class="form-item">
+
+
+            <div class="label">
+
+                规格参数
+
+            </div>
+
+
+            <textarea
+
+                id="spec_parameters"
+
+                class="json-input"
+
+                placeholder='例如 {"voltage":"24V","current":"120A"}'
+
+            ></textarea>
+
+
+        </div>
+
+
+
+
+
+        <div class="form-item">
+
+
+            <div class="label">
+
+                规格说明
+
+            </div>
+
+
+            <textarea
+                id="spec_description"
+            ></textarea>
+
+
+        </div>
+
+
+
+
+
+        <button
+
+            type="button"
+
+            onclick="addSpec()"
+
+        >
+
+            保存规格
+
+        </button>
+
+
+
+    </div>
+
+
+
+
+
+    <!-- ==========================
+         规格列表
+    ========================== -->
+
+
+    
+<div
+
+        id="specListPanel"
+
+        style="display:none;"
+
+    >
+
+
+<!-- ==========================
+     规格筛选区域
+========================== -->
+
+
+<div class="search-box">
+
+
+<div class="form-item">
+
+<div class="label">
+产品分类
+</div>
+
+
+<select
+id="spec_filter_category"
+onchange="specCategoryChange()"
+>
+
+<option value="">
+全部产品分类
+</option>
+
+
+</select>
+
+</div>
+
+
+
+
+<div class="form-item">
+
+<div class="label">
+物料名称
+</div>
+
+
+<select
+id="spec_filter_material"
+onchange="specMaterialChange()"
+>
+
+<option value="">
+全部物料
+</option>
+
+
+</select>
+
+</div>
+
+
+
+
+<div class="form-item">
+
+<div class="label">
+关键词
+</div>
+
+
+<input
+id="spec_filter_keyword"
+placeholder="规格编码/规格名称"
+>
+
+</div>
+
+
+
+<button
+type="button"
+onclick="searchSpecList()"
+>
+
+查询
+
+</button>
+
+
+</div>
+
+
+
+
+
+        <div
+
+            id="spec_list"
+
+            class="data-list"
+
+        >
+
+
+        </div>
+
+
+
+    </div>
+
+
+
+
+</div>
+
+
+
+
+<!-- ==========================
+     供应关系
+========================== -->
+
+
+<div id="supplier"
+class="panel">
+
+
+
+    <!-- ==========================
+         添加 / 列表切换
+    ========================== -->
+
+
+    <div class="sub-action-bar">
+
+
+        <button
+            id="supplierFormBtn"
+            class="sub-action-btn active"
+            type="button"
+            onclick="showSupplierForm()"
+        >
+
+            添加供应关系
+
+        </button>
+
+
+
+        <button
+            id="supplierListBtn"
+            class="sub-action-btn"
+            type="button"
+            onclick="showSupplierList()"
+        >
+
+            供应关系列表
+
+        </button>
+
+
+    </div>
+
+
+
+
+
+    <!-- ==========================
+         添加供应关系表单
+    ========================== -->
+
+
+    <div
+        id="supplierFormPanel"
+    >
+
+
+
+
+        <div class="form-item">
+
+
+            <div class="label">
+
+                物料规格
+
+            </div>
+
+
+
+            <select
+                id="supplier_spec"
+            >
+
+
+                <option>
+
+                    请选择规格
+
+                </option>
+
+
+            </select>
+
+
+
+        </div>
+
+
+
+
+
+        <div class="form-item">
+
+
+            <div class="label">
+
+                供应商
+
+            </div>
+
+
+
+            <select
+                id="supplier_company"
+            >
+
+
+                <option>
+
+                    请选择供应商
+
+                </option>
+
+
+            </select>
+
+
+
+        </div>
+
+
+
+
+
+        <div class="form-item">
+
+
+            <div class="label">
+
+                供应商质保(月)
+
+            </div>
+
+
+
+            <input
+
+                id="supplier_warranty"
+
+                type="number"
+
+                value="12"
+
+            >
+
+
+
+        </div>
+
+
+
+
+
+        <div class="form-item">
+
+
+            <div class="label">
+
+                参考价格
+
+            </div>
+
+
+
+            <input
+
+                id="supplier_price"
+
+                type="number"
+
+                step="0.01"
+
+            >
+
+
+
+        </div>
+
+
+
+
+
+        <div class="form-item">
+
+
+            <div class="label">
+
+                备注
+
+            </div>
+
+
+
+            <textarea
+
+                id="supplier_remark"
+
+            ></textarea>
+
+
+
+        </div>
+
+
+
+
+
+        <button
+
+            type="button"
+
+            onclick="addSupplierRelation()"
+
+        >
+
+            保存供应关系
+
+        </button>
+
+
+
+
+    </div>
+
+
+
+
+
+
+    <!-- ==========================
+         供应关系列表
+    ========================== -->
+
+
+    <div
+
+        id="supplierListPanel"
+
+        style="display:none;"
+
+    >
+
+
+
+        <!-- ==========================
+             供应关系筛选区域
+        ========================== -->
+
+
+        <div class="search-box">
+
+
+            <div class="form-item">
+
+                <div class="label">
+                产品分类
+                </div>
+
+
+                <select
+                id="supplier_filter_category"
+                onchange="supplierCategoryChange()"
+                >
+
+                <option value="">
+                全部产品分类
+                </option>
+
+                </select>
+
+
+            </div>
+
+
+
+            <div class="form-item">
+
+                <div class="label">
+                供应商
+                </div>
+
+
+                <select
+                id="supplier_filter_supplier"
+                
+                onchange="supplierFilterChange()">
+
+                <option value="">
+                全部供应商
+                </option>
+
+                </select>
+
+
+            </div>
+
+
+
+            <div class="form-item">
+
+                <div class="label">
+                关键词
+                </div>
+
+
+                <input
+                id="supplier_filter_keyword"
+                placeholder="物料/规格/供应商"
+                >
+
+            </div>
+
+
+
+            <button
+            type="button"
+            onclick="searchSupplierList()"
+            >
+
+            查询
+
+            </button>
+
+
+        </div>
+
+
+        <div
+
+            id="supplier_list"
+
+            class="data-list"
+
+        >
+
+
+        </div>
+
+
+
+    </div>
+
+
+
+
+
+</div>
+
+
+
+
+<div
+
+id="message"
+
+class="message"
+
+>
+
+</div>
+
+
+
+
+
+<script>
+
+
+// ==========================
+// 全局
+// ==========================
+
+
+let materials = [];
+
+let specs = [];
+
+let suppliers = [];
+
+
+
+
+
+// ==========================
+// 页面初始化
+// ==========================
+
+
+window.onload = function(){
+
+
+    loadMaterials();
+
+    loadMaterialSpecs();
+
+    loadSuppliers();
+
+    loadMaterialList();
+
+    loadSpecList();
+
+    loadSupplierList();
+
+    loadProductCategories();
+
+};
+        
+
+
+function getCookie(name){
+
+    let cookieValue = null;
+
+    if(document.cookie){
+
+        document.cookie.split(';').forEach(function(cookie){
+
+            cookie = cookie.trim();
+
+            if(cookie.startsWith(name + '=')){
+
+                cookieValue = decodeURIComponent(
+                    cookie.substring(name.length + 1)
+                );
+
+            }
+
+        });
+
+    }
+
+    return cookieValue;
+}
+// ==========================
+
+
+// ==========================
+// TAB切换时恢复初始筛选状态
+// ==========================
+
+
+function resetMaterialFilter(){
+
+
+    document.getElementById(
+        "material_filter_category"
+    ).value="";
+
+
+    document.getElementById(
+        "material_filter_keyword"
+    ).value="";
+
+
+    searchMaterialList();
+
+
+}
+
+
+
+function resetSpecFilter(){
+
+
+    document.getElementById(
+        "spec_filter_category"
+    ).value="";
+
+
+    document.getElementById(
+        "spec_filter_material"
+    ).value="";
+
+
+    document.getElementById(
+        "spec_filter_keyword"
+    ).value="";
+
+
+    loadSpecMaterials();
+
+    loadSpecList();
+
+
+}
+
+
+
+function resetSupplierFilter(){
+
+
+    document.getElementById(
+        "supplier_filter_category"
+    ).value="";
+
+
+    document.getElementById(
+        "supplier_filter_supplier"
+    ).value="";
+
+
+    document.getElementById(
+        "supplier_filter_keyword"
+    ).value="";
+
+
+    loadSupplierFilterSuppliers();
+
+    loadSupplierList();
+
+
+}
+
+
+// TAB切换
+// ==========================
+
+
+function switchTab(id,obj){
+
+
+    document
+    .querySelectorAll(".tab")
+    .forEach(
+        item=>{
+            item.classList.remove("active");
+        }
+    );
+
+
+    obj.classList.add("active");
+
+
+
+    document
+    .querySelectorAll(".panel")
+    .forEach(
+        item=>{
+            item.classList.remove("active");
+        }
+    );
+
+
+
+    document
+    .getElementById(id)
+    .classList.add("active");
+
+
+    // 切换TAB时恢复初始筛选状态
+
+    if(id=="material"){
+
+        resetMaterialFilter();
+
+    }
+
+
+    if(id=="spec"){
+
+        resetSpecFilter();
+
+    }
+
+
+    if(id=="supplier"){
+
+        resetSupplierFilter();
+
+    }
+
+
+    // 切换主TAB时，默认回到添加页面
+
+    if(id=="material"){
+
+        showMaterialForm();
+
+    }
+
+
+    if(id=="spec"){
+
+        showSpecForm();
+
+    }
+
+
+    if(id=="supplier"){
+
+        showSupplierForm();
+
+    }
+
+
+
+    if(id=="spec"){
+
+        loadMaterials();
+
+        loadSpecList();
+
+    }
+
+
+
+    if(id=="supplier"){
+
+        loadMaterialSpecs();
+
+        loadSuppliers();
+
+        loadSupplierList();
+
+    }
+
+
+}
+
+
+
+
+
+
+// ==========================
+// 消息提示
+// ==========================
+
+
+function showMessage(msg,success=true){
+
+
+    let box =
+    document.getElementById("message");
+
+
+    box.innerHTML = msg;
+
+
+    box.style.display="block";
+
+
+    if(success){
+
+        box.className =
+        "message success";
+
+    }
+
+    else{
+
+        box.className =
+        "message error";
+
+    }
+
+
+    setTimeout(()=>{
+
+        box.style.display="none";
+
+    },3000);
+
+
+
+}
+
+
+
+
+
+
+
+
+// ==========================
+// 加载物料
+// ==========================
+
+
+function loadMaterials(){
+
+
+    fetch(
+        "/pldp/web/supply-chain/api/materials/"
+    )
+
+
+    .then(res=>res.json())
+
+
+    .then(data=>{
+
+
+        materials=data;
+
+
+        let select =
+        document.getElementById(
+            "spec_material"
+        );
+
+
+        if(select){
+
+
+            select.innerHTML =
+            "<option value=''>请选择物料</option>";
+
+
+
+            data.forEach(item=>{
+
+
+                select.innerHTML +=
+                `
+                <option value="${item.id}">
+                ${item.name} (${item.code})
+                </option>
+                `;
+
+
+            });
+
+
+        }
+
+
+    });
+
+
+
+}
+
+
+
+
+
+
+
+// ==========================
+// 加载规格
+// ==========================
+
+
+function loadMaterialSpecs(){
+
+
+    fetch(
+        "/pldp/web/supply-chain/api/material-specs/"
+    )
+
+
+    .then(res=>res.json())
+
+
+    .then(data=>{
+
+
+        specs=data;
+
+
+        let select =
+        document.getElementById(
+            "supplier_spec"
+        );
+
+
+        if(select){
+
+
+            select.innerHTML =
+            "<option value=''>请选择规格</option>";
+
+
+
+            data.forEach(item=>{
+
+
+                select.innerHTML +=
+                `
+                <option value="${item.id}">
+                ${item.material}-${item.name}
+                </option>
+                `;
+
+
+            });
+
+
+        }
+
+
+    });
+
+
+
+}
+
+
+
+
+
+
+
+
+// ==========================
+// 加载供应商
+// ==========================
+
+
+function loadSuppliers(){
+
+
+    fetch(
+        "/pldp/web/supply-chain/api/suppliers/"
+    )
+
+
+    .then(res=>res.json())
+
+
+    .then(data=>{
+
+
+        suppliers=data;
+
+
+        let select =
+        document.getElementById(
+            "supplier_company"
+        );
+
+
+        let filterSupplierSelect =
+        document.getElementById(
+            "supplier_filter_supplier"
+        );
+
+
+
+        if(select){
+
+
+            select.innerHTML =
+            "<option value=''>请选择供应商</option>";
+
+
+
+            data.forEach(item=>{
+
+
+                select.innerHTML +=
+                `
+                <option value="${item.id}">
+                ${item.name}
+                </option>
+                `;
+
+
+
+                if(filterSupplierSelect){
+
+
+                    filterSupplierSelect.innerHTML +=
+                    `
+                    <option value="${item.id}">
+                    ${item.name}
+                    </option>
+                    `;
+
+
+                }
+
+
+            });
+
+
+        }
+
+
+
+    });
+
+
+
+}
+
+
+
+
+
+
+
+
+
+// ==========================
+// 添加物料
+// ==========================
+
+
+function getSelectedMaterialCategoryCode(){
+
+
+    const select =
+    document.getElementById(
+        "material_category"
+    );
+
+
+    if(!select || !select.value){
+
+        return "";
+
+    }
+
+
+    const option =
+    select.options[
+        select.selectedIndex
+    ];
+
+
+    return (
+        option.dataset.code || ""
+    ).trim().toUpperCase();
+
+
+}
+
+
+
+function getMaterialCodePart(){
+
+
+    const categoryCode =
+    getSelectedMaterialCategoryCode();
+
+
+    let codePart =
+    document.getElementById(
+        "material_code"
+    ).value.trim().toUpperCase();
+
+
+    const prefix =
+    categoryCode
+    ? categoryCode + "-"
+    : "";
+
+
+    if(
+        prefix &&
+        codePart.startsWith(prefix)
+    ){
+
+        codePart =
+        codePart.substring(
+            prefix.length
+        ).trim();
+
+    }
+
+
+    return codePart;
+
+
+}
+
+
+
+function updateMaterialCodePreview(){
+
+
+    const categoryCode =
+    getSelectedMaterialCategoryCode();
+
+
+    const codePart =
+    getMaterialCodePart();
+
+
+    const prefixNode =
+    document.getElementById(
+        "material_code_prefix"
+    );
+
+
+    const previewNode =
+    document.getElementById(
+        "material_code_preview"
+    );
+
+
+    prefixNode.textContent =
+    categoryCode
+    ? categoryCode + "-"
+    : "品类编码-";
+
+
+    if(!categoryCode){
+
+        previewNode.textContent =
+        "请先选择所属产品分类";
+
+        return;
+
+    }
+
+
+    previewNode.textContent =
+    codePart
+    ? "最终保存编码：" + categoryCode + "-" + codePart
+    : "最终保存编码：" + categoryCode + "-物料编码";
+
+
+}
+
+
+
+function normalizeMaterialCodeInput(){
+
+
+    const input =
+    document.getElementById(
+        "material_code"
+    );
+
+
+    input.value =
+    getMaterialCodePart();
+
+
+    updateMaterialCodePreview();
+
+
+}
+
+
+
+function addMaterial(){
+
+
+    let data={
+
+
+        code:
+        getMaterialCodePart(),
+
+
+        name:
+        document.getElementById(
+            "material_name"
+        ).value.trim(),
+
+
+        product_category_id:
+        document.getElementById(
+            "material_category"
+        ).value,
+
+
+        is_key_part:
+        document.getElementById(
+            "material_key"
+        ).checked,
+
+
+        description:
+        document.getElementById(
+            "material_description"
+        ).value.trim()
+
+
+    };
+
+
+
+    fetch(
+        "/pldp/web/supply-chain/api/material/add/",
+        {
+
+
+            method:"POST",
+
+
+            headers:{
+
+                "Content-Type": "application/json",
+                
+                "X-CSRFToken":getCookie("csrftoken")
+
+            },
+
+
+            body:
+            JSON.stringify(data)
+
+
+        }
+    )
+
+
+    .then(res=>res.json())
+
+
+    .then(data=>{
+
+
+        if(data.success){
+
+
+            showMessage(
+                "物料添加成功：" + data.code
+            );
+
+
+            resetMaterial();
+
+            loadMaterials();
+
+            loadMaterialList();
+
+
+        }
+
+        else{
+
+
+            showMessage(
+                data.message ||
+                "添加失败",
+                false
+            );
+
+
+        }
+
+
+    });
+
+
+
+}
+
+
+
+
+
+
+
+
+function resetMaterial(){
+
+
+    document.getElementById(
+        "material_code"
+    ).value="";
+
+
+    document.getElementById(
+        "material_name"
+    ).value="";
+
+
+    document.getElementById(
+        "material_description"
+    ).value="";
+
+
+    document.getElementById(
+        "material_key"
+    ).checked=false;
+
+
+    updateMaterialCodePreview();
+
+
+}
+
+
+
+
+
+
+
+// ==========================
+// 添加规格
+// ==========================
+
+
+function addSpec(){
+
+
+
+    let parameters={};
+
+
+    try{
+
+
+        let text =
+        document.getElementById(
+            "spec_parameters"
+        ).value.trim();
+
+
+
+        if(text){
+
+            parameters =
+            JSON.parse(text);
+
+        }
+
+
+
+    }
+
+    catch(e){
+
+
+        showMessage(
+            "规格参数JSON格式错误",
+            false
+        );
+
+        return;
+
+
+    }
+
+
+
+
+    let data={
+
+
+        material_id:
+        document.getElementById(
+            "spec_material"
+        ).value,
+
+
+        code:
+        document.getElementById(
+            "spec_code"
+        ).value.trim(),
+
+
+
+        name:
+        document.getElementById(
+            "spec_name"
+        ).value.trim(),
+
+
+
+        performance_description:
+        document.getElementById(
+            "spec_performance"
+        ).value.trim(),
+
+
+
+        parameters:parameters,
+
+
+
+        description:
+        document.getElementById(
+            "spec_description"
+        ).value.trim()
+
+
+    };
+
+
+
+    fetch(
+        "/pldp/web/supply-chain/api/material-spec/add/",
+        {
+
+
+            method:"POST",
+
+
+            headers:{
+
+                "Content-Type": "application/json",
+                "X-CSRFToken":getCookie("csrftoken")
+
+            },
+
+
+            body:
+            JSON.stringify(data)
+
+        }
+    )
+
+
+
+    .then(res=>res.json())
+
+
+    .then(data=>{
+
+
+        if(data.success){
+
+
+            showMessage(
+                "规格添加成功"
+            );
+
+
+            resetSpec();
+
+            loadMaterials();
+
+            loadMaterialSpecs();
+
+            loadSpecList();
+
+            loadMaterialList();
+
+        }
+
+        else{
+
+
+            showMessage(
+                data.message ||
+                "添加失败",
+                false
+            );
+
+
+        }
+
+
+    });
+
+
+}
+
+
+
+
+
+
+
+function resetSpec(){
+
+
+[
+"spec_code",
+"spec_name",
+"spec_performance",
+"spec_parameters",
+"spec_description"
+
+].forEach(id=>{
+
+    document.getElementById(id).value="";
+
+    document.getElementById("spec_material").value="";
+
+});
+
+
+}
+
+
+
+
+
+
+
+
+
+// ==========================
+// 添加供应关系
+// ==========================
+
+
+function addSupplierRelation(){
+
+
+    let data={
+
+
+        material_spec_id:
+        document.getElementById(
+            "supplier_spec"
+        ).value,
+
+
+        supplier_id:
+        document.getElementById(
+            "supplier_company"
+        ).value,
+
+
+
+        warranty_months:
+        document.getElementById(
+            "supplier_warranty"
+        ).value,
+
+
+
+        reference_price:
+        document.getElementById(
+            "supplier_price"
+        ).value,
+
+
+
+        remark:
+        document.getElementById(
+            "supplier_remark"
+        ).value
+
+
+    };
+
+
+
+    fetch(
+        "/pldp/web/supply-chain/api/material-spec-supplier/add/",
+        {
+
+
+            method:"POST",
+
+
+            headers:{
+
+                "Content-Type": "application/json",
+                "X-CSRFToken":getCookie("csrftoken")
+
+            },
+
+
+            body:
+            JSON.stringify(data)
+
+        }
+    )
+
+
+
+    .then(res=>res.json())
+
+
+    .then(data=>{
+
+
+        if(data.success){
+
+
+            showMessage(
+                "供应关系添加成功"
+            );
+
+
+            resetSupplier();
+
+            loadMaterialList();
+
+            loadSupplierList();
+
+
+        }
+
+        else{
+
+
+            showMessage(
+                data.message ||
+                "添加失败",
+                false
+            );
+
+
+        }
+
+
+    });
+
+
+
+}
+
+
+
+
+
+
+
+function resetSupplier(){
+
+
+document.getElementById(
+"supplier_warranty"
+).value=12;
+
+
+document.getElementById(
+"supplier_price"
+).value="";
+
+
+document.getElementById(
+"supplier_remark"
+).value="";
+
+
+}
+
+
+// ==========================
+// 加载物料列表
+// ==========================
+
+
+function loadMaterialList(
+    category="",
+    keyword=""
+){
+
+
+    let url =
+    "/pldp/web/supply-chain/api/materials/?category="
+    + category
+    + "&keyword="
+    + encodeURIComponent(keyword);
+
+
+
+    fetch(url)
+
+
+
+    .then(
+        res => res.json()
+    )
+
+
+
+    .then(
+        data => {
+
+
+            let html = "";
+
+
+
+            if(
+                !data ||
+                data.length === 0
+            ){
+
+                document.getElementById(
+                    "material_list"
+                ).innerHTML =
+                "暂无数据";
+
+
+                return;
+
+            }
+
+
+
+
+            data.forEach(
+                item => {
+
+
+
+                    html += `
+
+                    <div class="list-item">
+
+
+
+                        <div class="list-content">
+
+
+
+                            <b>
+
+                            ${item.code}
+
+                            -
+
+                            ${item.name}
+
+                            </b>
+
+
+
+
+                            <div class="small">
+
+                            产品分类：
+
+                            ${
+                                item.category
+                                ?
+                                item.category
+                                :
+                                "未分类"
+                            }
+
+
+                            </div>
+
+
+
+
+                            <div class="small">
+
+
+                            ${
+                                item.is_key_part
+                                ?
+                                "关键件"
+                                :
+                                "普通件"
+                            }
+
+
+                            </div>
+
+
+
+                            ${
+                                item.description
+                                ?
+                                `
+                                <div class="small">
+
+                                ${item.description}
+
+                                </div>
+                                `
+                                :
+                                ""
+                            }
+
+
+
+                        </div>
+
+
+
+
+                        <button
+
+                        class="delete-btn"
+
+                        onclick="
+                        deleteMaterial(${item.id})
+                        "
+
+                        >
+
+                        删除
+
+                        </button>
+
+
+
+                    </div>
+
+
+                    `;
+
+
+                }
+            );
+
+
+
+
+            document.getElementById(
+                "material_list"
+            ).innerHTML = html;
+
+
+
+        }
+
+    )
+
+
+
+    .catch(
+        error => {
+
+
+            console.error(
+                "物料列表加载失败:",
+                error
+            );
+
+
+            document.getElementById(
+                "material_list"
+            ).innerHTML =
+            "加载失败";
+
+
+        }
+    );
+
+
+}
+
+
+
+
+
+// ==========================
+// 加载规格列表
+// ==========================
+
+
+
+
+function searchSpecList(){
+
+    loadSpecList();
+
+}
+
+
+
+
+function specMaterialChange(){
+
+
+    document.getElementById(
+        "spec_filter_keyword"
+    ).value = "";
+
+
+    loadSpecList();
+
+
+}
+
+
+function loadSpecList(){
+
+
+    let category =
+    document.getElementById(
+        "spec_filter_category"
+    ).value;
+
+
+    let material =
+    document.getElementById(
+        "spec_filter_material"
+    ).value;
+
+
+    let keyword =
+    document.getElementById(
+        "spec_filter_keyword"
+    ).value;
+
+
+
+    let url =
+    "/pldp/web/supply-chain/api/material-specs/?"
+    +
+    "category="
+    +
+    category
+    +
+    "&material="
+    +
+    material
+    +
+    "&keyword="
+    +
+    encodeURIComponent(keyword);
+
+
+
+    fetch(url)
+
+
+    .then(
+        res => res.json()
+    )
+
+
+    .then(
+        data => {
+
+
+            let html="";
+
+
+            data.forEach(
+                item => {
+
+
+                    html += `
+
+                    <div class="list-item">
+
+
+                        <div class="list-content">
+
+
+                            <b>
+                            ${item.material}
+                            -
+                            ${item.name}
+                            </b>
+
+
+                            <div class="small">
+
+                            编码：
+                            ${item.code}
+
+                            </div>
+
+
+                            <div class="small">
+
+                            ${item.performance_description || ""}
+
+                            </div>
+
+
+                        </div>
+
+
+
+                        <button
+                        class="delete-btn"
+                        onclick="deleteSpec(${item.id})">
+
+                        删除
+
+                        </button>
+
+
+                    </div>
+
+                    `;
+
+
+                }
+            );
+
+
+
+            document.getElementById(
+                "spec_list"
+            ).innerHTML =
+            html || "暂无数据";
+
+
+        }
+    );
+
+
+}
+
+
+
+
+
+
+
+// ==========================
+// 加载供应关系列表
+// ==========================
+
+
+
+// ==========================
+// 根据产品分类加载供应商筛选列表
+// ==========================
+
+
+
+function supplierCategoryChange(){
+
+
+    document.getElementById(
+        "supplier_filter_supplier"
+    ).value = "";
+
+
+    document.getElementById(
+        "supplier_filter_keyword"
+    ).value = "";
+
+
+    loadSupplierFilterSuppliers();
+
+
+}
+
+
+function loadSupplierFilterSuppliers(){
+
+
+    let category =
+    document.getElementById(
+        "supplier_filter_category"
+    ).value;
+
+
+
+    let supplierSelect =
+    document.getElementById(
+        "supplier_filter_supplier"
+    );
+
+
+
+    if(!supplierSelect){
+
+        return;
+
+    }
+
+
+
+    supplierSelect.innerHTML =
+    `
+    <option value="">
+        全部供应商
+    </option>
+    `;
+
+
+
+    if(!category){
+
+        loadSupplierList();
+
+        return;
+
+    }
+
+
+
+    fetch(
+        "/pldp/web/supply-chain/api/suppliers-by-category/?category="
+        +
+        category
+    )
+
+
+    .then(
+        res=>res.json()
+    )
+
+
+    .then(
+        data=>{
+
+
+            data.forEach(
+                item=>{
+
+
+                    let option =
+                    document.createElement(
+                        "option"
+                    );
+
+
+                    option.value =
+                    item.id;
+
+
+                    option.textContent =
+                    item.name;
+
+
+                    supplierSelect.appendChild(
+                        option
+                    );
+
+
+                }
+            );
+
+
+            loadSupplierList();
+
+
+        }
+    );
+
+
+}
+
+
+
+
+
+
+function supplierFilterChange(){
+
+
+    document.getElementById(
+        "supplier_filter_keyword"
+    ).value = "";
+
+
+    loadSupplierList();
+
+
+}
+
+
+function loadSupplierList(){
+
+
+    let category =
+    document.getElementById(
+        "supplier_filter_category"
+    ).value;
+
+
+
+    let supplier =
+    document.getElementById(
+        "supplier_filter_supplier"
+    ).value;
+
+
+
+    let keyword =
+    document.getElementById(
+        "supplier_filter_keyword"
+    ).value;
+
+
+
+    let url =
+    "/pldp/web/supply-chain/api/material-supplier-list/?"
+    +
+    "category="
+    +
+    category
+    +
+    "&supplier="
+    +
+    supplier
+    +
+    "&keyword="
+    +
+    encodeURIComponent(keyword);
+
+
+
+    fetch(
+        url
+    )
+
+
+    .then(res=>res.json())
+
+
+    .then(data=>{
+
+
+        let html="";
+
+
+
+        data.forEach(material=>{
+
+
+            material.specs.forEach(spec=>{
+
+
+                spec.suppliers.forEach(rel=>{
+
+
+                    html += `
+
+
+                    <div class="list-item">
+
+
+                    <div class="list-content">
+
+
+                    <b>
+
+                    ${material.name}
+
+                    -
+
+                    ${spec.name}
+
+                    </b>
+
+
+
+                    <div class="small">
+
+                    供应商：
+
+                    ${rel.name}
+
+                    </div>
+
+
+
+                    <div class="small">
+
+                    质保：
+
+                    ${rel.warranty_months}
+                    个月
+
+                    ${
+                        rel.reference_price
+                        ?
+                        " | 参考价格："+rel.reference_price
+                        :
+                        ""
+                    }
+
+                    </div>
+
+
+                    </div>
+
+
+
+                    <button
+                    class="delete-btn"
+                    onclick="deleteSupplierRelation(${rel.id})">
+
+                    删除
+
+                    </button>
+
+
+                    </div>
+
+
+
+                    `;
+
+
+                });
+
+
+
+            });
+
+
+
+        });
+
+
+
+        document.getElementById(
+            "supplier_list"
+        ).innerHTML =
+        html || "暂无数据";
+
+
+
+    });
+
+
+
+}
+
+
+
+
+
+
+
+
+
+
+function searchSupplierList(){
+
+
+    loadSupplierList();
+
+
+}
+
+
+// ==========================
+// 删除物料
+// ==========================
+
+
+function deleteMaterial(id){
+
+
+    if(!confirm(
+        "确定删除该物料吗？"
+    )){
+
+
+        return;
+
+    }
+
+
+
+    fetch(
+        "/pldp/web/supply-chain/api/material/delete/",
+        {
+
+
+            method:"POST",
+
+
+            headers:{
+
+                "Content-Type": "application/json",
+                "X-CSRFToken":getCookie("csrftoken")
+
+            },
+
+
+            body:
+            JSON.stringify({
+
+                id:id
+
+            })
+
+
+        }
+    )
+
+
+
+    .then(res=>res.json())
+
+
+    .then(data=>{
+
+
+        if(data.success){
+
+
+            showMessage(
+                "删除成功"
+            );
+
+
+            loadMaterialList();
+
+            loadMaterials();
+
+
+        }
+
+        else{
+
+
+            showMessage(
+                data.message ||
+                "删除失败",
+                false
+            );
+
+
+        }
+
+
+    });
+
+
+
+}
+
+
+
+
+
+
+
+
+// ==========================
+// 删除规格
+// ==========================
+
+
+function deleteSpec(id){
+
+
+    if(!confirm(
+        "确定删除该规格吗？"
+    )){
+
+
+        return;
+
+    }
+
+
+
+    fetch(
+        "/pldp/web/supply-chain/api/material-spec/delete/",
+        {
+
+
+            method:"POST",
+
+
+            headers:{
+
+                "Content-Type": "application/json",
+                "X-CSRFToken":getCookie("csrftoken")
+
+            },
+
+
+            body:
+            JSON.stringify({
+
+                id:id
+
+            })
+
+
+        }
+    )
+
+
+
+    .then(res=>res.json())
+
+
+    .then(data=>{
+
+
+        if(data.success){
+
+
+            showMessage(
+                "删除成功"
+            );
+
+
+            loadSpecList();
+
+            loadMaterialSpecs();
+
+
+        }
+
+        else{
+
+
+            showMessage(
+                data.message ||
+                "删除失败",
+                false
+            );
+
+
+        }
+
+
+    });
+
+
+
+}
+
+
+
+
+
+
+
+
+// ==========================
+// 删除供应关系
+// ==========================
+
+
+function deleteSupplierRelation(id){
+
+
+    if(!confirm(
+        "确定删除该供应关系吗？"
+    )){
+
+
+        return;
+
+    }
+
+
+
+
+    fetch(
+        "/pldp/web/supply-chain/api/material-spec-supplier/delete/",
+        {
+
+
+            method:"POST",
+
+
+            headers:{
+
+                "Content-Type": "application/json",
+                "X-CSRFToken":getCookie("csrftoken")
+
+            },
+
+
+            body:
+            JSON.stringify({
+
+                id:id
+
+            })
+
+
+        }
+    )
+
+
+
+    .then(res=>res.json())
+
+
+    .then(data=>{
+
+
+        if(data.success){
+
+
+            showMessage(
+                "删除成功"
+            );
+
+
+            loadSupplierList();
+
+
+        }
+
+        else{
+
+
+            showMessage(
+                data.message ||
+                "删除失败",
+                false
+            );
+
+
+        }
+
+
+    });
+
+
+
+}
+
+
+// ==========================
+
+
+// ==========================
+// 添加页面初始化
+// ==========================
+
+
+function resetMaterialForm(){
+
+
+    document.getElementById(
+        "material_code"
+    ).value="";
+
+
+    document.getElementById(
+        "material_name"
+    ).value="";
+
+
+    document.getElementById(
+        "material_category"
+    ).value="";
+
+
+    document.getElementById(
+        "material_description"
+    ).value="";
+
+
+    document.getElementById(
+        "material_key"
+    ).checked=false;
+
+
+    updateMaterialCodePreview();
+
+
+}
+
+
+
+function resetSpecForm(){
+
+
+    [
+        "spec_code",
+        "spec_name",
+        "spec_performance",
+        "spec_parameters",
+        "spec_description"
+    ].forEach(id=>{
+
+        document.getElementById(id).value="";
+
+    });
+
+
+    document.getElementById(
+        "spec_material"
+    ).value="";
+
+
+}
+
+
+
+function resetSupplierForm(){
+
+
+    document.getElementById(
+        "supplier_spec"
+    ).value="";
+
+
+    document.getElementById(
+        "supplier_company"
+    ).value="";
+
+
+    document.getElementById(
+        "supplier_warranty"
+    ).value="";
+
+
+    document.getElementById(
+        "supplier_price"
+    ).value="";
+
+
+    document.getElementById(
+        "supplier_remark"
+    ).value="";
+
+
+}
+
+
+// 显示添加物料表单
+// ==========================
+
+function showMaterialForm() {
+
+    document.getElementById(
+        "materialFormPanel"
+    ).style.display = "block";
+
+
+    document.getElementById(
+        "materialListPanel"
+    ).style.display = "none";
+
+
+    document.getElementById(
+        "materialFormBtn"
+    ).classList.add(
+        "active"
+    );
+
+
+    document.getElementById(
+        "materialListBtn"
+    ).classList.remove(
+        "active"
+    );
+
+
+    resetMaterialForm();
+
+}
+
+
+
+// ==========================
+// 显示物料列表
+// ==========================
+
+function showMaterialList() {
+
+    document.getElementById(
+        "materialFormPanel"
+    ).style.display = "none";
+
+
+    document.getElementById(
+        "materialListPanel"
+    ).style.display = "block";
+
+
+    document.getElementById(
+        "materialFormBtn"
+    ).classList.remove(
+        "active"
+    );
+
+
+    document.getElementById(
+        "materialListBtn"
+    ).classList.add(
+        "active"
+    );
+
+
+    document.getElementById(
+        "material_filter_category"
+    ).value = "";
+
+
+    document.getElementById(
+        "material_filter_keyword"
+    ).value = "";
+
+
+    loadMaterialList();
+
+}
+
+
+// ==========================
+// 显示规格添加
+// ==========================
+
+
+function showSpecForm(){
+
+
+    document.getElementById(
+        "specFormPanel"
+    ).style.display="block";
+
+
+
+    document.getElementById(
+        "specListPanel"
+    ).style.display="none";
+
+
+
+    document.getElementById(
+        "specFormBtn"
+    ).classList.add(
+        "active"
+    );
+
+
+
+    document.getElementById(
+        "specListBtn"
+    ).classList.remove(
+        "active"
+    );
+
+
+
+    resetSpecForm();
+
+}
+
+
+
+
+// ==========================
+// 显示规格列表
+// ==========================
+
+
+function showSpecList(){
+
+
+    document.getElementById(
+        "specFormPanel"
+    ).style.display="none";
+
+
+
+    document.getElementById(
+        "specListPanel"
+    ).style.display="block";
+
+
+
+    document.getElementById(
+        "specFormBtn"
+    ).classList.remove(
+        "active"
+    );
+
+
+
+    document.getElementById(
+        "specListBtn"
+    ).classList.add(
+        "active"
+    );
+
+
+
+
+    document.getElementById(
+        "spec_filter_category"
+    ).value = "";
+
+
+    document.getElementById(
+        "spec_filter_material"
+    ).value = "";
+
+
+    document.getElementById(
+        "spec_filter_keyword"
+    ).value = "";
+
+
+    loadSpecList();
+
+
+
+}
+
+
+// ==========================
+// 显示供应关系添加
+// ==========================
+
+
+function showSupplierForm(){
+
+
+    document.getElementById(
+        "supplierFormPanel"
+    ).style.display="block";
+
+
+
+    document.getElementById(
+        "supplierListPanel"
+    ).style.display="none";
+
+
+
+    document.getElementById(
+        "supplierFormBtn"
+    ).classList.add(
+        "active"
+    );
+
+
+
+    document.getElementById(
+        "supplierListBtn"
+    ).classList.remove(
+        "active"
+    );
+
+
+
+    resetSupplierForm();
+
+}
+
+
+
+
+
+// ==========================
+// 显示供应关系列表
+// ==========================
+
+
+function showSupplierList(){
+
+
+    document.getElementById(
+        "supplierFormPanel"
+    ).style.display="none";
+
+
+
+    document.getElementById(
+        "supplierListPanel"
+    ).style.display="block";
+
+
+
+    document.getElementById(
+        "supplierFormBtn"
+    ).classList.remove(
+        "active"
+    );
+
+
+
+    document.getElementById(
+        "supplierListBtn"
+    ).classList.add(
+        "active"
+    );
+
+
+
+
+    document.getElementById(
+        "supplier_filter_category"
+    ).value = "";
+
+
+    document.getElementById(
+        "supplier_filter_supplier"
+    ).value = "";
+
+
+    document.getElementById(
+        "supplier_filter_keyword"
+    ).value = "";
+
+
+    loadSupplierList();
+
+
+
+}
+
+
+function loadProductCategories(){
+
+
+    fetch(
+        "/pldp/web/supply-chain/api/product-categories/"
+    )
+
+
+    .then(
+        response => response.json()
+    )
+
+
+    .then(
+        data => {
+
+
+            let addSelect =
+            document.getElementById(
+                "material_category"
+            );
+
+
+            let filterSelect =
+            document.getElementById(
+                "material_filter_category"
+            );
+
+
+            let specSelect =
+            document.getElementById(
+                "spec_filter_category"
+            );
+
+
+            let supplierSelect =
+            document.getElementById(
+                "supplier_filter_category"
+            );
+
+
+
+            if(addSelect){
+
+                addSelect.innerHTML =
+                `
+                <option value="">
+                    请选择产品分类
+                </option>
+                `;
+
+            }
+
+
+
+            if(filterSelect){
+
+                filterSelect.innerHTML =
+                `
+                <option value="">
+                    全部产品分类
+                </option>
+                `;
+
+            }
+
+
+
+            if(specSelect){
+
+                specSelect.innerHTML =
+                `
+                <option value="">
+                    全部产品分类
+                </option>
+                `;
+
+            }
+
+
+
+            if(supplierSelect){
+
+                supplierSelect.innerHTML =
+                `
+                <option value="">
+                    全部产品分类
+                </option>
+                `;
+
+            }
+
+
+
+            data.forEach(
+                item => {
+
+
+                    if(addSelect){
+
+
+                        let option1 =
+                        document.createElement(
+                            "option"
+                        );
+
+
+                        option1.value =
+                        item.id;
+
+
+                        option1.dataset.code =
+                        item.code;
+
+
+                        option1.textContent =
+                        item.name;
+
+
+                        addSelect.appendChild(
+                            option1
+                        );
+
+
+                    }
+
+
+
+                    if(filterSelect){
+
+
+                        let option2 =
+                        document.createElement(
+                            "option"
+                        );
+
+
+                        option2.value =
+                        item.id;
+
+
+                        option2.textContent =
+                        item.name;
+
+
+                        filterSelect.appendChild(
+                            option2
+                        );
+
+
+                    }
+
+
+
+                    if(specSelect){
+
+
+                        let option3 =
+                        document.createElement(
+                            "option"
+                        );
+
+
+                        option3.value =
+                        item.id;
+
+
+                        option3.textContent =
+                        item.name;
+
+
+                        specSelect.appendChild(
+                            option3
+                        );
+
+
+                    }
+
+
+
+
+                    if(supplierSelect){
+
+
+                        let option4 =
+                        document.createElement(
+                            "option"
+                        );
+
+
+                        option4.value =
+                        item.id;
+
+
+                        option4.textContent =
+                        item.name;
+
+
+                        supplierSelect.appendChild(
+                            option4
+                        );
+
+
+                    }
+
+
+                }
+            );
+
+
+            updateMaterialCodePreview();
+
+
+        }
+    )
+
+
+    .catch(
+        error => {
+
+            console.error(
+                "产品分类加载失败:",
+                error
+            );
+
+        }
+    );
+
+
+}
+
+
+
+
+
+
+// ==========================
+// 根据产品分类加载规格物料
+// ==========================
+
+
+
+
+function specCategoryChange(){
+
+
+    document.getElementById(
+        "spec_filter_keyword"
+    ).value = "";
+
+
+    loadSpecMaterials();
+
+
+}
+
+
+function loadSpecMaterials(){
+
+
+    let category =
+    document.getElementById(
+        "spec_filter_category"
+    ).value;
+
+
+
+    let materialSelect =
+    document.getElementById(
+        "spec_filter_material"
+    );
+
+
+
+    if(!materialSelect){
+
+        return;
+
+    }
+
+
+
+    materialSelect.innerHTML =
+    `
+    <option value="" onchange="loadSpecList()">
+        全部物料
+    </option>
+    `;
+
+
+
+    if(!category){
+
+        loadSpecList();
+
+        return;
+
+    }
+
+
+
+    fetch(
+        "/pldp/web/supply-chain/api/materials-by-category/?category="
+        + category
+    )
+
+
+    .then(
+        response => response.json()
+    )
+
+
+    .then(
+        data => {
+
+
+            data.forEach(
+                item => {
+
+
+                    let option =
+                    document.createElement(
+                        "option"
+                    );
+
+
+                    option.value =
+                    item.id;
+
+
+                    option.textContent =
+                    item.name;
+
+
+                    materialSelect.appendChild(
+                        option
+                    );
+
+
+                }
+            );
+
+
+            loadSpecList();
+
+
+        }
+    )
+
+
+    .catch(
+        error => {
+
+            console.error(
+                "加载规格物料失败:",
+                error
+            );
+
+        }
+    );
+
+
+}
+
+
+
+
+
+function materialCategoryChange(){
+
+
+    document.getElementById(
+        "material_filter_keyword"
+    ).value = "";
+
+
+    searchMaterialList();
+
+
+}
+
+
+function searchMaterialList(){
+
+
+    let category =
+    document.getElementById(
+        "material_filter_category"
+    ).value;
+
+
+
+    let keyword =
+    document.getElementById(
+        "material_filter_keyword"
+    ).value;
+
+
+
+    loadMaterialList(
+        category,
+        keyword
+    );
+
+
+}
+
+
+
+
+</script>
+
+
+</body>
+
+
+</html>
