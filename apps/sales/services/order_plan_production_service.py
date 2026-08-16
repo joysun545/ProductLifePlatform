@@ -10,6 +10,10 @@ from workflow.services.workflow_service import publish_workitem
 from sales.services.order_plan_receipt_service import (
     mark_devices_shipped, role_openids, display_name,
 )
+from sales.services.order_plan_shipment_authorization_service import (
+    OrderPlanShipmentAuthorizationError,
+    publish_shipment_authorization_task,
+)
 
 
 class OrderPlanProductionError(Exception):
@@ -105,25 +109,23 @@ def confirm_order_plan_production(*, user, plan_id):
         "plan_code": plan.plan_code,
         "items": item_rows,
     }
-    sales_openid = plan.created_by.wx_openid or ""
-    if sales_openid:
-        publish_workitem(
-            domain="SALES", type="ORDER_PLAN_PRODUCTION_COMPLETED",
-            biz_id=plan.plan_code, biz_ref=f"sales.OrderPlan:{plan.pk}",
-            uniq_key=f"sales:order-plan:{plan.pk}:production-completed:sales",
-            title="订单生产已完成",
-            summary=f"{plan.merchant_organization.name}｜{plan.brand.name}｜共{plan.total_quantity}台",
-            link="/pages/sales/order_plan_list/order_plan_list",
-            recipients_openids=(sales_openid,), need_action=False,
-            action_mode="EACH_ACK", payload=common,
-            actor_openid=user.wx_openid or "", mark_workitem_done_immediately=True,
+    try:
+        publish_shipment_authorization_task(
+            plan=plan,
+            actor_openid=user.wx_openid or "",
         )
+    except OrderPlanShipmentAuthorizationError as exc:
+        raise OrderPlanProductionError(str(exc)) from exc
     return common, True
 
 
 def get_stock_outbound_detail(*, user, plan_id):
     identity = _identity(user, "factory_stock")
     plan = _plan(identity, plan_id)
+    if not plan.shipment_authorized_at or not plan.shipment_authorized_by_id:
+        raise OrderPlanProductionError(
+            "创建订单的厂家销售经理尚未下达发货指令。"
+        )
     workitem = WorkItem.objects.filter(
         type="ORDER_PLAN_STOCK_OUTBOUND",
         uniq_key=f"sales:order-plan:{plan.pk}:stock-outbound",
@@ -147,6 +149,10 @@ def get_stock_outbound_detail(*, user, plan_id):
 def confirm_stock_outbound(*, user, plan_id):
     identity = _identity(user, "factory_stock")
     plan = _plan(identity, plan_id, lock=True)
+    if not plan.shipment_authorized_at or not plan.shipment_authorized_by_id:
+        raise OrderPlanProductionError(
+            "创建订单的厂家销售经理尚未下达发货指令，不能出库。"
+        )
     workitem = WorkItem.objects.select_for_update().filter(
         type="ORDER_PLAN_STOCK_OUTBOUND",
         uniq_key=f"sales:order-plan:{plan.pk}:stock-outbound",
@@ -265,6 +271,10 @@ def confirm_stock_outbound(*, user, plan_id):
 def render_lifecycle_qrcode(*, user, plan_id, item_id):
     identity = _identity(user, "factory_stock")
     plan = _plan(identity, plan_id)
+    if not plan.shipment_authorized_at or not plan.shipment_authorized_by_id:
+        raise OrderPlanProductionError(
+            "创建订单的厂家销售经理尚未下达发货指令。"
+        )
     item = OrderPlanItem.objects.filter(pk=item_id, plan=plan).first()
     if not item:
         raise OrderPlanProductionError("订单产品明细不存在。")

@@ -1,4 +1,4 @@
-# apps/workflow/services/task_query.py
+from django.db.models import Q
 
 from workflow.models import UserTask
 
@@ -133,6 +133,7 @@ def get_task_summary(openid):
     {
         "unread_count": int,
         "action_pending_count": int,
+        "attention_count": int,
     }
     """
 
@@ -151,9 +152,17 @@ def get_task_summary(openid):
         state="DONE"
     ).count()
 
+    # 徽标表示“需要关注”，既包含未读通知，也包含已经打开但尚未完成的
+    # 操作任务。使用 OR 查询保证“未读且待处理”的同一任务只计一次。
+    attention_count = qs.filter(
+        Q(state="NEW") |
+        (Q(need_action=True) & ~Q(state="DONE"))
+    ).count()
+
     return {
         "unread_count": unread_count,
         "action_pending_count": action_pending_count,
+        "attention_count": attention_count,
     }
 
 

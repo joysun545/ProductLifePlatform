@@ -17,6 +17,13 @@ ELIGIBLE_STATUSES = {
 }
 
 
+def _ensure_shipment_authorized(plan):
+    if not plan.shipment_authorized_at or not plan.shipment_authorized_by_id:
+        raise OrderQRCodePrintError(
+            "创建订单的厂家销售经理尚未下达发货指令。"
+        )
+
+
 def _item_payload(item):
     return {
         "id": item.pk,
@@ -33,9 +40,15 @@ def _item_payload(item):
 def get_print_center_data():
     plans = (
         OrderPlan.objects.select_related(
-            "merchant_organization", "created_by", "brand"
+            "merchant_organization", "created_by", "brand",
+            "shipment_authorized_by",
         )
-        .filter(status__in=ELIGIBLE_STATUSES, items__qrcode_printed_at__isnull=True)
+        .filter(
+            status__in=ELIGIBLE_STATUSES,
+            shipment_authorized_at__isnull=False,
+            shipment_authorized_by__isnull=False,
+            items__qrcode_printed_at__isnull=True,
+        )
         .distinct()
         .order_by("submitted_at", "id")
     )
@@ -75,6 +88,7 @@ def _get_item(item_id, *, lock=False):
         raise OrderQRCodePrintError("订单产品明细不存在。")
     if item.plan.status not in ELIGIBLE_STATUSES:
         raise OrderQRCodePrintError("该订单当前不在二维码打印阶段。")
+    _ensure_shipment_authorized(item.plan)
     if item.qrcode_printed_at:
         raise OrderQRCodePrintError("该产品型号的二维码已经打印完成。")
     if not hasattr(item, "bom_confirmation"):
@@ -98,6 +112,7 @@ def _factory_stock_openids(plan):
 
 
 def _publish_stock_outbound_task(plan):
+    _ensure_shipment_authorized(plan)
     stock_openids = _factory_stock_openids(plan)
     if not stock_openids:
         raise OrderQRCodePrintError("厂家尚未配置有效的库管账号，不能完成整单打印。")
@@ -121,7 +136,12 @@ def _publish_stock_outbound_task(plan):
             for row in items
         ],
     }
-    publish_workitem(
+    actor_openid = (
+        plan.shipment_authorized_by.wx_openid
+        if plan.shipment_authorized_by_id
+        else ""
+    )
+    workitem = publish_workitem(
         domain="SALES",
         type="ORDER_PLAN_STOCK_OUTBOUND",
         biz_id=plan.plan_code,
@@ -140,9 +160,35 @@ def _publish_stock_outbound_task(plan):
         need_action=True,
         action_mode="ANYONE_DO",
         payload=payload,
-        actor_openid="",
+        actor_openid=actor_openid,
         mark_workitem_done_immediately=False,
     )
+    # publish_workitem 会复用同一 uniq_key。旧订单部署迁移时可能暂时
+    # 关闭过未授权的出库任务，因此重新打开时显式清理旧完成痕迹，
+    # 并把本轮真正的发货授权人记录为任务发起人。
+    workitem.actor_openid = actor_openid
+    workitem.done_by_openid = ""
+    workitem.done_at = None
+    workitem.save(
+        update_fields=(
+            "actor_openid",
+            "done_by_openid",
+            "done_at",
+            "updated_at",
+        )
+    )
+    return workitem
+
+
+def publish_stock_outbound_task_if_ready(plan):
+    """销售已授权且全部二维码已打印时，发布或重新打开库管出库任务。"""
+    _ensure_shipment_authorized(plan)
+    if plan.status not in ELIGIBLE_STATUSES:
+        return False
+    if plan.items.filter(qrcode_printed_at__isnull=True).exists():
+        return False
+    _publish_stock_outbound_task(plan)
+    return True
 
 
 @transaction.atomic
@@ -226,6 +272,7 @@ def confirm_item_printed(*, item_id):
         raise OrderQRCodePrintError("该产品型号的二维码已经打印完成。")
     if plan.status not in ELIGIBLE_STATUSES:
         raise OrderQRCodePrintError("该订单当前不在二维码打印阶段。")
+    _ensure_shipment_authorized(plan)
     if not item.qrcode_generated_at:
         raise OrderQRCodePrintError("请先生成该产品型号的全部二维码。")
     batch = ProductionBatch.objects.filter(batch_no=item.order_batch_code).first()
@@ -234,12 +281,13 @@ def confirm_item_printed(*, item_id):
     item.qrcode_printed_at = timezone.now()
     item.save(update_fields=("qrcode_printed_at", "updated_at"))
     remaining = plan.items.filter(qrcode_printed_at__isnull=True).count()
+    stock_task_created = False
     if remaining == 0:
-        _publish_stock_outbound_task(plan)
+        stock_task_created = publish_stock_outbound_task_if_ready(plan)
     return {
         "item_id": item.pk,
         "order_plan_id": plan.pk,
         "remaining_items": remaining,
         "order_printed": remaining == 0,
-        "stock_task_created": remaining == 0,
+        "stock_task_created": stock_task_created,
     }

@@ -2,7 +2,8 @@ from django.db.models import Prefetch
 
 from account.models import UserOrganization
 from product.models import BOMItem
-from sales.models import OrderPlan, OrderPlanItem
+from sales.models import OrderPlan, OrderPlanItem, OrderPlanPayment
+from sales.services.order_finance_service import serialize_finance_summary
 from supply_chain.services.supplier_responsibility_service import (
     get_responsible_material_ids,
 )
@@ -287,6 +288,54 @@ def _production_confirmation_data(workitem, openid):
     }
 
 
+def _shipment_authorization_data(plan, workitem, openid):
+    if not workitem and not plan.shipment_authorized_at:
+        return None
+    task = None
+    if workitem:
+        task = next(
+            (
+                row
+                for row in workitem.user_tasks.all()
+                if row.to_openid == openid
+            ),
+            None,
+        )
+    authorized = bool(
+        plan.shipment_authorized_at and plan.shipment_authorized_by_id
+    )
+    authorized_by_name = ""
+    if plan.shipment_authorized_by_id:
+        authorized_by_name = (
+            plan.shipment_authorized_by.wx_nickname
+            or plan.shipment_authorized_by.get_full_name()
+            or plan.shipment_authorized_by.username
+        )
+    return {
+        "workitem_id": workitem.pk if workitem else None,
+        "task_id": task.pk if task else None,
+        "state": "AUTHORIZED" if authorized else "PENDING",
+        "state_name": (
+            "已下达发货指令" if authorized else "待下达发货指令"
+        ),
+        "authorized_by_name": authorized_by_name,
+        "authorized_at": (
+            plan.shipment_authorized_at.isoformat()
+            if plan.shipment_authorized_at
+            else None
+        ),
+        "can_confirm": bool(
+            task
+            and not authorized
+            and workitem
+            and workitem.status == "OPEN"
+            and task.state != "DONE"
+            and task.need_action
+            and plan.status == OrderPlan.Status.PRODUCTION_COMPLETED
+        ),
+    }
+
+
 def _processed_actors(payload):
     actors = payload.get("processed_actors", [])
     return actors if isinstance(actors, list) else []
@@ -374,8 +423,8 @@ def _supplier_confirmation_data(workitem, *, openid=""):
 
 def _serialize_factory_plan(
     plan, role_code, supplier_workitems, production_workitem=None,
-    stock_workitem=None, receipt_workitem=None, accounting_workitem=None,
-    openid=""
+    shipment_authorization_workitem=None, stock_workitem=None,
+    receipt_workitem=None, accounting_workitem=None, openid=""
 ):
     data = _base_plan_data(plan)
     confirmations = [
@@ -423,6 +472,15 @@ def _serialize_factory_plan(
             "production_confirmation": (
                 _production_confirmation_data(production_workitem, openid)
                 if role_code == "factory_production"
+                else None
+            ),
+            "shipment_authorization": (
+                _shipment_authorization_data(
+                    plan,
+                    shipment_authorization_workitem,
+                    openid,
+                )
+                if role_code in {"factory_sales", "factory_stock"}
                 else None
             ),
             "fulfillment_stages": _stage_data(plan),
@@ -616,6 +674,8 @@ def get_order_plan_list(user, status="", limit=50):
         "shipped_by",
         "received_by",
         "accounted_by",
+        "shipment_authorized_by",
+        "finance",
     )
 
     if role_code == "factory_sales":
@@ -701,10 +761,21 @@ def get_order_plan_list(user, status="", limit=50):
         )
 
     plans = list(plans.prefetch_related(
-        Prefetch("items", queryset=visible_order_items, to_attr="visible_items")
+        Prefetch("items", queryset=visible_order_items, to_attr="visible_items"),
+        Prefetch(
+            "finance__payments",
+            queryset=OrderPlanPayment.objects.select_related(
+                "uploaded_by",
+                "confirmed_by",
+            ).order_by("sequence_no", "id"),
+        ),
     )[:limit])
     workitems_by_plan = _supplier_workitems([plan.pk for plan in plans])
     production_by_plan = _production_workitems([plan.pk for plan in plans])
+    shipment_authorization_by_plan = _role_workitems(
+        [plan.pk for plan in plans],
+        "ORDER_PLAN_SHIPMENT_AUTHORIZATION",
+    )
     stock_by_plan = _stock_workitems([plan.pk for plan in plans])
     receipt_by_plan = _role_workitems(
         [plan.pk for plan in plans], "ORDER_PLAN_MERCHANT_RECEIPT"
@@ -753,6 +824,7 @@ def get_order_plan_list(user, status="", limit=50):
                 role_code,
                 workitems_by_plan.get(plan.pk, {}),
                 production_by_plan.get(plan.pk),
+                shipment_authorization_by_plan.get(plan.pk),
                 stock_by_plan.get(plan.pk),
                 receipt_by_plan.get(plan.pk),
                 accounting_by_plan.get(plan.pk),
@@ -760,6 +832,11 @@ def get_order_plan_list(user, status="", limit=50):
             )
             for plan in plans
         ]
+
+    for plan, item in zip(plans, items):
+        finance_summary = serialize_finance_summary(plan, user, role_code)
+        if finance_summary is not None:
+            item["finance_summary"] = finance_summary
 
     return {
         "viewer": {

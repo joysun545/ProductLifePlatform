@@ -93,3 +93,40 @@ class WorkflowTaskAuthenticationTests(TestCase):
         self.assertEqual(response.status_code, 403)
         self.task.refresh_from_db()
         self.assertEqual(self.task.state, "NEW")
+
+    def test_summary_attention_count_is_union_without_double_count(self):
+        cases = (
+            ("new-action", "NEW", True),
+            ("read-action", "READ", True),
+            ("read-notice", "READ", False),
+            ("done-action", "DONE", True),
+        )
+        for suffix, state, need_action in cases:
+            workitem = WorkItem.objects.create(
+                domain="SYSTEM",
+                type="TEST_ATTENTION",
+                biz_id=f"test-attention-{suffix}",
+                title=f"关注计数-{suffix}",
+                action_mode="EACH_ACK",
+                uniq_key=f"test-attention-{suffix}-owner",
+            )
+            UserTask.objects.create(
+                workitem=workitem,
+                to_openid=self.user.wx_openid,
+                state=state,
+                need_action=need_action,
+            )
+
+        response = self.client.get(
+            self.summary_url,
+            HTTP_AUTHORIZATION=self.authorization,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        summary = response.json()["data"]
+        # setUp 的普通未读通知 + 本测试的未读操作任务。
+        self.assertEqual(summary["unread_count"], 2)
+        # 未读操作任务 + 已读但未处理的操作任务。
+        self.assertEqual(summary["action_pending_count"], 2)
+        # 两类任务取并集，未读操作任务不能重复计数。
+        self.assertEqual(summary["attention_count"], 3)

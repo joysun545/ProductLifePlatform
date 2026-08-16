@@ -14,6 +14,7 @@ from channel.models import MerchantChannelAssignment
 from lifecycle.utils.id_generator import gen_life_id
 from product.models import BOM, Brand, ProductModel
 from sales.models import OrderPlan, OrderPlanItem
+from sales.services.order_finance_service import initialize_order_finance
 from workflow.services.workflow_service import publish_workitem
 
 
@@ -505,5 +506,10 @@ def create_order_plan(
             actor_openid=user.wx_openid or "",
             mark_workitem_done_immediately=True,
         )
+
+    # The receivable/payment ledger runs in parallel with the physical order
+    # chain. It must not change OrderPlan.status or the existing accounting
+    # confirmation that controls shipment statistics.
+    initialize_order_finance(plan=plan, actor=user)
 
     return _serialize_plan(plan), True

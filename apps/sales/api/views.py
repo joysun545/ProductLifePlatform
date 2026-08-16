@@ -1,6 +1,6 @@
 import json
 
-from django.http import HttpResponse, JsonResponse
+from django.http import FileResponse, HttpResponse, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 
 from account.services.auth_service import ApiAuthenticationError, authenticate_request
@@ -36,8 +36,21 @@ from sales.services.order_plan_production_service import (
     get_stock_outbound_detail,
     render_lifecycle_qrcode,
 )
+from sales.services.order_plan_shipment_authorization_service import (
+    OrderPlanShipmentAuthorizationError,
+    confirm_shipment_authorization,
+)
 from sales.services.order_plan_receipt_service import (
     OrderPlanReceiptError, confirm_merchant_receipt, confirm_order_accounting,
+)
+from sales.services.order_finance_service import (
+    OrderFinanceError,
+    confirm_payment_received,
+    get_order_finance_detail,
+    get_payment_voucher_file,
+    get_statement_file,
+    submit_order_statement,
+    upload_payment_voucher,
 )
 
 
@@ -277,6 +290,33 @@ def order_plan_production(request, plan_id):
 
 
 @csrf_exempt
+def shipment_authorization(request, plan_id):
+    if request.method != "POST":
+        return _method_error("POST")
+    user, error_response = _authenticated_user(request)
+    if error_response:
+        return error_response
+    try:
+        result, changed = confirm_shipment_authorization(
+            user=user,
+            plan_id=plan_id,
+        )
+    except OrderPlanShipmentAuthorizationError as exc:
+        return JsonResponse(
+            {"code": 1, "msg": str(exc), "data": {}},
+            status=200,
+        )
+    return JsonResponse(
+        {
+            "code": 0,
+            "msg": "发货指令已下达" if changed else "该订单已经下达发货指令",
+            "data": result,
+        },
+        status=200,
+    )
+
+
+@csrf_exempt
 def stock_outbound_detail(request, plan_id):
     if request.method not in ("GET", "POST"):
         return _method_error("GET或POST")
@@ -339,3 +379,138 @@ def accounting_confirm(request, plan_id):
     except OrderPlanReceiptError as exc:
         return JsonResponse({"code": 1, "msg": str(exc), "data": {}}, status=200)
     return JsonResponse({"code": 0, "msg": "入账完成" if changed else "该订单已入账", "data": result})
+
+
+def order_finance_detail(request, plan_id):
+    if request.method != "GET":
+        return _method_error("GET")
+    user, error_response = _authenticated_user(request)
+    if error_response:
+        return error_response
+    try:
+        result = get_order_finance_detail(user=user, plan_id=plan_id)
+    except OrderFinanceError as exc:
+        return JsonResponse({"code": 1, "msg": str(exc), "data": {}}, status=200)
+    return JsonResponse({"code": 0, "msg": "", "data": result}, status=200)
+
+
+@csrf_exempt
+def order_finance_statement(request, plan_id):
+    if request.method != "POST":
+        return _method_error("POST")
+    user, error_response = _authenticated_user(request)
+    if error_response:
+        return error_response
+    try:
+        result = submit_order_statement(
+            user=user,
+            plan_id=plan_id,
+            receivable_amount=request.POST.get("receivable_amount"),
+            image=request.FILES.get("statement_image"),
+        )
+    except OrderFinanceError as exc:
+        return JsonResponse({"code": 1, "msg": str(exc), "data": {}}, status=200)
+    return JsonResponse(
+        {"code": 0, "msg": "订单清单已提交", "data": result},
+        status=200,
+    )
+
+
+@csrf_exempt
+def order_finance_payments(request, plan_id):
+    if request.method != "POST":
+        return _method_error("POST")
+    user, error_response = _authenticated_user(request)
+    if error_response:
+        return error_response
+    try:
+        result, created = upload_payment_voucher(
+            user=user,
+            plan_id=plan_id,
+            client_request_id=request.POST.get("client_request_id"),
+            image=request.FILES.get("voucher_image"),
+        )
+    except OrderFinanceError as exc:
+        return JsonResponse({"code": 1, "msg": str(exc), "data": {}}, status=200)
+    return JsonResponse(
+        {
+            "code": 0,
+            "msg": "付款凭证已上传" if created else "付款凭证已经上传，请勿重复提交",
+            "data": result,
+        },
+        status=200,
+    )
+
+
+@csrf_exempt
+def order_finance_payment_confirm(request, plan_id, payment_id):
+    if request.method != "POST":
+        return _method_error("POST")
+    user, error_response = _authenticated_user(request)
+    if error_response:
+        return error_response
+    data = _request_data(request)
+    try:
+        result, changed = confirm_payment_received(
+            user=user,
+            plan_id=plan_id,
+            payment_id=payment_id,
+            amount=data.get("confirmed_amount"),
+        )
+    except OrderFinanceError as exc:
+        return JsonResponse({"code": 1, "msg": str(exc), "data": {}}, status=200)
+    return JsonResponse(
+        {
+            "code": 0,
+            "msg": "收款已确认" if changed else "该笔收款已经确认",
+            "data": result,
+        },
+        status=200,
+    )
+
+
+def order_finance_statement_image(request, plan_id):
+    if request.method != "GET":
+        return _method_error("GET")
+    user, error_response = _authenticated_user(request)
+    if error_response:
+        return error_response
+    try:
+        field_file, original_name, content_type = get_statement_file(
+            user=user,
+            plan_id=plan_id,
+        )
+    except OrderFinanceError as exc:
+        return JsonResponse({"code": 1, "msg": str(exc), "data": {}}, status=200)
+    response = FileResponse(
+        field_file.open("rb"),
+        content_type=content_type,
+        as_attachment=False,
+        filename=original_name or "order-statement.jpg",
+    )
+    response["Cache-Control"] = "private, no-store"
+    return response
+
+
+def order_finance_voucher_image(request, plan_id, payment_id):
+    if request.method != "GET":
+        return _method_error("GET")
+    user, error_response = _authenticated_user(request)
+    if error_response:
+        return error_response
+    try:
+        field_file, original_name, content_type = get_payment_voucher_file(
+            user=user,
+            plan_id=plan_id,
+            payment_id=payment_id,
+        )
+    except OrderFinanceError as exc:
+        return JsonResponse({"code": 1, "msg": str(exc), "data": {}}, status=200)
+    response = FileResponse(
+        field_file.open("rb"),
+        content_type=content_type,
+        as_attachment=False,
+        filename=original_name or "payment-voucher.jpg",
+    )
+    response["Cache-Control"] = "private, no-store"
+    return response

@@ -85,6 +85,20 @@ class OrderPlan(models.Model):
         db_index=True,
         verbose_name="提交时间",
     )
+    shipment_authorized_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="发货授权时间",
+    )
+    shipment_authorized_by = models.ForeignKey(
+        "account.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="authorized_order_plan_shipments",
+        verbose_name="发货授权人",
+    )
     shipped_at = models.DateTimeField(null=True, blank=True, verbose_name="发货时间")
     shipped_by = models.ForeignKey(
         "account.User", null=True, blank=True, on_delete=models.SET_NULL,
@@ -119,6 +133,19 @@ class OrderPlan(models.Model):
             models.CheckConstraint(
                 condition=~Q(factory_organization=F("merchant_organization")),
                 name="sales_order_plan_organizations_not_self",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        shipment_authorized_at__isnull=True,
+                        shipment_authorized_by__isnull=True,
+                    )
+                    | Q(
+                        shipment_authorized_at__isnull=False,
+                        shipment_authorized_by__isnull=False,
+                    )
+                ),
+                name="sales_shipment_authorization_fields_together",
             ),
         ]
 

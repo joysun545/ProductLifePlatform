@@ -1,6 +1,8 @@
 import json
 from datetime import timedelta
+from decimal import Decimal
 
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 from django.utils import timezone
 
@@ -20,11 +22,18 @@ from account.services.auth_service import issue_access_token
 from channel.models import MerchantChannelAssignment
 from lifecycle.models import DeviceState, LifecycleEvent, OrganizationDevice
 from product.models import BOM, BOMItem, Brand, ProductCategory, ProductModel
-from sales.services.order_qrcode_print_service import generate_item_qrcodes
+from sales.services.order_qrcode_print_service import (
+    OrderQRCodePrintError,
+    confirm_item_printed,
+    generate_item_qrcodes,
+    get_print_center_data,
+)
 from sales.models import (
     OrderPlan,
     OrderPlanItem,
     OrderPlanItemBOMConfirmation,
+    OrderPlanFinance,
+    OrderPlanPayment,
 )
 from supply_chain.models import (
     Material,
@@ -435,7 +444,14 @@ class OrderPlanApiTests(TestCase):
     def _prepare_outbound_ready_plan(self, client_request_id):
         plan = self._create_plan(client_request_id)
         plan.status = OrderPlan.Status.PRODUCTION_COMPLETED
-        plan.save(update_fields=("status", "updated_at"))
+        plan.shipment_authorized_at = timezone.now()
+        plan.shipment_authorized_by = self.sales_user
+        plan.save(update_fields=(
+            "status",
+            "shipment_authorized_at",
+            "shipment_authorized_by",
+            "updated_at",
+        ))
         plan.items.update(status=OrderPlan.Status.PRODUCTION_COMPLETED)
 
         for item in plan.items.select_related("product_model").order_by("id"):
@@ -738,10 +754,209 @@ class OrderPlanApiTests(TestCase):
             )
         )
 
+    def test_sales_authorization_gates_qrcode_printing_and_stock_outbound(self):
+        plan = self._create_plan("shipment-authorization-flow")
+        plan.status = OrderPlan.Status.PRODUCTION_PENDING
+        plan.save(update_fields=("status", "updated_at"))
+        plan.items.update(status=OrderPlan.Status.PRODUCTION_PENDING)
+
+        production_workitem = WorkItem.objects.create(
+            domain="SALES",
+            type="ORDER_PLAN_PRODUCTION_CONFIRM",
+            biz_id=plan.plan_code,
+            biz_ref=f"sales.OrderPlan:{plan.pk}",
+            uniq_key=f"sales:order-plan:{plan.pk}:production-confirm",
+            title="确认生产完成",
+            summary="物料已到齐，等待厂家生产经理确认",
+            link="/pages/sales/order_plan_list/order_plan_list",
+            action_mode="ANYONE_DO",
+            payload={"order_plan_id": plan.pk, "plan_code": plan.plan_code},
+        )
+        UserTask.objects.create(
+            workitem=production_workitem,
+            to_openid=self.factory_production.wx_openid,
+            to_role_snapshot="factory_production",
+            need_action=True,
+            display_title_snapshot="确认生产完成",
+        )
+
+        production_response = self.client.post(
+            f"/pldp/api/sales/order-plans/{plan.pk}/production-confirm/",
+            HTTP_AUTHORIZATION=self.production_authorization,
+        )
+        self.assertEqual(
+            production_response.json()["code"],
+            0,
+            production_response.json(),
+        )
+        plan.refresh_from_db()
+        self.assertEqual(plan.status, OrderPlan.Status.PRODUCTION_COMPLETED)
+        self.assertIsNone(plan.shipment_authorized_at)
+        self.assertIsNone(plan.shipment_authorized_by)
+
+        authorization_workitem = WorkItem.objects.get(
+            type="ORDER_PLAN_SHIPMENT_AUTHORIZATION",
+            uniq_key=f"sales:order-plan:{plan.pk}:shipment-authorization",
+        )
+        self.assertEqual(authorization_workitem.status, "OPEN")
+        authorization_task = authorization_workitem.user_tasks.get()
+        self.assertEqual(authorization_task.to_openid, self.sales_user.wx_openid)
+        self.assertTrue(authorization_task.need_action)
+
+        self.assertNotIn(
+            plan.pk,
+            {item["id"] for item in get_print_center_data()["orders"]},
+        )
+        first_item = plan.items.order_by("id").first()
+        with self.assertRaisesMessage(
+            OrderQRCodePrintError,
+            "尚未下达发货指令",
+        ):
+            generate_item_qrcodes(item_id=first_item.pk)
+
+        stock_before_authorization = self.client.post(
+            f"/pldp/api/sales/order-plans/{plan.pk}/stock-outbound/",
+            HTTP_AUTHORIZATION=self.stock_authorization,
+        )
+        self.assertEqual(stock_before_authorization.json()["code"], 1)
+        self.assertIn(
+            "尚未下达发货指令",
+            stock_before_authorization.json()["msg"],
+        )
+
+        forbidden = self.client.post(
+            f"/pldp/api/sales/order-plans/{plan.pk}/shipment-authorization/",
+            HTTP_AUTHORIZATION=(
+                f"Bearer {issue_access_token(self.other_sales_user)}"
+            ),
+        )
+        self.assertEqual(forbidden.json()["code"], 1)
+        self.assertIn("创建该订单", forbidden.json()["msg"])
+
+        sales_list = self._get_list(self.authorization).json()["data"]["items"]
+        sales_plan = next(row for row in sales_list if row["id"] == plan.pk)
+        self.assertTrue(sales_plan["shipment_authorization"]["can_confirm"])
+        self.assertEqual(
+            sales_plan["shipment_authorization"]["state"],
+            "PENDING",
+        )
+
+        finance = OrderPlanFinance.objects.get(order_plan=plan)
+        self.assertIsNone(finance.receivable_amount)
+        self.assertFalse(finance.payments.exists())
+
+        authorization_response = self.client.post(
+            f"/pldp/api/sales/order-plans/{plan.pk}/shipment-authorization/",
+            HTTP_AUTHORIZATION=self.authorization,
+        )
+        self.assertEqual(
+            authorization_response.json()["code"],
+            0,
+            authorization_response.json(),
+        )
+        self.assertEqual(
+            authorization_response.json()["msg"],
+            "发货指令已下达",
+        )
+        plan.refresh_from_db()
+        authorization_workitem.refresh_from_db()
+        self.assertEqual(plan.shipment_authorized_by, self.sales_user)
+        self.assertIsNotNone(plan.shipment_authorized_at)
+        self.assertEqual(authorization_workitem.status, "DONE")
+        self.assertEqual(
+            authorization_workitem.done_by_openid,
+            self.sales_user.wx_openid,
+        )
+        authorization_task.refresh_from_db()
+        self.assertEqual(authorization_task.state, "DONE")
+        self.assertFalse(authorization_task.need_action)
+
+        stock_notice = WorkItem.objects.get(
+            type="ORDER_PLAN_SHIPMENT_AUTHORIZED_STOCK",
+            uniq_key=f"sales:order-plan:{plan.pk}:shipment-authorized:stock",
+        )
+        self.assertSetEqual(
+            set(stock_notice.user_tasks.values_list("to_openid", flat=True)),
+            {self.factory_stock.wx_openid},
+        )
+        self.assertFalse(
+            WorkItem.objects.filter(
+                uniq_key=f"sales:order-plan:{plan.pk}:stock-outbound"
+            ).exists()
+        )
+        self.assertIn(
+            plan.pk,
+            {item["id"] for item in get_print_center_data()["orders"]},
+        )
+
+        for item in plan.items.select_related("product_model").order_by("id"):
+            bom = BOM.objects.get(
+                product_model=item.product_model,
+                version="v1",
+                is_active=True,
+            )
+            OrderPlanItemBOMConfirmation.objects.update_or_create(
+                order_plan_item=item,
+                defaults={
+                    "source_bom": bom,
+                    "confirmed_bom": bom,
+                    "confirmed_by": self.matching_user,
+                    "has_changes": False,
+                    "confirmed_at": timezone.now(),
+                },
+            )
+            generated = generate_item_qrcodes(item_id=item.pk)
+            self.assertEqual(len(generated["qrcodes"]), item.quantity)
+            printed = confirm_item_printed(item_id=item.pk)
+
+        self.assertTrue(printed["order_printed"])
+        self.assertTrue(printed["stock_task_created"])
+        stock_workitem = WorkItem.objects.get(
+            type="ORDER_PLAN_STOCK_OUTBOUND",
+            uniq_key=f"sales:order-plan:{plan.pk}:stock-outbound",
+        )
+        self.assertEqual(stock_workitem.status, "OPEN")
+        self.assertEqual(
+            stock_workitem.actor_openid,
+            self.sales_user.wx_openid,
+        )
+
+        outbound_response = self.client.post(
+            f"/pldp/api/sales/order-plans/{plan.pk}/stock-outbound/",
+            HTTP_AUTHORIZATION=self.stock_authorization,
+        )
+        self.assertEqual(
+            outbound_response.json()["code"],
+            0,
+            outbound_response.json(),
+        )
+        plan.refresh_from_db()
+        self.assertEqual(plan.status, OrderPlan.Status.SHIPPED)
+        finance.refresh_from_db()
+        self.assertIsNone(finance.receivable_amount)
+        self.assertFalse(finance.payments.exists())
+
+        repeated_authorization = self.client.post(
+            f"/pldp/api/sales/order-plans/{plan.pk}/shipment-authorization/",
+            HTTP_AUTHORIZATION=self.authorization,
+        )
+        self.assertEqual(repeated_authorization.json()["code"], 0)
+        self.assertEqual(
+            repeated_authorization.json()["msg"],
+            "该订单已经下达发货指令",
+        )
+
     def test_factory_stock_confirms_outbound_in_order_list_and_updates_stages(self):
         plan = self._create_plan("stock-order-list")
         plan.status = OrderPlan.Status.PRODUCTION_COMPLETED
-        plan.save(update_fields=("status", "updated_at"))
+        plan.shipment_authorized_at = timezone.now()
+        plan.shipment_authorized_by = self.sales_user
+        plan.save(update_fields=(
+            "status",
+            "shipment_authorized_at",
+            "shipment_authorized_by",
+            "updated_at",
+        ))
         plan.items.update(status=OrderPlan.Status.PRODUCTION_COMPLETED)
 
         # 按正式打印流程准备BOM、生产批次、设备及二维码。
@@ -970,6 +1185,9 @@ class OrderPlanApiTests(TestCase):
         plan.refresh_from_db()
         accounting_workitem.refresh_from_db()
         self.assertEqual(plan.accounted_by, self.factory_assistant_1)
+        plan.finance.refresh_from_db()
+        self.assertIsNone(plan.finance.statement_submitted_at)
+        self.assertFalse(plan.finance.payments.exists())
         self.assertEqual(accounting_workitem.status, "DONE")
         assistant_actor_task = accounting_workitem.user_tasks.get(
             to_openid=self.factory_assistant_1.wx_openid
@@ -1922,3 +2140,177 @@ class OrderPlanApiTests(TestCase):
 
         self.assertEqual(response.json()["code"], 1)
         self.assertIn("厂家配套经理", response.json()["msg"])
+
+    @staticmethod
+    def _finance_image(name):
+        return SimpleUploadedFile(
+            name,
+            b"\x89PNG\r\n\x1a\n" + b"order-finance-test-image",
+            content_type="image/png",
+        )
+
+    def test_order_finance_supports_private_roles_and_multiple_payments(self):
+        plan = self._create_plan("order-finance-flow")
+        finance = OrderPlanFinance.objects.get(order_plan=plan)
+        self.assertIsNone(finance.receivable_amount)
+
+        statement_workitem = WorkItem.objects.get(
+            type="ORDER_PLAN_FINANCE_STATEMENT",
+            uniq_key=f"sales:order-plan:{plan.pk}:finance-statement",
+        )
+        self.assertSetEqual(
+            set(statement_workitem.user_tasks.values_list("to_openid", flat=True)),
+            {
+                self.factory_assistant_1.wx_openid,
+                self.factory_assistant_2.wx_openid,
+            },
+        )
+
+        sales_list = self._get_list(self.authorization).json()["data"]["items"]
+        sales_plan = next(item for item in sales_list if item["id"] == plan.pk)
+        self.assertEqual(
+            sales_plan["finance_summary"]["state"],
+            "WAITING_STATEMENT",
+        )
+        senior_list = self._get_list(
+            self.merchant_senior_manager_authorization
+        ).json()["data"]["items"]
+        senior_plan = next(item for item in senior_list if item["id"] == plan.pk)
+        self.assertNotIn("finance_summary", senior_plan)
+
+        statement_response = self.client.post(
+            f"/pldp/api/sales/order-plans/{plan.pk}/finance/statement/",
+            {
+                "receivable_amount": "1000.00",
+                "statement_image": self._finance_image("statement.png"),
+            },
+            HTTP_AUTHORIZATION=self.factory_assistant_1_authorization,
+        )
+        self.assertEqual(statement_response.json()["code"], 0, statement_response.json())
+        finance.refresh_from_db()
+        self.assertEqual(finance.receivable_amount, Decimal("1000.00"))
+        self.assertEqual(finance.statement_submitted_by, self.factory_assistant_1)
+        statement_workitem.refresh_from_db()
+        self.assertEqual(statement_workitem.status, "DONE")
+        assistant_peer_task = statement_workitem.user_tasks.get(
+            to_openid=self.factory_assistant_2.wx_openid
+        )
+        self.assertEqual(assistant_peer_task.done_reason, "OTHER_ACTION")
+
+        merchant_payment_task = WorkItem.objects.get(
+            type="ORDER_PLAN_PAYMENT_UPLOAD",
+            uniq_key=f"sales:order-plan:{plan.pk}:payment-upload:1",
+        )
+        self.assertEqual(merchant_payment_task.status, "OPEN")
+        self.assertSetEqual(
+            set(merchant_payment_task.user_tasks.values_list("to_openid", flat=True)),
+            {self.merchant_owner.wx_openid},
+        )
+
+        forbidden_detail = self.client.get(
+            f"/pldp/api/sales/order-plans/{plan.pk}/finance/",
+            HTTP_AUTHORIZATION=self.merchant_senior_manager_authorization,
+        )
+        self.assertEqual(forbidden_detail.json()["code"], 1)
+        other_sales_detail = self.client.get(
+            f"/pldp/api/sales/order-plans/{plan.pk}/finance/",
+            HTTP_AUTHORIZATION=(
+                f"Bearer {issue_access_token(self.other_sales_user)}"
+            ),
+        )
+        self.assertEqual(other_sales_detail.json()["code"], 1)
+
+        first_upload = self.client.post(
+            f"/pldp/api/sales/order-plans/{plan.pk}/finance/payments/",
+            {
+                "client_request_id": "payment-request-1",
+                "voucher_image": self._finance_image("payment-1.png"),
+            },
+            HTTP_AUTHORIZATION=self.merchant_owner_authorization,
+        )
+        self.assertEqual(first_upload.json()["code"], 0, first_upload.json())
+        first_payment = OrderPlanPayment.objects.get(
+            finance=finance,
+            sequence_no=1,
+        )
+        self.assertEqual(first_payment.status, OrderPlanPayment.Status.PENDING)
+        self.assertTrue(
+            WorkItem.objects.filter(
+                type="ORDER_PLAN_PAYMENT_UPLOADED_NOTICE",
+                user_tasks__to_openid=self.sales_user.wx_openid,
+            ).exists()
+        )
+        first_confirm_task = WorkItem.objects.get(
+            uniq_key=(
+                f"sales:order-plan:{plan.pk}:payment:{first_payment.pk}:confirm"
+            )
+        )
+        self.assertSetEqual(
+            set(first_confirm_task.user_tasks.values_list("to_openid", flat=True)),
+            {
+                self.factory_assistant_1.wx_openid,
+                self.factory_assistant_2.wx_openid,
+            },
+        )
+
+        first_confirm = self.client.post(
+            (
+                f"/pldp/api/sales/order-plans/{plan.pk}/finance/payments/"
+                f"{first_payment.pk}/confirm/"
+            ),
+            data=json.dumps({"confirmed_amount": "400.00"}),
+            content_type="application/json",
+            HTTP_AUTHORIZATION=self.factory_assistant_2_authorization,
+        )
+        self.assertEqual(first_confirm.json()["code"], 0, first_confirm.json())
+        self.assertEqual(
+            first_confirm.json()["data"]["confirmed_received_amount"],
+            "400.00",
+        )
+        self.assertEqual(
+            first_confirm.json()["data"]["outstanding_amount"],
+            "600.00",
+        )
+        self.assertTrue(
+            WorkItem.objects.filter(
+                uniq_key=f"sales:order-plan:{plan.pk}:payment-upload:2",
+                status="OPEN",
+            ).exists()
+        )
+
+        second_upload = self.client.post(
+            f"/pldp/api/sales/order-plans/{plan.pk}/finance/payments/",
+            {
+                "client_request_id": "payment-request-2",
+                "voucher_image": self._finance_image("payment-2.png"),
+            },
+            HTTP_AUTHORIZATION=self.merchant_owner_authorization,
+        )
+        self.assertEqual(second_upload.json()["code"], 0, second_upload.json())
+        second_payment = OrderPlanPayment.objects.get(
+            finance=finance,
+            sequence_no=2,
+        )
+        second_confirm = self.client.post(
+            (
+                f"/pldp/api/sales/order-plans/{plan.pk}/finance/payments/"
+                f"{second_payment.pk}/confirm/"
+            ),
+            data=json.dumps({"confirmed_amount": "600.00"}),
+            content_type="application/json",
+            HTTP_AUTHORIZATION=self.factory_assistant_1_authorization,
+        )
+        self.assertEqual(second_confirm.json()["code"], 0, second_confirm.json())
+        self.assertEqual(second_confirm.json()["data"]["state"], "FULLY_RECEIVED")
+        self.assertEqual(second_confirm.json()["data"]["outstanding_amount"], "0.00")
+        self.assertFalse(
+            WorkItem.objects.filter(
+                uniq_key=f"sales:order-plan:{plan.pk}:payment-upload:3"
+            ).exists()
+        )
+
+        # Confirming money never performs or gates the existing shipment-statistics
+        # accounting action.
+        plan.refresh_from_db()
+        self.assertIsNone(plan.accounted_at)
+        self.assertIsNone(plan.accounted_by)

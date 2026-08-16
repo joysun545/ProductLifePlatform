@@ -5,6 +5,8 @@ from .models import (
     OrderPlan,
     OrderPlanItem,
     OrderPlanItemBOMConfirmation,
+    OrderPlanFinance,
+    OrderPlanPayment,
     SalesPlan,
 )
 
@@ -44,6 +46,8 @@ class OrderPlanAdmin(admin.ModelAdmin):
         "total_quantity",
         "status",
         "created_by",
+        "shipment_authorized_by",
+        "shipment_authorized_at",
         "submitted_at",
     )
     list_filter = ("status", "brand", "factory_organization")
@@ -53,9 +57,43 @@ class OrderPlanAdmin(admin.ModelAdmin):
         "region_snapshot",
         "created_by__wx_nickname",
     )
-    readonly_fields = ("plan_code", "total_quantity", "submitted_at")
+    readonly_fields = (
+        "plan_code",
+        "total_quantity",
+        "submitted_at",
+        "shipment_authorized_at",
+    )
     inlines = (OrderPlanItemInline,)
 
 
 admin.site.register(SalesPlan)
 admin.site.register(Batch)
+
+
+@admin.register(OrderPlanFinance)
+class OrderPlanFinanceAdmin(admin.ModelAdmin):
+    list_display = (
+        "order_plan",
+        "receivable_amount",
+        "statement_submitted_by",
+        "statement_submitted_at",
+    )
+    search_fields = ("order_plan__plan_code", "order_plan__merchant_organization__name")
+    readonly_fields = ("created_at", "updated_at")
+
+
+@admin.register(OrderPlanPayment)
+class OrderPlanPaymentAdmin(admin.ModelAdmin):
+    list_display = (
+        "finance",
+        "sequence_no",
+        "status",
+        "confirmed_amount",
+        "uploaded_by",
+        "confirmed_by",
+        "uploaded_at",
+        "confirmed_at",
+    )
+    list_filter = ("status", "uploaded_at", "confirmed_at")
+    search_fields = ("finance__order_plan__plan_code", "uploaded_by__wx_nickname")
+    readonly_fields = ("uploaded_at", "created_at", "updated_at")
