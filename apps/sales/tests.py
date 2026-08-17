@@ -33,6 +33,7 @@ from sales.models import (
     OrderPlanItem,
     OrderPlanItemBOMConfirmation,
     OrderPlanFinance,
+    OrderPlanLogisticsDocument,
     OrderPlanPayment,
 )
 from supply_chain.models import (
@@ -63,6 +64,9 @@ class OrderPlanApiTests(TestCase):
         )
         self.factory_stock_role = OrganizationRole.objects.get(
             code="factory_stock"
+        )
+        self.factory_logistics_role = OrganizationRole.objects.get(
+            code="factory_logistics"
         )
         self.factory_sales_assistant_role = OrganizationRole.objects.get(
             code="factory_sales_assistant"
@@ -142,6 +146,18 @@ class OrderPlanApiTests(TestCase):
             "openid-order-factory-stock",
             self.factory,
             self.factory_stock_role,
+        )
+        self.factory_logistics_1 = self._user_with_identity(
+            "order-factory-logistics-1",
+            "openid-order-factory-logistics-1",
+            self.factory,
+            self.factory_logistics_role,
+        )
+        self.factory_logistics_2 = self._user_with_identity(
+            "order-factory-logistics-2",
+            "openid-order-factory-logistics-2",
+            self.factory,
+            self.factory_logistics_role,
         )
         self.factory_manager = self._user_with_identity(
             "order-factory-manager",
@@ -311,6 +327,9 @@ class OrderPlanApiTests(TestCase):
                 assigned_by=self.supplier_owner,
             )
         self.authorization = f"Bearer {issue_access_token(self.sales_user)}"
+        self.other_sales_authorization = (
+            f"Bearer {issue_access_token(self.other_sales_user)}"
+        )
         self.matching_authorization = (
             f"Bearer {issue_access_token(self.matching_user)}"
         )
@@ -319,6 +338,12 @@ class OrderPlanApiTests(TestCase):
         )
         self.stock_authorization = (
             f"Bearer {issue_access_token(self.factory_stock)}"
+        )
+        self.factory_logistics_1_authorization = (
+            f"Bearer {issue_access_token(self.factory_logistics_1)}"
+        )
+        self.factory_logistics_2_authorization = (
+            f"Bearer {issue_access_token(self.factory_logistics_2)}"
         )
         self.factory_assistant_1_authorization = (
             f"Bearer {issue_access_token(self.factory_assistant_1)}"
@@ -331,6 +356,9 @@ class OrderPlanApiTests(TestCase):
         )
         self.merchant_senior_manager_authorization = (
             f"Bearer {issue_access_token(self.merchant_senior_manager)}"
+        )
+        self.merchant_sales_authorization = (
+            f"Bearer {issue_access_token(self.merchant_sales)}"
         )
         self.merchant_stock_1_authorization = (
             f"Bearer {issue_access_token(self.merchant_stock_1)}"
@@ -810,7 +838,7 @@ class OrderPlanApiTests(TestCase):
         first_item = plan.items.order_by("id").first()
         with self.assertRaisesMessage(
             OrderQRCodePrintError,
-            "尚未下达发货指令",
+            "尚未确认发货",
         ):
             generate_item_qrcodes(item_id=first_item.pk)
 
@@ -820,7 +848,7 @@ class OrderPlanApiTests(TestCase):
         )
         self.assertEqual(stock_before_authorization.json()["code"], 1)
         self.assertIn(
-            "尚未下达发货指令",
+            "尚未确认发货",
             stock_before_authorization.json()["msg"],
         )
 
@@ -856,7 +884,7 @@ class OrderPlanApiTests(TestCase):
         )
         self.assertEqual(
             authorization_response.json()["msg"],
-            "发货指令已下达",
+            "发货已确认",
         )
         plan.refresh_from_db()
         authorization_workitem.refresh_from_db()
@@ -943,7 +971,7 @@ class OrderPlanApiTests(TestCase):
         self.assertEqual(repeated_authorization.json()["code"], 0)
         self.assertEqual(
             repeated_authorization.json()["msg"],
-            "该订单已经下达发货指令",
+            "该订单已经确认发货",
         )
 
     def test_factory_stock_confirms_outbound_in_order_list_and_updates_stages(self):
@@ -1031,6 +1059,193 @@ class OrderPlanApiTests(TestCase):
             [stage["state"] for stage in plan_data["fulfillment_stages"]],
             ["DONE", "DONE", "DONE", "DONE", "CURRENT"],
         )
+
+    def test_logistics_documents_are_parallel_to_receipt_and_notify_merchants(self):
+        plan = self._prepare_outbound_ready_plan("parallel-logistics-documents")
+        outbound_response = self.client.post(
+            f"/pldp/api/sales/order-plans/{plan.pk}/stock-outbound/",
+            HTTP_AUTHORIZATION=self.stock_authorization,
+        )
+        self.assertEqual(outbound_response.json()["code"], 0, outbound_response.json())
+        self.assertTrue(
+            outbound_response.json()["data"]["logistics_task_created"]
+        )
+
+        receipt_workitem = WorkItem.objects.get(
+            type="ORDER_PLAN_MERCHANT_RECEIPT",
+            uniq_key=f"sales:order-plan:{plan.pk}:merchant-receipt",
+        )
+        logistics_workitem = WorkItem.objects.get(
+            type="ORDER_PLAN_LOGISTICS_DOCUMENT_UPLOAD",
+            uniq_key=(
+                f"sales:order-plan:{plan.pk}:logistics-document-upload"
+            ),
+        )
+        self.assertEqual(receipt_workitem.status, "OPEN")
+        self.assertEqual(logistics_workitem.status, "OPEN")
+        self.assertSetEqual(
+            set(logistics_workitem.user_tasks.values_list("to_openid", flat=True)),
+            {
+                self.factory_logistics_1.wx_openid,
+                self.factory_logistics_2.wx_openid,
+            },
+        )
+
+        # 商家实物入库不等待物流经理上传单据。
+        receipt_response = self.client.post(
+            f"/pldp/api/sales/order-plans/{plan.pk}/merchant-receipt/",
+            HTTP_AUTHORIZATION=self.merchant_owner_authorization,
+        )
+        self.assertEqual(receipt_response.json()["code"], 0, receipt_response.json())
+        plan.refresh_from_db()
+        logistics_workitem.refresh_from_db()
+        self.assertEqual(plan.status, OrderPlan.Status.RECEIVED)
+        self.assertEqual(logistics_workitem.status, "OPEN")
+
+        upload_response = self.client.post(
+            f"/pldp/api/sales/order-plans/{plan.pk}/logistics/documents/",
+            data={
+                "client_request_id": "logistics-doc-request-1",
+                "remark": "第一车物流单",
+                "document_file": SimpleUploadedFile(
+                    "waybill-1.pdf",
+                    b"%PDF-1.4\nlogistics-test-document",
+                    content_type="application/pdf",
+                ),
+            },
+            HTTP_AUTHORIZATION=self.factory_logistics_1_authorization,
+        )
+        self.assertEqual(upload_response.json()["code"], 0, upload_response.json())
+        self.assertEqual(upload_response.json()["data"]["sequence_no"], 1)
+        self.assertEqual(OrderPlanLogisticsDocument.objects.filter(order_plan=plan).count(), 1)
+
+        logistics_workitem.refresh_from_db()
+        self.assertEqual(logistics_workitem.status, "DONE")
+        self.assertEqual(
+            logistics_workitem.done_by_openid,
+            self.factory_logistics_1.wx_openid,
+        )
+        actor_task = logistics_workitem.user_tasks.get(
+            to_openid=self.factory_logistics_1.wx_openid,
+        )
+        peer_task = logistics_workitem.user_tasks.get(
+            to_openid=self.factory_logistics_2.wx_openid,
+        )
+        self.assertEqual(actor_task.done_reason, "SELF_ACTION")
+        self.assertEqual(peer_task.done_reason, "OTHER_ACTION")
+        self.assertIn(
+            self.factory_logistics_1.wx_nickname,
+            peer_task.display_title_snapshot,
+        )
+
+        first_document = OrderPlanLogisticsDocument.objects.get(order_plan=plan)
+        first_notice = WorkItem.objects.get(
+            type="ORDER_PLAN_LOGISTICS_DOCUMENT_AVAILABLE",
+            uniq_key=(
+                f"sales:order-plan:{plan.pk}:logistics-document:"
+                f"{first_document.pk}:available"
+            ),
+        )
+        self.assertSetEqual(
+            set(first_notice.user_tasks.values_list("to_openid", flat=True)),
+            {
+                self.sales_user.wx_openid,
+                self.merchant_owner.wx_openid,
+                self.merchant_sales.wx_openid,
+                self.merchant_stock_1.wx_openid,
+                self.merchant_stock_2.wx_openid,
+            },
+        )
+        self.assertFalse(
+            first_notice.user_tasks.filter(
+                to_openid=self.merchant_senior_manager.wx_openid,
+            ).exists()
+        )
+        self.assertFalse(
+            first_notice.user_tasks.filter(
+                to_openid=self.other_sales_user.wx_openid,
+            ).exists()
+        )
+
+        sales_detail = self.client.get(
+            f"/pldp/api/sales/order-plans/{plan.pk}/logistics/",
+            HTTP_AUTHORIZATION=self.authorization,
+        )
+        self.assertEqual(sales_detail.json()["code"], 0, sales_detail.json())
+        self.assertFalse(sales_detail.json()["data"]["actions"]["can_upload"])
+        self.assertEqual(len(sales_detail.json()["data"]["documents"]), 1)
+
+        unrelated_sales_detail = self.client.get(
+            f"/pldp/api/sales/order-plans/{plan.pk}/logistics/",
+            HTTP_AUTHORIZATION=self.other_sales_authorization,
+        )
+        self.assertEqual(unrelated_sales_detail.json()["code"], 1)
+
+        merchant_detail = self.client.get(
+            f"/pldp/api/sales/order-plans/{plan.pk}/logistics/",
+            HTTP_AUTHORIZATION=self.merchant_sales_authorization,
+        )
+        self.assertEqual(merchant_detail.json()["code"], 0, merchant_detail.json())
+        self.assertFalse(merchant_detail.json()["data"]["actions"]["can_upload"])
+        self.assertEqual(len(merchant_detail.json()["data"]["documents"]), 1)
+        preview_path = merchant_detail.json()["data"]["documents"][0][
+            "preview_path"
+        ]
+        document_response = self.client.get(
+            f"/pldp/api{preview_path}",
+            HTTP_AUTHORIZATION=self.merchant_sales_authorization,
+        )
+        self.assertEqual(document_response.status_code, 200)
+        self.assertEqual(document_response["Content-Type"], "application/pdf")
+        self.assertEqual(document_response["Cache-Control"], "private, no-store")
+
+        senior_detail = self.client.get(
+            f"/pldp/api/sales/order-plans/{plan.pk}/logistics/",
+            HTTP_AUTHORIZATION=self.merchant_senior_manager_authorization,
+        )
+        self.assertEqual(senior_detail.json()["code"], 1)
+
+        # 首份单据完成操作任务后，物流经理仍可补充后续车辆/批次单据。
+        second_upload = self.client.post(
+            f"/pldp/api/sales/order-plans/{plan.pk}/logistics/documents/",
+            data={
+                "client_request_id": "logistics-doc-request-2",
+                "remark": "第二车物流单",
+                "document_file": SimpleUploadedFile(
+                    "waybill-2.png",
+                    b"\x89PNG\r\n\x1a\nlogistics-test-image",
+                    content_type="image/png",
+                ),
+            },
+            HTTP_AUTHORIZATION=self.factory_logistics_2_authorization,
+        )
+        self.assertEqual(second_upload.json()["code"], 0, second_upload.json())
+        self.assertEqual(second_upload.json()["data"]["sequence_no"], 2)
+        self.assertEqual(OrderPlanLogisticsDocument.objects.filter(order_plan=plan).count(), 2)
+        self.assertEqual(
+            WorkItem.objects.filter(
+                type="ORDER_PLAN_LOGISTICS_DOCUMENT_AVAILABLE",
+                biz_ref=f"sales.OrderPlan:{plan.pk}",
+            ).count(),
+            2,
+        )
+
+        logistics_list = self._get_list(
+            self.factory_logistics_1_authorization,
+        ).json()["data"]
+        logistics_plan = next(
+            item for item in logistics_list["items"] if item["id"] == plan.pk
+        )
+        self.assertEqual(logistics_plan["logistics_summary"]["document_count"], 2)
+        self.assertTrue(logistics_plan["logistics_summary"]["can_upload"])
+
+        merchant_list = self._get_list(
+            self.merchant_owner_authorization,
+        ).json()["data"]
+        merchant_plan = next(
+            item for item in merchant_list["items"] if item["id"] == plan.pk
+        )
+        self.assertTrue(merchant_plan["logistics_summary"]["can_view"])
 
     def test_merchant_receipt_and_accounting_are_shared_and_idempotent(self):
         plan = self._prepare_outbound_ready_plan("merchant-shared-receipt")

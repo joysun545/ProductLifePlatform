@@ -52,6 +52,12 @@ from sales.services.order_finance_service import (
     submit_order_statement,
     upload_payment_voucher,
 )
+from sales.services.order_logistics_service import (
+    OrderLogisticsError,
+    get_logistics_document_file,
+    get_order_logistics_detail,
+    upload_order_logistics_document,
+)
 
 
 def _request_data(request):
@@ -309,7 +315,7 @@ def shipment_authorization(request, plan_id):
     return JsonResponse(
         {
             "code": 0,
-            "msg": "发货指令已下达" if changed else "该订单已经下达发货指令",
+            "msg": "发货已确认" if changed else "该订单已经确认发货",
             "data": result,
         },
         status=200,
@@ -511,6 +517,70 @@ def order_finance_voucher_image(request, plan_id, payment_id):
         content_type=content_type,
         as_attachment=False,
         filename=original_name or "payment-voucher.jpg",
+    )
+    response["Cache-Control"] = "private, no-store"
+    return response
+
+
+def order_logistics_detail(request, plan_id):
+    if request.method != "GET":
+        return _method_error("GET")
+    user, error_response = _authenticated_user(request)
+    if error_response:
+        return error_response
+    try:
+        result = get_order_logistics_detail(user=user, plan_id=plan_id)
+    except OrderLogisticsError as exc:
+        return JsonResponse({"code": 1, "msg": str(exc), "data": {}}, status=200)
+    return JsonResponse({"code": 0, "msg": "", "data": result}, status=200)
+
+
+@csrf_exempt
+def order_logistics_documents(request, plan_id):
+    if request.method != "POST":
+        return _method_error("POST")
+    user, error_response = _authenticated_user(request)
+    if error_response:
+        return error_response
+    try:
+        result, created = upload_order_logistics_document(
+            user=user,
+            plan_id=plan_id,
+            client_request_id=request.POST.get("client_request_id"),
+            document_file=request.FILES.get("document_file"),
+            remark=request.POST.get("remark", ""),
+        )
+    except OrderLogisticsError as exc:
+        return JsonResponse({"code": 1, "msg": str(exc), "data": {}}, status=200)
+    return JsonResponse(
+        {
+            "code": 0,
+            "msg": "物流单据已上传" if created else "该物流单据已经上传，请勿重复提交",
+            "data": result,
+        },
+        status=200,
+    )
+
+
+def order_logistics_document_file(request, plan_id, document_id):
+    if request.method != "GET":
+        return _method_error("GET")
+    user, error_response = _authenticated_user(request)
+    if error_response:
+        return error_response
+    try:
+        field_file, original_name, content_type = get_logistics_document_file(
+            user=user,
+            plan_id=plan_id,
+            document_id=document_id,
+        )
+    except OrderLogisticsError as exc:
+        return JsonResponse({"code": 1, "msg": str(exc), "data": {}}, status=200)
+    response = FileResponse(
+        field_file.open("rb"),
+        content_type=content_type,
+        as_attachment=False,
+        filename=original_name or "logistics-document",
     )
     response["Cache-Control"] = "private, no-store"
     return response

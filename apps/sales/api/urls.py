@@ -63,5 +63,8 @@ urlpatterns = [
     path("order-plans/<int:plan_id>/finance/payments/", views.order_finance_payments, name="order_finance_payments"),
     path("order-plans/<int:plan_id>/finance/payments/<int:payment_id>/confirm/", views.order_finance_payment_confirm, name="order_finance_payment_confirm"),
     path("order-plans/<int:plan_id>/finance/payments/<int:payment_id>/voucher-image/", views.order_finance_voucher_image, name="order_finance_voucher_image"),
+    path("order-plans/<int:plan_id>/logistics/", views.order_logistics_detail, name="order_logistics_detail"),
+    path("order-plans/<int:plan_id>/logistics/documents/", views.order_logistics_documents, name="order_logistics_documents"),
+    path("order-plans/<int:plan_id>/logistics/documents/<int:document_id>/file/", views.order_logistics_document_file, name="order_logistics_document_file"),
     path("order-plans/<int:plan_id>/items/<int:item_id>/lifecycle-qrcode/", views.lifecycle_qrcode, name="lifecycle_qrcode"),
 ]

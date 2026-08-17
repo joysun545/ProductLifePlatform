@@ -28,6 +28,8 @@ staticfiles/
 # User uploaded files
 media/
 private_order_finance/
+private_order_logistics/
+private_goods_transfer/
 
 # ==========================================
 # Environment variables / secrets

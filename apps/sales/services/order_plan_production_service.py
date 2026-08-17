@@ -14,6 +14,7 @@ from sales.services.order_plan_shipment_authorization_service import (
     OrderPlanShipmentAuthorizationError,
     publish_shipment_authorization_task,
 )
+from sales.services.order_logistics_service import publish_logistics_upload_task
 
 
 class OrderPlanProductionError(Exception):
@@ -124,7 +125,7 @@ def get_stock_outbound_detail(*, user, plan_id):
     plan = _plan(identity, plan_id)
     if not plan.shipment_authorized_at or not plan.shipment_authorized_by_id:
         raise OrderPlanProductionError(
-            "创建订单的厂家销售经理尚未下达发货指令。"
+            "创建订单的厂家销售经理尚未确认发货。"
         )
     workitem = WorkItem.objects.filter(
         type="ORDER_PLAN_STOCK_OUTBOUND",
@@ -151,7 +152,7 @@ def confirm_stock_outbound(*, user, plan_id):
     plan = _plan(identity, plan_id, lock=True)
     if not plan.shipment_authorized_at or not plan.shipment_authorized_by_id:
         raise OrderPlanProductionError(
-            "创建订单的厂家销售经理尚未下达发货指令，不能出库。"
+            "创建订单的厂家销售经理尚未确认发货，不能出库。"
         )
     workitem = WorkItem.objects.select_for_update().filter(
         type="ORDER_PLAN_STOCK_OUTBOUND",
@@ -261,10 +262,15 @@ def confirm_stock_outbound(*, user, plan_id):
         action_mode="ANYONE_DO", payload=payload,
         actor_openid=user.wx_openid or "", mark_workitem_done_immediately=False,
     )
+    logistics_workitem = publish_logistics_upload_task(
+        plan=plan,
+        actor_openid=user.wx_openid or "",
+    )
     return {
         "order_plan_id": plan.pk,
         "plan_code": plan.plan_code,
         "outbound_completed": True,
+        "logistics_task_created": logistics_workitem is not None,
     }, True
 
 
@@ -273,7 +279,7 @@ def render_lifecycle_qrcode(*, user, plan_id, item_id):
     plan = _plan(identity, plan_id)
     if not plan.shipment_authorized_at or not plan.shipment_authorized_by_id:
         raise OrderPlanProductionError(
-            "创建订单的厂家销售经理尚未下达发货指令。"
+            "创建订单的厂家销售经理尚未确认发货。"
         )
     item = OrderPlanItem.objects.filter(pk=item_id, plan=plan).first()
     if not item:

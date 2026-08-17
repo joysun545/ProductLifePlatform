@@ -6,6 +6,7 @@ from .models import (
     OrderPlanItem,
     OrderPlanItemBOMConfirmation,
     OrderPlanFinance,
+    OrderPlanLogisticsDocument,
     OrderPlanPayment,
     SalesPlan,
 )
@@ -96,4 +97,24 @@ class OrderPlanPaymentAdmin(admin.ModelAdmin):
     )
     list_filter = ("status", "uploaded_at", "confirmed_at")
     search_fields = ("finance__order_plan__plan_code", "uploaded_by__wx_nickname")
+    readonly_fields = ("uploaded_at", "created_at", "updated_at")
+
+
+@admin.register(OrderPlanLogisticsDocument)
+class OrderPlanLogisticsDocumentAdmin(admin.ModelAdmin):
+    list_display = (
+        "order_plan",
+        "sequence_no",
+        "original_name",
+        "file_type",
+        "uploaded_by",
+        "uploaded_at",
+    )
+    list_filter = ("file_type", "uploaded_at")
+    search_fields = (
+        "order_plan__plan_code",
+        "order_plan__merchant_organization__name",
+        "original_name",
+        "uploaded_by__wx_nickname",
+    )
     readonly_fields = ("uploaded_at", "created_at", "updated_at")

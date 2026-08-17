@@ -2,8 +2,14 @@ from django.db.models import Prefetch
 
 from account.models import UserOrganization
 from product.models import BOMItem
-from sales.models import OrderPlan, OrderPlanItem, OrderPlanPayment
+from sales.models import (
+    OrderPlan,
+    OrderPlanItem,
+    OrderPlanLogisticsDocument,
+    OrderPlanPayment,
+)
 from sales.services.order_finance_service import serialize_finance_summary
+from sales.services.order_logistics_service import serialize_logistics_summary
 from supply_chain.services.supplier_responsibility_service import (
     get_responsible_material_ids,
 )
@@ -20,6 +26,7 @@ FACTORY_ROLE_CODES = {
     "factory_matching",
     "factory_production",
     "factory_stock",
+    "factory_logistics",
 }
 MERCHANT_ROLE_CODES = {
     "merchant_owner",
@@ -316,7 +323,7 @@ def _shipment_authorization_data(plan, workitem, openid):
         "task_id": task.pk if task else None,
         "state": "AUTHORIZED" if authorized else "PENDING",
         "state_name": (
-            "已下达发货指令" if authorized else "待下达发货指令"
+            "已确认发货" if authorized else "待确认发货"
         ),
         "authorized_by_name": authorized_by_name,
         "authorized_at": (
@@ -686,7 +693,7 @@ def get_order_plan_list(user, status="", limit=50):
         )
     elif role_code in {
         "factory_matching", "factory_production", "factory_stock",
-        "factory_sales_assistant",
+        "factory_sales_assistant", "factory_logistics",
     }:
         visibility = "factory_all"
         plans = plans.filter(factory_organization=identity.organization)
@@ -769,6 +776,13 @@ def get_order_plan_list(user, status="", limit=50):
                 "confirmed_by",
             ).order_by("sequence_no", "id"),
         ),
+        Prefetch(
+            "logistics_documents",
+            queryset=OrderPlanLogisticsDocument.objects.select_related(
+                "uploaded_by",
+            ).order_by("sequence_no", "id"),
+            to_attr="visible_logistics_documents",
+        ),
     )[:limit])
     workitems_by_plan = _supplier_workitems([plan.pk for plan in plans])
     production_by_plan = _production_workitems([plan.pk for plan in plans])
@@ -837,6 +851,9 @@ def get_order_plan_list(user, status="", limit=50):
         finance_summary = serialize_finance_summary(plan, user, role_code)
         if finance_summary is not None:
             item["finance_summary"] = finance_summary
+        logistics_summary = serialize_logistics_summary(plan, role_code)
+        if logistics_summary is not None:
+            item["logistics_summary"] = logistics_summary
 
     return {
         "viewer": {
