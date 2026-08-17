@@ -33,6 +33,8 @@ from .serializers import (
     InstallDeviceSerializer,
     RefreshInstallationInvitationSerializer,
     ResolveQRCodeSerializer,
+    CreateGoodsTransferSerializer,
+    ScanGoodsTransferDeviceSerializer,
 )
 
 
@@ -48,6 +50,553 @@ from lifecycle.services.customer_service import (
     CustomerFlowPermissionError,
     CustomerFlowStateError,
 )
+from lifecycle.services.goods_transfer_service import (
+    GoodsTransferError,
+    confirm_goods_transfer_receipt,
+    create_goods_transfer,
+    get_goods_transfer_detail,
+    get_goods_transfer_list,
+    get_goods_transfer_options,
+    scan_goods_transfer_device,
+    submit_goods_transfer,
+)
+from lifecycle.services.goods_transfer_settlement_service import (
+    GoodsTransferSettlementError,
+    confirm_goods_transfer_payment,
+    get_goods_transfer_settlement_detail,
+    get_logistics_document_file as get_goods_transfer_logistics_document_file,
+    get_payment_voucher_file as get_goods_transfer_payment_voucher_file,
+    get_statement_file as get_goods_transfer_statement_file,
+    submit_goods_transfer_statement,
+    upload_goods_transfer_logistics_document,
+    upload_goods_transfer_payment_voucher,
+)
+from lifecycle.services.goods_transfer_account_service import (
+    GoodsTransferAccountError,
+    allocate_goods_transfer_credit,
+    confirm_goods_transfer_account_case,
+    confirm_goods_transfer_account_payment,
+    get_goods_transfer_account_payment_file,
+    get_goods_transfer_account_statement_file,
+    get_goods_transfer_accounts,
+    submit_goods_transfer_account_case,
+    upload_goods_transfer_account_payment,
+)
+
+
+def _authenticated_flow_user(request):
+    try:
+        return authenticate_request(request), None
+    except ApiAuthenticationError as exc:
+        return None, Response(
+            {"code": 401, "msg": str(exc), "data": {}},
+            status=status.HTTP_401_UNAUTHORIZED,
+        )
+
+
+def _goods_transfer_error(exc):
+    return Response(
+        {"code": 1, "msg": str(exc), "data": {}},
+        status=status.HTTP_409_CONFLICT,
+    )
+
+
+class GoodsTransferOptionsAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            data = get_goods_transfer_options(
+                user=user,
+                flow_type=request.GET.get("flow_type"),
+            )
+        except GoodsTransferError as exc:
+            return _goods_transfer_error(exc)
+        return Response({"code": 0, "msg": "success", "data": data})
+
+
+class GoodsTransferListCreateAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            data = get_goods_transfer_list(
+                user=user,
+                limit=request.GET.get("limit", 50),
+            )
+        except GoodsTransferError as exc:
+            return _goods_transfer_error(exc)
+        return Response({"code": 0, "msg": "success", "data": data})
+
+    def post(self, request):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        serializer = CreateGoodsTransferSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            data, created = create_goods_transfer(
+                user=user,
+                **serializer.validated_data,
+            )
+        except GoodsTransferError as exc:
+            return _goods_transfer_error(exc)
+        return Response(
+            {
+                "code": 0,
+                "msg": "商品流转单已创建" if created else "商品流转单已存在",
+                "data": data,
+            },
+            status=(
+                status.HTTP_201_CREATED if created else status.HTTP_200_OK
+            ),
+        )
+
+
+class GoodsTransferDetailAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request, transfer_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            data = get_goods_transfer_detail(
+                user=user,
+                transfer_id=transfer_id,
+            )
+        except GoodsTransferError as exc:
+            return _goods_transfer_error(exc)
+        return Response({"code": 0, "msg": "success", "data": data})
+
+
+class GoodsTransferScanAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, transfer_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        serializer = ScanGoodsTransferDeviceSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            data = scan_goods_transfer_device(
+                user=user,
+                transfer_id=transfer_id,
+                **serializer.validated_data,
+            )
+        except GoodsTransferError as exc:
+            return _goods_transfer_error(exc)
+        return Response({"code": 0, "msg": "设备已加入流转", "data": data})
+
+
+class GoodsTransferSubmitAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, transfer_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            data, changed = submit_goods_transfer(
+                user=user,
+                transfer_id=transfer_id,
+            )
+        except GoodsTransferError as exc:
+            return _goods_transfer_error(exc)
+        return Response({
+            "code": 0,
+            "msg": "商品流转已提交" if changed else "商品流转已提交",
+            "data": data,
+        })
+
+
+class GoodsTransferReceiptAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, transfer_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            data, changed = confirm_goods_transfer_receipt(
+                user=user,
+                transfer_id=transfer_id,
+            )
+        except GoodsTransferError as exc:
+            return _goods_transfer_error(exc)
+        return Response({
+            "code": 0,
+            "msg": "商品入库已确认" if changed else "商品已经入库",
+            "data": data,
+        })
+
+
+def _goods_transfer_settlement_error(exc):
+    return Response(
+        {"code": 1, "msg": str(exc), "data": {}},
+        status=status.HTTP_409_CONFLICT,
+    )
+
+
+def _private_file_response(field_file, original_name, content_type, fallback):
+    response = FileResponse(
+        field_file.open("rb"),
+        content_type=content_type,
+        as_attachment=False,
+        filename=original_name or fallback,
+    )
+    response["Cache-Control"] = "private, no-store"
+    return response
+
+
+class GoodsTransferSettlementDetailAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request, transfer_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            data = get_goods_transfer_settlement_detail(
+                user=user,
+                transfer_id=transfer_id,
+            )
+        except GoodsTransferSettlementError as exc:
+            return _goods_transfer_settlement_error(exc)
+        return Response({"code": 0, "msg": "success", "data": data})
+
+
+class GoodsTransferSettlementStatementAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, transfer_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            data = submit_goods_transfer_statement(
+                user=user,
+                transfer_id=transfer_id,
+                receivable_amount=request.data.get("receivable_amount"),
+                image=request.FILES.get("statement_image"),
+            )
+        except GoodsTransferSettlementError as exc:
+            return _goods_transfer_settlement_error(exc)
+        return Response({"code": 0, "msg": "货品清单和应收金额已提交", "data": data})
+
+
+class GoodsTransferSettlementLogisticsDocumentsAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, transfer_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            data, created = upload_goods_transfer_logistics_document(
+                user=user,
+                transfer_id=transfer_id,
+                client_request_id=request.data.get("client_request_id"),
+                document=request.FILES.get("document_file"),
+                remark=request.data.get("remark", ""),
+            )
+        except GoodsTransferSettlementError as exc:
+            return _goods_transfer_settlement_error(exc)
+        return Response({
+            "code": 0,
+            "msg": "物流单据已上传" if created else "该物流单据已经上传，请勿重复提交",
+            "data": data,
+        })
+
+
+class GoodsTransferSettlementPaymentsAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, transfer_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            data, created = upload_goods_transfer_payment_voucher(
+                user=user,
+                transfer_id=transfer_id,
+                client_request_id=request.data.get("client_request_id"),
+                image=request.FILES.get("voucher_image"),
+            )
+        except GoodsTransferSettlementError as exc:
+            return _goods_transfer_settlement_error(exc)
+        return Response({
+            "code": 0,
+            "msg": "付款凭证已上传" if created else "付款凭证已经上传，请勿重复提交",
+            "data": data,
+        })
+
+
+class GoodsTransferSettlementPaymentConfirmAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, transfer_id, payment_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            data, changed = confirm_goods_transfer_payment(
+                user=user,
+                transfer_id=transfer_id,
+                payment_id=payment_id,
+                amount=request.data.get("confirmed_amount"),
+            )
+        except GoodsTransferSettlementError as exc:
+            return _goods_transfer_settlement_error(exc)
+        return Response({
+            "code": 0,
+            "msg": "收款已确认" if changed else "该笔收款已经确认",
+            "data": data,
+        })
+
+
+class GoodsTransferSettlementStatementFileAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request, transfer_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            file_value = get_goods_transfer_statement_file(
+                user=user,
+                transfer_id=transfer_id,
+            )
+        except GoodsTransferSettlementError as exc:
+            return _goods_transfer_settlement_error(exc)
+        return _private_file_response(*file_value, fallback="goods-statement.jpg")
+
+
+class GoodsTransferSettlementLogisticsDocumentFileAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request, transfer_id, document_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            file_value = get_goods_transfer_logistics_document_file(
+                user=user,
+                transfer_id=transfer_id,
+                document_id=document_id,
+            )
+        except GoodsTransferSettlementError as exc:
+            return _goods_transfer_settlement_error(exc)
+        return _private_file_response(*file_value, fallback="logistics-document")
+
+
+class GoodsTransferSettlementPaymentVoucherFileAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request, transfer_id, payment_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            file_value = get_goods_transfer_payment_voucher_file(
+                user=user,
+                transfer_id=transfer_id,
+                payment_id=payment_id,
+            )
+        except GoodsTransferSettlementError as exc:
+            return _goods_transfer_settlement_error(exc)
+        return _private_file_response(*file_value, fallback="payment-voucher.jpg")
+
+
+class GoodsTransferAccountsAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request, transfer_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            data = get_goods_transfer_accounts(user=user, transfer_id=transfer_id)
+        except GoodsTransferAccountError as exc:
+            return _goods_transfer_settlement_error(exc)
+        return Response({"code": 0, "msg": "success", "data": data})
+
+
+class GoodsTransferAccountSubmitAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, transfer_id, case_type):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            data = submit_goods_transfer_account_case(
+                user=user,
+                transfer_id=transfer_id,
+                case_type=case_type,
+                amount=request.data.get("amount"),
+                no_amount=request.data.get("no_amount", False),
+                remark=request.data.get("remark", ""),
+                image=request.FILES.get("statement_image"),
+            )
+        except GoodsTransferAccountError as exc:
+            return _goods_transfer_settlement_error(exc)
+        return Response({"code": 0, "msg": "往来金额已提交，等待对方确认", "data": data})
+
+
+class GoodsTransferAccountConfirmAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, transfer_id, case_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            data = confirm_goods_transfer_account_case(
+                user=user,
+                transfer_id=transfer_id,
+                case_id=case_id,
+                action=request.data.get("action"),
+                rejection_reason=request.data.get("rejection_reason", ""),
+            )
+        except GoodsTransferAccountError as exc:
+            return _goods_transfer_settlement_error(exc)
+        return Response({"code": 0, "msg": "往来金额已处理", "data": data})
+
+
+class GoodsTransferAccountAllocationsAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, transfer_id, case_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            data = allocate_goods_transfer_credit(
+                user=user,
+                transfer_id=transfer_id,
+                case_id=case_id,
+                target_kind=request.data.get("target_kind"),
+                target_id=request.data.get("target_id"),
+                amount=request.data.get("amount"),
+            )
+        except (GoodsTransferAccountError, TypeError, ValueError) as exc:
+            return _goods_transfer_settlement_error(exc)
+        return Response({"code": 0, "msg": "退货冲抵已关联应收批次", "data": data})
+
+
+class GoodsTransferAccountPaymentsAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, transfer_id, case_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            data, created = upload_goods_transfer_account_payment(
+                user=user,
+                transfer_id=transfer_id,
+                case_id=case_id,
+                client_request_id=request.data.get("client_request_id"),
+                image=request.FILES.get("voucher_image"),
+            )
+        except GoodsTransferAccountError as exc:
+            return _goods_transfer_settlement_error(exc)
+        return Response({
+            "code": 0,
+            "msg": "付款凭证已上传" if created else "付款凭证已经上传，请勿重复提交",
+            "data": data,
+        })
+
+
+class GoodsTransferAccountPaymentConfirmAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, transfer_id, case_id, payment_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            data, changed = confirm_goods_transfer_account_payment(
+                user=user,
+                transfer_id=transfer_id,
+                case_id=case_id,
+                payment_id=payment_id,
+                amount=request.data.get("confirmed_amount"),
+            )
+        except GoodsTransferAccountError as exc:
+            return _goods_transfer_settlement_error(exc)
+        return Response({
+            "code": 0,
+            "msg": "收款已确认" if changed else "该笔收款已经确认",
+            "data": data,
+        })
+
+
+class GoodsTransferAccountStatementFileAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request, transfer_id, case_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            file_value = get_goods_transfer_account_statement_file(
+                user=user,
+                transfer_id=transfer_id,
+                case_id=case_id,
+            )
+        except GoodsTransferAccountError as exc:
+            return _goods_transfer_settlement_error(exc)
+        return _private_file_response(*file_value, fallback="account-statement.jpg")
+
+
+class GoodsTransferAccountPaymentVoucherFileAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request, transfer_id, case_id, payment_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            file_value = get_goods_transfer_account_payment_file(
+                user=user,
+                transfer_id=transfer_id,
+                case_id=case_id,
+                payment_id=payment_id,
+            )
+        except GoodsTransferAccountError as exc:
+            return _goods_transfer_settlement_error(exc)
+        return _private_file_response(*file_value, fallback="account-payment.jpg")
 
 
 class QRCodeResolveAPI(APIView):

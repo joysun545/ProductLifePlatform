@@ -101,6 +101,11 @@ class DeviceState(models.Model):
             "已报废"
         ),
 
+        (
+            "RETURNED_TO_FACTORY",
+            "已退回厂家"
+        ),
+
     ]
 
 

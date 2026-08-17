@@ -87,6 +87,11 @@ class OrganizationDevice(models.Model):
             "流转中"
         ),
 
+        (
+            "RETURNED_TO_FACTORY",
+            "已退回厂家"
+        ),
+
     ]
 
 

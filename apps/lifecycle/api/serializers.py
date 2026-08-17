@@ -66,3 +66,26 @@ class ActivateCustomerDeviceSerializer(serializers.Serializer):
         max_length=128,
         trim_whitespace=True,
     )
+
+
+class CreateGoodsTransferSerializer(serializers.Serializer):
+    flow_type = serializers.ChoiceField(
+        choices=("SHIPMENT", "RETURN", "TRANSFER")
+    )
+    client_request_id = serializers.CharField(max_length=64)
+    source_account_id = serializers.IntegerField(
+        required=False,
+        allow_null=True,
+        min_value=1,
+    )
+    target_account_id = serializers.IntegerField(min_value=1)
+    remark = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=255,
+        trim_whitespace=True,
+    )
+
+
+class ScanGoodsTransferDeviceSerializer(serializers.Serializer):
+    qr_text = serializers.CharField(max_length=1024, trim_whitespace=True)

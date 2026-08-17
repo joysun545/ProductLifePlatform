@@ -17,6 +17,20 @@ from .installation import InstallationInvitation, InstallationRecord
 
 from .document_read import ProductDocumentRead
 
+from .goods_transfer import GoodsTransfer, GoodsTransferItem
+
+from .goods_transfer_settlement import (
+    GoodsTransferLogisticsDocument,
+    GoodsTransferPayment,
+    GoodsTransferSettlement,
+)
+
+from .goods_transfer_accounts import (
+    GoodsTransferAccountCase,
+    GoodsTransferAccountPayment,
+    GoodsTransferCreditAllocation,
+)
+
 
 __all__ = [
 
@@ -37,5 +51,21 @@ __all__ = [
     "InstallationInvitation",
 
     "ProductDocumentRead",
+
+    "GoodsTransfer",
+
+    "GoodsTransferItem",
+
+    "GoodsTransferSettlement",
+
+    "GoodsTransferLogisticsDocument",
+
+    "GoodsTransferPayment",
+
+    "GoodsTransferAccountCase",
+
+    "GoodsTransferAccountPayment",
+
+    "GoodsTransferCreditAllocation",
 
 ]
