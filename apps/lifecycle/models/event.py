@@ -115,6 +115,41 @@ class LifecycleEvent(models.Model):
             "设备报废"
         ),
 
+        (
+            "FACTORY_RETURN_PICKUP",
+            "厂家物流取回"
+        ),
+
+        (
+            "FACTORY_RETURN_INTAKE",
+            "退货分类入库"
+        ),
+
+        (
+            "FACTORY_RETURN_REPAIR_DIAGNOSIS",
+            "退货设备修复诊断"
+        ),
+
+        (
+            "FACTORY_RETURN_REPAIR_COMPLETE",
+            "退货设备修复完成"
+        ),
+
+        (
+            "FACTORY_RETURN_DISASSEMBLY_COMPLETE",
+            "退货设备拆机完成"
+        ),
+
+        (
+            "FACTORY_RETURN_MATCHING_COMPLETE",
+            "退货设备配套处置完成"
+        ),
+
+        (
+            "LIFECYCLE_CLOSE",
+            "生命周期结束"
+        ),
+
     ]
 
 

@@ -31,6 +31,12 @@ from .goods_transfer_accounts import (
     GoodsTransferCreditAllocation,
 )
 
+from .factory_return import (
+    FactoryReturnDocument,
+    FactoryReturnInventoryItem,
+    FactoryReturnProcess,
+)
+
 
 __all__ = [
 
@@ -67,5 +73,11 @@ __all__ = [
     "GoodsTransferAccountPayment",
 
     "GoodsTransferCreditAllocation",
+
+    "FactoryReturnProcess",
+
+    "FactoryReturnInventoryItem",
+
+    "FactoryReturnDocument",
 
 ]

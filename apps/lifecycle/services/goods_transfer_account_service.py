@@ -244,8 +244,13 @@ def _publish_submit_task(case, actor_openid=""):
     recipients = _role_openids(_submitter_org(case))
     if not recipients:
         return None
+    return_title = (
+        "退货已由厂家取回，待提交退货冲抵金额"
+        if case.upper_organization.organization_type.code == "OWNER"
+        else "退货已入库，待提交退货冲抵金额"
+    )
     titles = {
-        GoodsTransferAccountCase.CaseType.RETURN_CREDIT: "退货已入库，待提交退货冲抵金额",
+        GoodsTransferAccountCase.CaseType.RETURN_CREDIT: return_title,
         GoodsTransferAccountCase.CaseType.TRANSFER_OUT_CREDIT: "调货已完成，待提交调出方冲抵金额",
         GoodsTransferAccountCase.CaseType.TRANSFER_IN_RECEIVABLE: "调货已完成，待提交调入方新增应收",
     }
@@ -401,7 +406,21 @@ def initialize_goods_transfer_accounts(*, transfer, actor=None):
         "from_organization__organization_type",
         "to_organization__organization_type",
     ).get(pk=transfer.pk)
-    if transfer.status != GoodsTransfer.Status.COMPLETED:
+    factory_return_picked_up = bool(
+        transfer.flow_type == GoodsTransfer.FlowType.RETURN
+        and transfer.to_organization.organization_type.code == "OWNER"
+        and transfer.status == GoodsTransfer.Status.PENDING_FACTORY_POSTING
+    )
+    factory_return_submitted = bool(
+        transfer.flow_type == GoodsTransfer.FlowType.RETURN
+        and transfer.to_organization.organization_type.code == "OWNER"
+        and transfer.status == GoodsTransfer.Status.PENDING_FACTORY_PICKUP
+    )
+    if (
+        transfer.status != GoodsTransfer.Status.COMPLETED
+        and not factory_return_picked_up
+        and not factory_return_submitted
+    ):
         return [], False
     definitions = []
     if transfer.flow_type == GoodsTransfer.FlowType.RETURN:
@@ -445,7 +464,11 @@ def initialize_goods_transfer_accounts(*, transfer, actor=None):
             type=SUBMIT_WORK_TYPE,
             uniq_key=_submit_key(case),
         ).first()
-        if case.status in {
+        factory_return_case = bool(
+            case.case_type == GoodsTransferAccountCase.CaseType.RETURN_CREDIT
+            and transfer.to_organization.organization_type.code == "OWNER"
+        )
+        if not factory_return_case and case.status in {
             GoodsTransferAccountCase.Status.DRAFT,
             GoodsTransferAccountCase.Status.REJECTED,
         } and not submit_task:
@@ -473,7 +496,15 @@ def _authorized_transfer(user, transfer_id):
         transfer.to_organization_id,
     }:
         raise GoodsTransferAccountError("该商品流转往来账不属于当前组织。")
-    if transfer.status != GoodsTransfer.Status.COMPLETED:
+    factory_return_picked_up = bool(
+        transfer.flow_type == GoodsTransfer.FlowType.RETURN
+        and transfer.to_organization.organization_type.code == "OWNER"
+        and transfer.status == GoodsTransfer.Status.PENDING_FACTORY_POSTING
+    )
+    if (
+        transfer.status != GoodsTransfer.Status.COMPLETED
+        and not factory_return_picked_up
+    ):
         raise GoodsTransferAccountError("请先完成实物流转和物权转移。")
     return transfer, identity
 
@@ -710,15 +741,21 @@ def _serialize_case(case, user, identity):
     pending_payment = case.payments.filter(
         status=GoodsTransferAccountPayment.Status.PENDING
     ).exists()
+    factory_return_case = bool(
+        case.case_type == GoodsTransferAccountCase.CaseType.RETURN_CREDIT
+        and case.upper_organization.organization_type.code == "OWNER"
+    )
     can_submit = bool(
-        identity.organization_id == submitter_org.pk
+        not factory_return_case
+        and identity.organization_id == submitter_org.pk
         and case.status in {
             GoodsTransferAccountCase.Status.DRAFT,
             GoodsTransferAccountCase.Status.REJECTED,
         }
     )
     can_confirm = bool(
-        identity.organization_id == confirmer_org.pk
+        not factory_return_case
+        and identity.organization_id == confirmer_org.pk
         and case.status == GoodsTransferAccountCase.Status.PENDING_CONFIRM
     )
     can_allocate = bool(
@@ -843,6 +880,13 @@ def submit_goods_transfer_account_case(
     case, identity = _authorized_case(
         user, transfer_id, case_type=case_type, lock=True
     )
+    if (
+        case.case_type == GoodsTransferAccountCase.CaseType.RETURN_CREDIT
+        and case.upper_organization.organization_type.code == "OWNER"
+    ):
+        raise GoodsTransferAccountError(
+            "退厂退货冲抵金额由厂家销售助理在物流确认取回后登记。"
+        )
     if identity.organization_id != _submitter_org(case).pk:
         raise GoodsTransferAccountError("当前组织不是该往来账的提交方。")
     if case.status not in {
@@ -896,6 +940,11 @@ def confirm_goods_transfer_account_case(
     *, user, transfer_id, case_id, action, rejection_reason=""
 ):
     case, identity = _authorized_case(user, transfer_id, case_id=case_id, lock=True)
+    if (
+        case.case_type == GoodsTransferAccountCase.CaseType.RETURN_CREDIT
+        and case.upper_organization.organization_type.code == "OWNER"
+    ):
+        raise GoodsTransferAccountError("退厂退货冲抵金额不经过商家提交确认流程。")
     if identity.organization_id != _confirmer_org(case).pk:
         raise GoodsTransferAccountError("当前组织不是该往来账的确认方。")
     if case.status != GoodsTransferAccountCase.Status.PENDING_CONFIRM:

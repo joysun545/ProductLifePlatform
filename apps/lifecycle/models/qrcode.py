@@ -143,6 +143,14 @@ class QRCode(models.Model):
 
 
 
+    disabled_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="禁用时间"
+    )
+
+
+
     created_at = models.DateTimeField(
         auto_now_add=True,
         verbose_name="创建时间"

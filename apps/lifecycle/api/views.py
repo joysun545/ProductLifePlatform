@@ -34,7 +34,11 @@ from .serializers import (
     RefreshInstallationInvitationSerializer,
     ResolveQRCodeSerializer,
     CreateGoodsTransferSerializer,
+    FactoryReturnCreditAmountSerializer,
+    FactoryReturnMatchingActionSerializer,
+    FactoryReturnProductionActionSerializer,
     ScanGoodsTransferDeviceSerializer,
+    FactoryReturnPostingSerializer,
 )
 
 
@@ -81,6 +85,18 @@ from lifecycle.services.goods_transfer_account_service import (
     get_goods_transfer_accounts,
     submit_goods_transfer_account_case,
     upload_goods_transfer_account_payment,
+)
+from lifecycle.services.factory_return_service import (
+    FactoryReturnProcessError,
+    confirm_factory_return_pickup,
+    get_factory_return_document_file,
+    get_factory_return_inventory,
+    get_factory_return_process,
+    post_factory_return_inventory,
+    process_factory_return_matching_item,
+    process_factory_return_production_item,
+    record_factory_return_credit_amount,
+    upload_factory_return_document,
 )
 
 
@@ -212,8 +228,13 @@ class GoodsTransferSubmitAPI(APIView):
             data, changed = submit_goods_transfer(
                 user=user,
                 transfer_id=transfer_id,
+                goods_list_document=request.FILES.get("goods_list_file"),
+                goods_list_client_request_id=request.data.get(
+                    "goods_list_client_request_id"
+                ),
+                return_remark=request.data.get("return_remark"),
             )
-        except GoodsTransferError as exc:
+        except (GoodsTransferError, FactoryReturnProcessError) as exc:
             return _goods_transfer_error(exc)
         return Response({
             "code": 0,
@@ -242,6 +263,251 @@ class GoodsTransferReceiptAPI(APIView):
             "msg": "商品入库已确认" if changed else "商品已经入库",
             "data": data,
         })
+
+
+def _factory_return_process_error(exc):
+    return Response(
+        {"code": 1, "msg": str(exc), "data": {}},
+        status=status.HTTP_409_CONFLICT,
+    )
+
+
+class FactoryReturnProcessAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request, transfer_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            data = get_factory_return_process(
+                user=user,
+                transfer_id=transfer_id,
+            )
+        except FactoryReturnProcessError as exc:
+            return _factory_return_process_error(exc)
+        return Response({"code": 0, "msg": "success", "data": data})
+
+
+class FactoryReturnPickupAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, transfer_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            data, changed = confirm_factory_return_pickup(
+                user=user,
+                transfer_id=transfer_id,
+            )
+        except FactoryReturnProcessError as exc:
+            return _factory_return_process_error(exc)
+        return Response({
+            "code": 0,
+            "msg": "退货已确认取回" if changed else "退货已经取回",
+            "data": data,
+        })
+
+
+class FactoryReturnPostingAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, transfer_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        serializer = FactoryReturnPostingSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            data, changed = post_factory_return_inventory(
+                user=user,
+                transfer_id=transfer_id,
+                **serializer.validated_data,
+            )
+        except FactoryReturnProcessError as exc:
+            return _factory_return_process_error(exc)
+        return Response({
+            "code": 0,
+            "msg": "退货已分类入库" if changed else "退货已经分类入库",
+            "data": data,
+        })
+
+
+class FactoryReturnCreditAmountAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, transfer_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        serializer = FactoryReturnCreditAmountSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            data, changed = record_factory_return_credit_amount(
+                user=user,
+                transfer_id=transfer_id,
+                amount=serializer.validated_data["amount"],
+            )
+        except FactoryReturnProcessError as exc:
+            return _factory_return_process_error(exc)
+        return Response({
+            "code": 0,
+            "msg": "退货冲抵金额已登记" if changed else "退货冲抵金额已经登记",
+            "data": data,
+        })
+
+
+class FactoryReturnInventoryAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            data = get_factory_return_inventory(user=user)
+        except FactoryReturnProcessError as exc:
+            return _factory_return_process_error(exc)
+        return Response({"code": 0, "msg": "success", "data": data})
+
+
+class FactoryReturnProductionActionAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, transfer_id, item_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        serializer = FactoryReturnProductionActionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            data, changed = process_factory_return_production_item(
+                user=user,
+                transfer_id=transfer_id,
+                item_id=item_id,
+                **serializer.validated_data,
+            )
+        except FactoryReturnProcessError as exc:
+            return _factory_return_process_error(exc)
+        return Response({
+            "code": 0,
+            "msg": "生产处置已保存" if changed else "生产处置未变化",
+            "data": data,
+        })
+
+
+class FactoryReturnMatchingActionAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, transfer_id, item_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        serializer = FactoryReturnMatchingActionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            data, changed = process_factory_return_matching_item(
+                user=user,
+                transfer_id=transfer_id,
+                item_id=item_id,
+                **serializer.validated_data,
+            )
+        except FactoryReturnProcessError as exc:
+            return _factory_return_process_error(exc)
+        return Response({
+            "code": 0,
+            "msg": "配套处置已保存" if changed else "配套处置未变化",
+            "data": data,
+        })
+
+
+class FactoryReturnDocumentUploadAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+    document_kind = ""
+    document_label = "退厂退货单据"
+
+    def post(self, request, transfer_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            data, created = upload_factory_return_document(
+                user=user,
+                transfer_id=transfer_id,
+                document_kind=self.document_kind,
+                client_request_id=request.data.get("client_request_id"),
+                document=request.FILES.get("document_file"),
+                remark=request.data.get("remark", ""),
+            )
+        except FactoryReturnProcessError as exc:
+            return _factory_return_process_error(exc)
+        return Response({
+            "code": 0,
+            "msg": (
+                f"{self.document_label}已上传"
+                if created
+                else f"{self.document_label}已存在"
+            ),
+            "data": data,
+        })
+
+
+class FactoryReturnLogisticsDocumentsAPI(FactoryReturnDocumentUploadAPI):
+    document_kind = "LOGISTICS"
+    document_label = "退货物流单据"
+
+
+class FactoryReturnGoodsListDocumentsAPI(FactoryReturnDocumentUploadAPI):
+    document_kind = "GOODS_LIST"
+    document_label = "退货货品清单"
+
+
+class FactoryReturnDocumentFileAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+    document_kind = ""
+    fallback_prefix = "factory-return-document"
+
+    def get(self, request, transfer_id, document_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            field_file, original_name, content_type = (
+                get_factory_return_document_file(
+                    user=user,
+                    transfer_id=transfer_id,
+                    document_id=document_id,
+                    document_kind=self.document_kind,
+                )
+            )
+        except FactoryReturnProcessError as exc:
+            return _factory_return_process_error(exc)
+        return _private_file_response(
+            field_file,
+            original_name,
+            content_type,
+            f"{self.fallback_prefix}-{document_id}",
+        )
+
+
+class FactoryReturnLogisticsDocumentFileAPI(FactoryReturnDocumentFileAPI):
+    document_kind = "LOGISTICS"
+    fallback_prefix = "factory-return-logistics"
+
+
+class FactoryReturnGoodsListDocumentFileAPI(FactoryReturnDocumentFileAPI):
+    document_kind = "GOODS_LIST"
+    fallback_prefix = "factory-return-goods-list"
 
 
 def _goods_transfer_settlement_error(exc):

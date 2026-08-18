@@ -14,6 +14,7 @@ from account.models import (
 from account.services.auth_service import get_active_identity
 from lifecycle.models import (
     DeviceState,
+    FactoryReturnDocument,
     GoodsTransfer,
     GoodsTransferItem,
     LifecycleEvent,
@@ -37,6 +38,10 @@ TRANSFER_OPERATOR_ROLES = {
 FACTORY_RECEIPT_ROLES = {"factory_stock"}
 FLOW_VIEW_ROLES = MERCHANT_FLOW_ROLES | FACTORY_RECEIPT_ROLES | {
     "factory_sales",
+    "factory_logistics",
+    "factory_sales_assistant",
+    "factory_matching",
+    "factory_production",
 }
 RECEIPT_WORK_TYPE = "GOODS_TRANSFER_RECEIPT_CONFIRM"
 NOTICE_WORK_TYPE = "GOODS_TRANSFER_NOTICE"
@@ -351,6 +356,8 @@ def scan_goods_transfer_device(*, user, transfer_id, qr_text):
         transfer__status__in=(
             GoodsTransfer.Status.SCANNING,
             GoodsTransfer.Status.PENDING_RECEIPT,
+            GoodsTransfer.Status.PENDING_FACTORY_PICKUP,
+            GoodsTransfer.Status.PENDING_FACTORY_POSTING,
         ),
     ).exists():
         raise GoodsTransferError("该设备正在其他未完成的商品流转中。")
@@ -522,7 +529,14 @@ def _lock_and_validate_items(transfer):
 
 
 @transaction.atomic
-def submit_goods_transfer(*, user, transfer_id):
+def submit_goods_transfer(
+    *,
+    user,
+    transfer_id,
+    goods_list_document=None,
+    goods_list_client_request_id=None,
+    return_remark=None,
+):
     identity = _identity(user, MERCHANT_FLOW_ROLES)
     transfer = (
         GoodsTransfer.objects.select_for_update()
@@ -547,6 +561,10 @@ def submit_goods_transfer(*, user, transfer_id):
     items = _lock_and_validate_items(transfer)
     now = timezone.now()
     if transfer.receipt_required:
+        factory_return = bool(
+            transfer.flow_type == GoodsTransfer.FlowType.RETURN
+            and transfer.to_organization.organization_type.code == "OWNER"
+        )
         event_type = (
             "RETURN"
             if transfer.flow_type == GoodsTransfer.FlowType.RETURN
@@ -557,7 +575,13 @@ def submit_goods_transfer(*, user, transfer_id):
                 transfer,
                 item,
                 event_type,
-                {"receipt_status": "PENDING"},
+                {
+                    "receipt_status": (
+                        "PENDING_FACTORY_PICKUP"
+                        if factory_return
+                        else "PENDING"
+                    )
+                },
             )
             DeviceState.objects.filter(device=item.device).update(
                 status="SHIPPED",
@@ -575,12 +599,20 @@ def submit_goods_transfer(*, user, transfer_id):
                 last_event=event,
                 updated_at=now,
             )
-            item.status = GoodsTransferItem.Status.PENDING_RECEIPT
+            item.status = (
+                GoodsTransferItem.Status.PENDING_FACTORY_PICKUP
+                if factory_return
+                else GoodsTransferItem.Status.PENDING_RECEIPT
+            )
             item.lifecycle_event = event
             item.save(
                 update_fields=("status", "lifecycle_event", "updated_at")
             )
-        transfer.status = GoodsTransfer.Status.PENDING_RECEIPT
+        transfer.status = (
+            GoodsTransfer.Status.PENDING_FACTORY_PICKUP
+            if factory_return
+            else GoodsTransfer.Status.PENDING_RECEIPT
+        )
         transfer.submitted_at = now
         transfer.save(
             update_fields=("status", "submitted_at", "updated_at")
@@ -592,7 +624,24 @@ def submit_goods_transfer(*, user, transfer_id):
             )
 
             initialize_goods_transfer_settlement(transfer=transfer, actor=user)
-        _publish_receipt_task(transfer)
+        if factory_return:
+            from lifecycle.services.factory_return_service import (
+                initialize_factory_return_process,
+            )
+
+            transfer.remark = str(
+                transfer.remark if return_remark is None else return_remark
+            ).strip()[:255]
+            transfer.save(update_fields=("remark", "updated_at"))
+            initialize_factory_return_process(
+                transfer=transfer,
+                items=items,
+                actor=user,
+                goods_list_document=goods_list_document,
+                goods_list_client_request_id=goods_list_client_request_id,
+            )
+        else:
+            _publish_receipt_task(transfer)
     else:
         for item in items:
             event = _create_flow_event(transfer, item, "TRANSFER")
@@ -718,6 +767,13 @@ def confirm_goods_transfer_receipt(*, user, transfer_id):
         raise GoodsTransferError("当前岗位不能确认本次商品入库。")
     if transfer.status == GoodsTransfer.Status.COMPLETED:
         return serialize_goods_transfer(transfer, identity), False
+    if (
+        transfer.flow_type == GoodsTransfer.FlowType.RETURN
+        and transfer.to_organization.organization_type.code == "OWNER"
+    ):
+        raise GoodsTransferError(
+            "退回厂家的设备由厂家物流确认取回，再由销售助理分类入库。"
+        )
     if transfer.status != GoodsTransfer.Status.PENDING_RECEIPT:
         raise GoodsTransferError("该商品流转尚未进入待确认入库状态。")
 
@@ -759,10 +815,7 @@ def confirm_goods_transfer_receipt(*, user, transfer_id):
             raise GoodsTransferError("流转设备当前状态已经变化，不能确认入库。")
 
     now = timezone.now()
-    factory_terminal = (
-        transfer.flow_type == GoodsTransfer.FlowType.RETURN
-        and transfer.to_organization.organization_type.code == "OWNER"
-    )
+    factory_terminal = False
     for item in items:
         event = LifecycleEvent.objects.create(
             device=item.device,
@@ -867,6 +920,65 @@ def serialize_goods_transfer(transfer, identity=None):
             identity.organization_id == transfer.to_organization_id
             and identity.role.code in _receipt_roles(transfer.to_organization)
         )
+    can_view_factory_return_process = bool(
+        identity
+        and transfer.status
+        in {
+            GoodsTransfer.Status.PENDING_FACTORY_PICKUP,
+            GoodsTransfer.Status.PENDING_FACTORY_POSTING,
+            GoodsTransfer.Status.COMPLETED,
+        }
+        and transfer.flow_type == GoodsTransfer.FlowType.RETURN
+        and transfer.to_organization.organization_type.code == "OWNER"
+        and identity.organization_id == transfer.to_organization_id
+        and identity.role.code
+        in {
+            "factory_stock",
+            "factory_sales",
+            "factory_logistics",
+            "factory_sales_assistant",
+            "factory_matching",
+            "factory_production",
+        }
+    )
+    logistics_documents = []
+    goods_list_documents = []
+    document_actions = {
+        "can_view_logistics": False,
+        "can_view_goods_list": False,
+        "can_upload_logistics": False,
+        "can_upload_goods_list": False,
+        "is_operation_owner": False,
+        "logistics_uploaded": False,
+        "goods_list_uploaded": False,
+        "task_status": "NOT_CREATED",
+        "task_completed": False,
+    }
+    is_factory_return = bool(
+        transfer.flow_type == GoodsTransfer.FlowType.RETURN
+        and transfer.to_organization.organization_type.code == "OWNER"
+    )
+    if is_factory_return:
+        from lifecycle.services.factory_return_service import (
+            factory_return_document_actions,
+            serialize_factory_return_documents,
+        )
+
+        document_actions = factory_return_document_actions(
+            identity,
+            transfer,
+        )
+        process = _related(transfer, "factory_return_process")
+        if process and document_actions["can_view_logistics"]:
+            logistics_documents = serialize_factory_return_documents(
+                process,
+                FactoryReturnDocument.DocumentKind.LOGISTICS,
+            )
+        if process and document_actions["can_view_goods_list"]:
+            goods_list_documents = serialize_factory_return_documents(
+                process,
+                FactoryReturnDocument.DocumentKind.GOODS_LIST,
+            )
     return {
         "id": transfer.pk,
         "flow_no": transfer.flow_no,
@@ -910,6 +1022,9 @@ def serialize_goods_transfer(transfer, identity=None):
         "factory_lifecycle_terminated": transfer.factory_lifecycle_terminated,
         "item_count": len(items),
         "items": [_serialize_item(item) for item in items],
+        "factory_return_logistics_documents": logistics_documents,
+        "factory_return_goods_list_documents": goods_list_documents,
+        "factory_return_document_task": document_actions,
         "actions": {
             "can_scan": bool(
                 identity
@@ -923,9 +1038,31 @@ def serialize_goods_transfer(transfer, identity=None):
                 and items
             ),
             "can_receive": can_receive,
+            "can_view_factory_return_process": can_view_factory_return_process,
+            "can_view_factory_return_logistics_documents": (
+                document_actions["can_view_logistics"]
+            ),
+            "can_view_factory_return_goods_list_documents": (
+                document_actions["can_view_goods_list"]
+            ),
+            "can_upload_factory_return_logistics_document": (
+                document_actions["can_upload_logistics"]
+            ),
+            "can_upload_factory_return_goods_list_document": (
+                document_actions["can_upload_goods_list"]
+            ),
             "can_view_accounts": bool(
                 identity
-                and transfer.status == GoodsTransfer.Status.COMPLETED
+                and (
+                    transfer.status == GoodsTransfer.Status.COMPLETED
+                    or (
+                        transfer.flow_type == GoodsTransfer.FlowType.RETURN
+                        and transfer.to_organization.organization_type.code
+                        == "OWNER"
+                        and transfer.status
+                        == GoodsTransfer.Status.PENDING_FACTORY_POSTING
+                    )
+                )
                 and transfer.flow_type
                 in {
                     GoodsTransfer.FlowType.RETURN,

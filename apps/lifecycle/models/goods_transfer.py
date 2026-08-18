@@ -12,6 +12,8 @@ class GoodsTransfer(models.Model):
     class Status(models.TextChoices):
         SCANNING = "SCANNING", "扫码中"
         PENDING_RECEIPT = "PENDING_RECEIPT", "待确认入库"
+        PENDING_FACTORY_PICKUP = "PENDING_FACTORY_PICKUP", "待厂家物流取回"
+        PENDING_FACTORY_POSTING = "PENDING_FACTORY_POSTING", "待退货分类入库"
         COMPLETED = "COMPLETED", "已完成"
         CANCELLED = "CANCELLED", "已取消"
 
@@ -111,6 +113,8 @@ class GoodsTransferItem(models.Model):
     class Status(models.TextChoices):
         SCANNED = "SCANNED", "已扫码"
         PENDING_RECEIPT = "PENDING_RECEIPT", "待确认入库"
+        PENDING_FACTORY_PICKUP = "PENDING_FACTORY_PICKUP", "待厂家物流取回"
+        PENDING_FACTORY_POSTING = "PENDING_FACTORY_POSTING", "待退货分类入库"
         COMPLETED = "COMPLETED", "已完成"
 
     transfer = models.ForeignKey(

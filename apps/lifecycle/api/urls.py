@@ -47,6 +47,85 @@ urlpatterns = [
     ),
 
     path(
+        "goods-transfers/<int:transfer_id>/factory-return/",
+        views.FactoryReturnProcessAPI.as_view(),
+        name="factory_return_process",
+    ),
+
+    path(
+        "goods-transfers/<int:transfer_id>/factory-return/pickup/",
+        views.FactoryReturnPickupAPI.as_view(),
+        name="factory_return_pickup",
+    ),
+
+    path(
+        "goods-transfers/<int:transfer_id>/factory-return/posting/",
+        views.FactoryReturnPostingAPI.as_view(),
+        name="factory_return_posting",
+    ),
+
+    path(
+        "goods-transfers/<int:transfer_id>/factory-return/credit-amount/",
+        views.FactoryReturnCreditAmountAPI.as_view(),
+        name="factory_return_credit_amount",
+    ),
+
+    path(
+        "factory-returns/inventory/",
+        views.FactoryReturnInventoryAPI.as_view(),
+        name="factory_return_inventory",
+    ),
+
+    path(
+        "goods-transfers/<int:transfer_id>/factory-return/items/<int:item_id>/production/",
+        views.FactoryReturnProductionActionAPI.as_view(),
+        name="factory_return_production_action",
+    ),
+
+    path(
+        "goods-transfers/<int:transfer_id>/factory-return/items/<int:item_id>/matching/",
+        views.FactoryReturnMatchingActionAPI.as_view(),
+        name="factory_return_matching_action",
+    ),
+
+    path(
+        "goods-transfers/<int:transfer_id>/factory-return/logistics-documents/",
+        views.FactoryReturnLogisticsDocumentsAPI.as_view(),
+        name="factory_return_logistics_documents",
+    ),
+
+    path(
+        "goods-transfers/<int:transfer_id>/factory-return/logistics-documents/<int:document_id>/file/",
+        views.FactoryReturnLogisticsDocumentFileAPI.as_view(),
+        name="factory_return_logistics_document_file",
+    ),
+
+    path(
+        "goods-transfers/<int:transfer_id>/factory-return/goods-list-documents/",
+        views.FactoryReturnGoodsListDocumentsAPI.as_view(),
+        name="factory_return_goods_list_documents",
+    ),
+
+    path(
+        "goods-transfers/<int:transfer_id>/factory-return/goods-list-documents/<int:document_id>/file/",
+        views.FactoryReturnGoodsListDocumentFileAPI.as_view(),
+        name="factory_return_goods_list_document_file",
+    ),
+
+    # v3兼容入口：原“物料单据”实为物流单据。
+    path(
+        "goods-transfers/<int:transfer_id>/factory-return/material-documents/",
+        views.FactoryReturnLogisticsDocumentsAPI.as_view(),
+        name="factory_return_material_documents_legacy",
+    ),
+
+    path(
+        "goods-transfers/<int:transfer_id>/factory-return/material-documents/<int:document_id>/file/",
+        views.FactoryReturnLogisticsDocumentFileAPI.as_view(),
+        name="factory_return_material_document_file_legacy",
+    ),
+
+    path(
         "goods-transfers/<int:transfer_id>/settlement/",
         views.GoodsTransferSettlementDetailAPI.as_view(),
         name="goods_transfer_settlement_detail",

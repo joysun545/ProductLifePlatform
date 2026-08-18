@@ -19,9 +19,15 @@ from account.models import (
 from account.services.auth_service import issue_access_token
 from lifecycle.models import (
     DeviceState,
+    FactoryReturnDocument,
+    FactoryReturnInventoryItem,
+    FactoryReturnProcess,
+    GoodsTransfer,
     GoodsTransferAccountCase,
     GoodsTransferCreditAllocation,
+    LifecycleEvent,
     OrganizationDevice,
+    QRCode,
 )
 from lifecycle.services.lifecycle_service import LifecycleService
 from manufacturing.models import ProductionBatch
@@ -37,6 +43,12 @@ class GoodsTransferApiTests(TestCase):
         owner_type = OrganizationType.objects.get(code="OWNER")
         merchant_type = OrganizationType.objects.get(code="MERCHANT")
         cls.factory_sales_role = OrganizationRole.objects.get(code="factory_sales")
+        cls.factory_logistics_role = OrganizationRole.objects.get(code="factory_logistics")
+        cls.factory_sales_assistant_role = OrganizationRole.objects.get(
+            code="factory_sales_assistant"
+        )
+        cls.factory_matching_role = OrganizationRole.objects.get(code="factory_matching")
+        cls.factory_production_role = OrganizationRole.objects.get(code="factory_production")
         cls.factory_stock_role = OrganizationRole.objects.get(code="factory_stock")
         cls.merchant_owner_role = OrganizationRole.objects.get(code="merchant_owner")
         cls.merchant_sales_role = OrganizationRole.objects.get(code="merchant_sales")
@@ -65,6 +77,20 @@ class GoodsTransferApiTests(TestCase):
 
         cls.factory_sales = cls._user(
             "flow_factory_sales", cls.factory, cls.factory_sales_role
+        )
+        cls.factory_logistics = cls._user(
+            "flow_factory_logistics", cls.factory, cls.factory_logistics_role
+        )
+        cls.factory_sales_assistant = cls._user(
+            "flow_factory_sales_assistant",
+            cls.factory,
+            cls.factory_sales_assistant_role,
+        )
+        cls.factory_matching = cls._user(
+            "flow_factory_matching", cls.factory, cls.factory_matching_role
+        )
+        cls.factory_production = cls._user(
+            "flow_factory_production", cls.factory, cls.factory_production_role
         )
         cls.factory_stock = cls._user(
             "flow_factory_stock", cls.factory, cls.factory_stock_role
@@ -214,13 +240,33 @@ class GoodsTransferApiTests(TestCase):
             **self.auth(user),
         )
         self.assertEqual(scan.json()["code"], 0, scan.json())
-        submit = self.client.post(
-            f"{self.endpoint}{transfer_id}/submit/",
-            {},
-            **self.auth(user),
-        )
+        submit = self.submit_transfer(user, transfer_id)
         self.assertEqual(submit.json()["code"], 0, submit.json())
         return submit.json()["data"]
+
+    def submit_transfer(self, user, transfer_id, *, return_remark="测试退货说明"):
+        transfer = GoodsTransfer.objects.select_related(
+            "to_organization__organization_type"
+        ).get(pk=transfer_id)
+        payload = {}
+        if (
+            transfer.flow_type == GoodsTransfer.FlowType.RETURN
+            and transfer.to_organization.organization_type.code == "OWNER"
+        ):
+            payload = {
+                "goods_list_client_request_id": f"test-goods-list-{transfer_id}",
+                "return_remark": return_remark,
+                "goods_list_file": SimpleUploadedFile(
+                    f"factory-return-{transfer_id}.pdf",
+                    b"%PDF-1.4\nfactory-return-goods-list",
+                    content_type="application/pdf",
+                ),
+            }
+        return self.client.post(
+            f"{self.endpoint}{transfer_id}/submit/",
+            payload,
+            **self.auth(user),
+        )
 
     def test_shipment_requires_receiver_confirmation_before_ownership_moves(self):
         device = self.devices[0]
@@ -351,7 +397,7 @@ class GoodsTransferApiTests(TestCase):
             )
         )
 
-    def test_return_to_factory_terminates_current_lifecycle_after_receipt(self):
+    def _legacy_return_to_factory_terminates_current_lifecycle_after_receipt(self):
         device = self.devices[2]
         self.set_owner(device, self.parent)
         flow = self.create_flow(
@@ -380,6 +426,864 @@ class GoodsTransferApiTests(TestCase):
         ownership = OrganizationDevice.objects.get(device=device)
         self.assertEqual(ownership.organization, self.factory)
         self.assertEqual(ownership.status, "RETURNED_TO_FACTORY")
+        device.qrcode.refresh_from_db()
+        self.assertEqual(device.qrcode.status, "DISABLED")
+        self.assertIsNotNone(device.qrcode.disabled_at)
+        disposition = FactoryReturnDisposition.objects.get(
+            transfer_item__transfer_id=flow["id"],
+            transfer_item__device=device,
+        )
+        self.assertEqual(disposition.decision, "PENDING")
+        self.assertEqual(disposition.source_bom, device.batch.bom)
+        self.assertTrue(
+            LifecycleEvent.objects.filter(
+                device=device,
+                event_type="LIFECYCLE_CLOSE",
+            ).exists()
+        )
+        disposition_task = WorkItem.objects.get(
+            type="FACTORY_RETURN_DISPOSITION",
+            biz_ref=f"lifecycle.GoodsTransfer:{flow['id']}",
+        )
+        self.assertEqual(disposition_task.status, "OPEN")
+        self.assertSetEqual(
+            set(disposition_task.user_tasks.values_list("to_openid", flat=True)),
+            {self.factory_stock.wx_openid},
+        )
+
+    def _legacy_factory_stock_decides_each_return_item_and_routes_reissue_to_sales(self):
+        first, second = self.devices[:2]
+        self.set_owner(first, self.parent)
+        self.set_owner(second, self.parent)
+        initial_device_count = type(first).objects.count()
+        initial_qrcode_count = QRCode.objects.count()
+        flow = self.create_flow(
+            self.parent_owner,
+            {
+                "flow_type": "RETURN",
+                "client_request_id": "factory-disposition-flow-1",
+                "target_account_id": self.factory_sales.pk,
+            },
+        )
+        for device in (first, second):
+            scanned = self.client.post(
+                f"{self.endpoint}{flow['id']}/scan/",
+                {"qr_text": device.qrcode.code},
+                **self.auth(self.parent_owner),
+            )
+            self.assertEqual(scanned.json()["code"], 0, scanned.json())
+        submitted = self.submit_transfer(self.parent_owner, flow["id"])
+        self.assertEqual(submitted.json()["code"], 0, submitted.json())
+
+        receipt = self.client.post(
+            f"{self.endpoint}{flow['id']}/receipt/",
+            {},
+            **self.auth(self.factory_stock),
+        )
+        self.assertEqual(receipt.json()["code"], 0, receipt.json())
+
+        dispositions_url = (
+            f"{self.endpoint}{flow['id']}/factory-return-dispositions/"
+        )
+        merchant_view = self.client.get(
+            dispositions_url,
+            **self.auth(self.parent_owner),
+        )
+        self.assertEqual(merchant_view.json()["code"], 1)
+        sales_view = self.client.get(
+            dispositions_url,
+            **self.auth(self.factory_sales),
+        )
+        self.assertEqual(sales_view.json()["code"], 0, sales_view.json())
+        self.assertFalse(sales_view.json()["data"]["viewer"]["can_decide"])
+
+        items = sales_view.json()["data"]["items"]
+        forbidden = self.client.post(
+            f"{dispositions_url}{items[0]['goods_transfer_item_id']}/decision/",
+            {"decision": "TERMINATE"},
+            **self.auth(self.factory_sales),
+        )
+        self.assertEqual(forbidden.json()["code"], 1)
+
+        first_decision = self.client.post(
+            f"{dispositions_url}{items[0]['goods_transfer_item_id']}/decision/",
+            {"decision": "TERMINATE", "remark": "本台结束"},
+            **self.auth(self.factory_stock),
+        )
+        self.assertEqual(first_decision.json()["code"], 0, first_decision.json())
+        self.assertEqual(first_decision.json()["data"]["pending_count"], 1)
+        disposition_task = WorkItem.objects.get(
+            type="FACTORY_RETURN_DISPOSITION",
+            biz_ref=f"lifecycle.GoodsTransfer:{flow['id']}",
+        )
+        self.assertEqual(disposition_task.status, "OPEN")
+
+        second_decision = self.client.post(
+            f"{dispositions_url}{items[1]['goods_transfer_item_id']}/decision/",
+            {
+                "decision": "REISSUE_CHANGED_BOM",
+                "remark": "更换部分配套物料",
+            },
+            **self.auth(self.factory_stock),
+        )
+        self.assertEqual(second_decision.json()["code"], 0, second_decision.json())
+        self.assertTrue(second_decision.json()["data"]["all_decided"])
+        disposition_task.refresh_from_db()
+        self.assertEqual(disposition_task.status, "DONE")
+        reissue = WorkItem.objects.get(type="FACTORY_RETURN_REISSUE_ORDER")
+        self.assertEqual(reissue.status, "OPEN")
+        self.assertSetEqual(
+            set(reissue.user_tasks.values_list("to_openid", flat=True)),
+            {self.factory_sales.wx_openid},
+        )
+        self.assertEqual(reissue.payload["bom_strategy"], "REISSUE_CHANGED_BOM")
+        self.assertEqual(type(first).objects.count(), initial_device_count)
+        self.assertEqual(QRCode.objects.count(), initial_qrcode_count)
+        self.assertEqual(
+            FactoryReturnDisposition.objects.filter(
+                decision="PENDING",
+            ).count(),
+            0,
+        )
+        self.assertEqual(
+            LifecycleEvent.objects.filter(
+                event_type="RETURN_DISPOSITION",
+            ).count(),
+            2,
+        )
+
+    def test_factory_return_submit_waits_for_logistics_pickup(self):
+        device = self.devices[0]
+        self.set_owner(device, self.parent)
+        flow = self.create_flow(
+            self.parent_stock,
+            {
+                "flow_type": "RETURN",
+                "client_request_id": "factory-return-pickup-1",
+                "target_account_id": self.factory_sales.pk,
+            },
+        )
+        submitted = self.scan_and_submit(self.parent_stock, flow["id"], device)
+        self.assertEqual(submitted["status"], "PENDING_FACTORY_PICKUP")
+        self.assertFalse(submitted["factory_lifecycle_terminated"])
+        ownership = OrganizationDevice.objects.get(device=device)
+        self.assertEqual(ownership.organization, self.parent)
+        self.assertEqual(ownership.status, "RETURNED")
+        process = FactoryReturnProcess.objects.get(transfer_id=flow["id"])
+        self.assertEqual(process.phase, "WAITING_PICKUP")
+        inventory_item = FactoryReturnInventoryItem.objects.get(process=process)
+        self.assertEqual(inventory_item.stock_status, "WAITING_POSTING")
+        self.assertEqual(inventory_item.source_bom, device.batch.bom)
+
+        sales_notice = WorkItem.objects.get(
+            type="FACTORY_RETURN_SALES_NOTICE_SUBMITTED",
+            biz_ref=f"lifecycle.GoodsTransfer:{flow['id']}",
+        )
+        self.assertSetEqual(
+            set(sales_notice.user_tasks.values_list("to_openid", flat=True)),
+            {self.factory_sales.wx_openid},
+        )
+        pickup_task = WorkItem.objects.get(
+            type="FACTORY_RETURN_PICKUP",
+            biz_ref=f"lifecycle.GoodsTransfer:{flow['id']}",
+        )
+        self.assertSetEqual(
+            set(pickup_task.user_tasks.values_list("to_openid", flat=True)),
+            {self.factory_logistics.wx_openid},
+        )
+        forbidden_receipt = self.client.post(
+            f"{self.endpoint}{flow['id']}/receipt/",
+            {},
+            **self.auth(self.factory_stock),
+        )
+        self.assertEqual(forbidden_receipt.json()["code"], 1)
+
+    def test_factory_return_final_submit_requires_goods_list_atomically(self):
+        device = self.devices[0]
+        self.set_owner(device, self.parent)
+        flow = self.create_flow(
+            self.parent_owner,
+            {
+                "flow_type": "RETURN",
+                "client_request_id": "factory-return-required-goods-list",
+                "target_account_id": self.factory_sales.pk,
+            },
+        )
+        scan = self.client.post(
+            f"{self.endpoint}{flow['id']}/scan/",
+            {"qr_text": device.qrcode.code},
+            **self.auth(self.parent_owner),
+        )
+        self.assertEqual(scan.json()["code"], 0, scan.json())
+        rejected = self.client.post(
+            f"{self.endpoint}{flow['id']}/submit/",
+            {"return_remark": "缺少货品清单"},
+            **self.auth(self.parent_owner),
+        )
+        self.assertEqual(rejected.json()["code"], 1)
+        transfer = GoodsTransfer.objects.get(pk=flow["id"])
+        self.assertEqual(transfer.status, "SCANNING")
+        ownership = OrganizationDevice.objects.get(device=device)
+        self.assertEqual(ownership.status, "IN_STOCK")
+        self.assertFalse(
+            FactoryReturnProcess.objects.filter(transfer=transfer).exists()
+        )
+
+        submitted = self.submit_transfer(
+            self.parent_owner,
+            flow["id"],
+            return_remark="包装完整，退货冲抵金额由厂家销售助理填写",
+        )
+        self.assertEqual(submitted.json()["code"], 0, submitted.json())
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.remark, "包装完整，退货冲抵金额由厂家销售助理填写")
+        process = FactoryReturnProcess.objects.get(transfer=transfer)
+        self.assertEqual(process.documents.filter(document_kind="GOODS_LIST").count(), 1)
+        self.assertEqual(process.account_case.status, "DRAFT")
+
+    def test_factory_return_documents_belong_to_initiator_and_are_non_blocking(self):
+        device = self.devices[0]
+        self.set_owner(device, self.parent)
+        flow = self.create_flow(
+            self.parent_stock,
+            {
+                "flow_type": "RETURN",
+                "client_request_id": "factory-return-material-document-1",
+                "target_account_id": self.factory_sales.pk,
+            },
+        )
+        submitted = self.scan_and_submit(self.parent_stock, flow["id"], device)
+        self.assertTrue(
+            submitted["actions"][
+                "can_upload_factory_return_logistics_document"
+            ]
+        )
+        self.assertTrue(
+            submitted["actions"][
+                "can_upload_factory_return_goods_list_document"
+            ]
+        )
+        self.assertEqual(submitted["factory_return_logistics_documents"], [])
+        self.assertEqual(
+            len(submitted["factory_return_goods_list_documents"]),
+            1,
+        )
+
+        document_task = WorkItem.objects.get(
+            type="FACTORY_RETURN_DOCUMENT_UPLOAD",
+            biz_ref=f"lifecycle.GoodsTransfer:{flow['id']}",
+        )
+        self.assertEqual(document_task.action_mode, "ANYONE_DO")
+        self.assertSetEqual(
+            set(document_task.user_tasks.values_list("to_openid", flat=True)),
+            {self.parent_stock.wx_openid},
+        )
+        assistant_task = WorkItem.objects.get(
+            type="FACTORY_RETURN_POSTING",
+            biz_ref=f"lifecycle.GoodsTransfer:{flow['id']}",
+        )
+        self.assertTrue(assistant_task.payload["blocked_by_pickup"])
+
+        # 同组织其他可扫码岗位能够查看，但不协同完成本流转单的上传操作。
+        peer_view = self.client.get(
+            f"{self.endpoint}{flow['id']}/",
+            **self.auth(self.parent_owner),
+        )
+        self.assertEqual(peer_view.json()["code"], 0, peer_view.json())
+        self.assertFalse(
+            peer_view.json()["data"]["actions"][
+                "can_upload_factory_return_logistics_document"
+            ]
+        )
+
+        # 上传单据不是物流取回的前置条件；现有取回接口仍可直接执行。
+        pickup = self.client.post(
+            f"{self.endpoint}{flow['id']}/factory-return/pickup/",
+            {},
+            **self.auth(self.factory_logistics),
+        )
+        self.assertEqual(pickup.json()["code"], 0, pickup.json())
+        document_task.refresh_from_db()
+        self.assertEqual(document_task.status, "OPEN")
+
+        logistics_url = (
+            f"{self.endpoint}{flow['id']}/factory-return/logistics-documents/"
+        )
+        forbidden_peer = self.client.post(
+            logistics_url,
+            {
+                "client_request_id": "factory-return-logistics-peer",
+                "document_file": self.image_file("peer-logistics.png"),
+            },
+            **self.auth(self.parent_sales),
+        )
+        self.assertEqual(forbidden_peer.json()["code"], 1)
+
+        uploaded = self.client.post(
+            logistics_url,
+            {
+                "client_request_id": "factory-return-logistics-upload-1",
+                "remark": "退货物流单据第一份",
+                "document_file": self.image_file("return-logistics.png"),
+            },
+            **self.auth(self.parent_stock),
+        )
+        self.assertEqual(uploaded.json()["code"], 0, uploaded.json())
+        documents = uploaded.json()["data"]["logistics_documents"]
+        self.assertEqual(len(documents), 1)
+        self.assertEqual(documents[0]["file_type"], "IMAGE")
+        self.assertEqual(documents[0]["remark"], "退货物流单据第一份")
+        self.assertEqual(
+            FactoryReturnDocument.objects.filter(
+                document_kind="LOGISTICS",
+            ).count(),
+            1,
+        )
+
+        # 货品清单已随最终提交完成；补传物流单据后原任务直接完成。
+        document_task.refresh_from_db()
+        self.assertEqual(document_task.status, "DONE")
+        self.assertFalse(
+            WorkItem.objects.filter(
+                type="FACTORY_RETURN_LOGISTICS_DOCUMENT_NOTICE",
+                biz_ref=f"lifecycle.GoodsTransfer:{flow['id']}",
+            ).exists()
+        )
+
+        logistics_view = self.client.get(
+            f"{self.endpoint}{flow['id']}/factory-return/",
+            **self.auth(self.factory_logistics),
+        )
+        self.assertEqual(logistics_view.json()["code"], 0, logistics_view.json())
+        self.assertEqual(
+            len(logistics_view.json()["data"]["logistics_documents"]),
+            1,
+        )
+        self.assertEqual(logistics_view.json()["data"]["goods_list_documents"], [])
+
+        goods_list_url = (
+            f"{self.endpoint}{flow['id']}/factory-return/goods-list-documents/"
+        )
+        goods_list_upload = self.client.post(
+            goods_list_url,
+            {
+                "client_request_id": "factory-return-goods-list-upload-1",
+                "remark": "本批退货货品清单",
+                "document_file": SimpleUploadedFile(
+                    "return-goods-list.pdf",
+                    b"%PDF-1.4\nfactory-return-goods-list",
+                    content_type="application/pdf",
+                ),
+            },
+            **self.auth(self.parent_stock),
+        )
+        self.assertEqual(goods_list_upload.json()["code"], 0, goods_list_upload.json())
+        self.assertEqual(
+            len(goods_list_upload.json()["data"]["goods_list_documents"]),
+            2,
+        )
+        goods_list_document = FactoryReturnDocument.objects.filter(
+            document_kind="GOODS_LIST",
+        ).order_by("-sequence_no").first()
+
+        document_task.refresh_from_db()
+        self.assertEqual(document_task.status, "DONE")
+        actor_task = document_task.user_tasks.get(
+            to_openid=self.parent_stock.wx_openid
+        )
+        self.assertEqual(actor_task.done_reason, "SELF_ACTION")
+
+        self.assertFalse(
+            WorkItem.objects.filter(
+                type="FACTORY_RETURN_GOODS_LIST_NOTICE",
+                biz_ref=f"lifecycle.GoodsTransfer:{flow['id']}",
+            ).exists()
+        )
+
+        assistant_view = self.client.get(
+            f"{self.endpoint}{flow['id']}/factory-return/",
+            **self.auth(self.factory_sales_assistant),
+        )
+        self.assertEqual(assistant_view.json()["code"], 0, assistant_view.json())
+        self.assertEqual(assistant_view.json()["data"]["logistics_documents"], [])
+        self.assertEqual(
+            len(assistant_view.json()["data"]["goods_list_documents"]),
+            2,
+        )
+        self.assertFalse(
+            assistant_view.json()["data"]["rules"][
+                "return_documents_block_pickup"
+            ]
+        )
+
+        goods_list_file = self.client.get(
+            f"{goods_list_url}{goods_list_document.pk}/file/",
+            **self.auth(self.factory_sales_assistant),
+        )
+        self.assertEqual(goods_list_file.status_code, 200)
+        forbidden_upload = self.client.post(
+            goods_list_url,
+            {
+                "client_request_id": "factory-return-goods-list-forbidden",
+                "document_file": self.image_file("forbidden.png"),
+            },
+            **self.auth(self.factory_logistics),
+        )
+        self.assertEqual(forbidden_upload.json()["code"], 1)
+
+        sales_view = self.client.get(
+            f"{self.endpoint}{flow['id']}/factory-return/",
+            **self.auth(self.factory_sales),
+        )
+        self.assertEqual(sales_view.json()["code"], 0, sales_view.json())
+        self.assertEqual(len(sales_view.json()["data"]["logistics_documents"]), 1)
+        self.assertEqual(len(sales_view.json()["data"]["goods_list_documents"]), 2)
+        self.assertEqual(
+            WorkItem.objects.filter(
+                biz_ref=f"lifecycle.GoodsTransfer:{flow['id']}",
+                type__in=(
+                    "FACTORY_RETURN_SALES_NOTICE_SUBMITTED",
+                    "FACTORY_RETURN_PICKUP",
+                    "FACTORY_RETURN_POSTING",
+                ),
+            ).count(),
+            3,
+        )
+
+    def test_factory_return_pickup_then_posts_inventory_before_finance_confirmation(self):
+        for device in self.devices:
+            self.set_owner(device, self.parent)
+        flow = self.create_flow(
+            self.parent_owner,
+            {
+                "flow_type": "RETURN",
+                "client_request_id": "factory-return-posting-1",
+                "target_account_id": self.factory_sales.pk,
+            },
+        )
+        for device in self.devices:
+            scanned = self.client.post(
+                f"{self.endpoint}{flow['id']}/scan/",
+                {"qr_text": device.qrcode.code},
+                **self.auth(self.parent_owner),
+            )
+            self.assertEqual(scanned.json()["code"], 0, scanned.json())
+        submitted = self.submit_transfer(self.parent_owner, flow["id"])
+        self.assertEqual(submitted.json()["code"], 0, submitted.json())
+
+        assistant_task = WorkItem.objects.get(
+            type="FACTORY_RETURN_POSTING",
+            biz_ref=f"lifecycle.GoodsTransfer:{flow['id']}",
+        )
+        self.assertEqual(assistant_task.status, "OPEN")
+        self.assertTrue(assistant_task.payload["blocked_by_pickup"])
+        forbidden_amount = self.client.post(
+            f"{self.endpoint}{flow['id']}/factory-return/credit-amount/",
+            {"amount": "800.00"},
+            **self.auth(self.factory_sales_assistant),
+        )
+        self.assertEqual(forbidden_amount.json()["code"], 1)
+
+        forbidden_pickup = self.client.post(
+            f"{self.endpoint}{flow['id']}/factory-return/pickup/",
+            {},
+            **self.auth(self.factory_sales),
+        )
+        self.assertEqual(forbidden_pickup.json()["code"], 1)
+        pickup = self.client.post(
+            f"{self.endpoint}{flow['id']}/factory-return/pickup/",
+            {},
+            **self.auth(self.factory_logistics),
+        )
+        self.assertEqual(pickup.json()["code"], 0, pickup.json())
+        self.assertEqual(
+            pickup.json()["data"]["transfer"]["status"],
+            "PENDING_FACTORY_POSTING",
+        )
+        assistant_task.refresh_from_db()
+        self.assertEqual(assistant_task.status, "OPEN")
+        self.assertFalse(assistant_task.payload["blocked_by_pickup"])
+        for device in self.devices:
+            ownership = OrganizationDevice.objects.get(device=device)
+            self.assertEqual(ownership.organization, self.factory)
+            self.assertEqual(ownership.status, "RETURNED_TO_FACTORY")
+            self.assertEqual(
+                DeviceState.objects.get(device=device).status,
+                "RETURNED_TO_FACTORY",
+            )
+            device.qrcode.refresh_from_db()
+            self.assertEqual(device.qrcode.status, "DISABLED")
+        self.assertFalse(
+            LifecycleEvent.objects.filter(event_type="LIFECYCLE_CLOSE").exists()
+        )
+        account_case = GoodsTransferAccountCase.objects.get(
+            transfer_id=flow["id"],
+            case_type="RETURN_CREDIT",
+        )
+        self.assertEqual(account_case.status, "DRAFT")
+
+        process_url = f"{self.endpoint}{flow['id']}/factory-return/"
+        assistant_view = self.client.get(
+            process_url,
+            **self.auth(self.factory_sales_assistant),
+        )
+        self.assertEqual(assistant_view.json()["code"], 0, assistant_view.json())
+        rows = assistant_view.json()["data"]["items"]
+        posting_payload = {
+            "posting_remark": "先分类入库，冲抵金额后续确认",
+            "items": [
+                {
+                    "item_id": rows[0]["goods_transfer_item_id"],
+                    "stock_status": "PENDING_DISASSEMBLY",
+                    "remark": "待拆机",
+                },
+                {
+                    "item_id": rows[1]["goods_transfer_item_id"],
+                    "stock_status": "PENDING_REISSUE",
+                    "remark": "配套暂不变",
+                },
+                {
+                    "item_id": rows[2]["goods_transfer_item_id"],
+                    "stock_status": "PENDING_REPAIR",
+                    "remark": "待检测修复",
+                },
+            ],
+        }
+        posting = self.client.post(
+            f"{process_url}posting/",
+            posting_payload,
+            content_type="application/json",
+            **self.auth(self.factory_sales_assistant),
+        )
+        self.assertEqual(posting.json()["code"], 0, posting.json())
+        self.assertEqual(posting.json()["data"]["process"]["phase"], "POSTED")
+        self.assertEqual(
+            posting.json()["data"]["transfer"]["status"],
+            "COMPLETED",
+        )
+        account_case.refresh_from_db()
+        self.assertEqual(account_case.status, "DRAFT")
+        assistant_task.refresh_from_db()
+        self.assertEqual(assistant_task.status, "OPEN")
+        self.assertTrue(assistant_task.payload["inventory_posted"])
+        self.assertFalse(assistant_task.payload["credit_amount_recorded"])
+        self.assertSetEqual(
+            set(
+                FactoryReturnInventoryItem.objects.filter(
+                    process__transfer_id=flow["id"]
+                ).values_list("stock_status", flat=True)
+            ),
+            {"PENDING_DISASSEMBLY", "PENDING_REISSUE", "PENDING_REPAIR"},
+        )
+        stock_notice = WorkItem.objects.get(type="FACTORY_RETURN_STOCK_NOTICE")
+        self.assertSetEqual(
+            set(stock_notice.user_tasks.values_list("to_openid", flat=True)),
+            {self.factory_stock.wx_openid},
+        )
+        for work_type in (
+            "FACTORY_RETURN_DISASSEMBLY_PRODUCTION",
+            "FACTORY_RETURN_REPAIR_PRODUCTION",
+        ):
+            task = WorkItem.objects.get(type=work_type)
+            self.assertSetEqual(
+                set(task.user_tasks.values_list("to_openid", flat=True)),
+                {self.factory_production.wx_openid},
+            )
+        for work_type in (
+            "FACTORY_RETURN_DISASSEMBLY_MATCHING",
+            "FACTORY_RETURN_REPAIR_MATCHING",
+        ):
+            task = WorkItem.objects.get(type=work_type)
+            self.assertSetEqual(
+                set(task.user_tasks.values_list("to_openid", flat=True)),
+                {self.factory_matching.wx_openid},
+            )
+
+        amount = self.client.post(
+            f"{self.endpoint}{flow['id']}/factory-return/credit-amount/",
+            {"amount": "800.00"},
+            **self.auth(self.factory_sales_assistant),
+        )
+        self.assertEqual(amount.json()["code"], 0, amount.json())
+        account_case.refresh_from_db()
+        self.assertEqual(account_case.status, "CONFIRMED")
+        self.assertEqual(str(account_case.confirmed_amount), "800.00")
+        assistant_task.refresh_from_db()
+        self.assertEqual(assistant_task.status, "DONE")
+        self.assertTrue(assistant_task.payload["inventory_posted"])
+        self.assertTrue(assistant_task.payload["credit_amount_recorded"])
+
+    def test_factory_return_credit_amount_can_be_recorded_before_inventory_posting(self):
+        device = self.devices[0]
+        self.set_owner(device, self.parent)
+        flow = self.create_flow(
+            self.parent_owner,
+            {
+                "flow_type": "RETURN",
+                "client_request_id": "factory-return-credit-first",
+                "target_account_id": self.factory_sales.pk,
+            },
+        )
+        self.scan_and_submit(self.parent_owner, flow["id"], device)
+        pickup = self.client.post(
+            f"{self.endpoint}{flow['id']}/factory-return/pickup/",
+            {},
+            **self.auth(self.factory_logistics),
+        )
+        self.assertEqual(pickup.json()["code"], 0, pickup.json())
+
+        amount = self.client.post(
+            f"{self.endpoint}{flow['id']}/factory-return/credit-amount/",
+            {"amount": "260.50"},
+            **self.auth(self.factory_sales_assistant),
+        )
+        self.assertEqual(amount.json()["code"], 0, amount.json())
+        assistant_task = WorkItem.objects.get(
+            type="FACTORY_RETURN_POSTING",
+            biz_ref=f"lifecycle.GoodsTransfer:{flow['id']}",
+        )
+        self.assertEqual(assistant_task.status, "OPEN")
+        self.assertTrue(assistant_task.payload["credit_amount_recorded"])
+        self.assertFalse(assistant_task.payload["inventory_posted"])
+
+        row = amount.json()["data"]["items"][0]
+        posting = self.client.post(
+            f"{self.endpoint}{flow['id']}/factory-return/posting/",
+            {
+                "posting_remark": "金额已先登记",
+                "items": [
+                    {
+                        "item_id": row["goods_transfer_item_id"],
+                        "stock_status": "PENDING_REISSUE",
+                        "remark": "直接进入待流转库存",
+                    }
+                ],
+            },
+            content_type="application/json",
+            **self.auth(self.factory_sales_assistant),
+        )
+        self.assertEqual(posting.json()["code"], 0, posting.json())
+        assistant_task.refresh_from_db()
+        self.assertEqual(assistant_task.status, "DONE")
+        self.assertTrue(assistant_task.payload["credit_amount_recorded"])
+        self.assertTrue(assistant_task.payload["inventory_posted"])
+
+    def test_factory_return_internal_disposition_moves_repaired_items_to_reissue(self):
+        for device in self.devices:
+            self.set_owner(device, self.parent)
+        flow = self.create_flow(
+            self.parent_owner,
+            {
+                "flow_type": "RETURN",
+                "client_request_id": "factory-return-internal-disposition",
+                "target_account_id": self.factory_sales.pk,
+            },
+        )
+        for device in self.devices:
+            scan = self.client.post(
+                f"{self.endpoint}{flow['id']}/scan/",
+                {"qr_text": device.qrcode.code},
+                **self.auth(self.parent_owner),
+            )
+            self.assertEqual(scan.json()["code"], 0, scan.json())
+        submit = self.submit_transfer(self.parent_owner, flow["id"])
+        self.assertEqual(submit.json()["code"], 0, submit.json())
+        pickup = self.client.post(
+            f"{self.endpoint}{flow['id']}/factory-return/pickup/",
+            {},
+            **self.auth(self.factory_logistics),
+        )
+        self.assertEqual(pickup.json()["code"], 0, pickup.json())
+        rows = pickup.json()["data"]["items"]
+        posting = self.client.post(
+            f"{self.endpoint}{flow['id']}/factory-return/posting/",
+            {
+                "posting_remark": "两台修复、一台拆机",
+                "items": [
+                    {
+                        "item_id": rows[0]["goods_transfer_item_id"],
+                        "stock_status": "PENDING_REPAIR",
+                    },
+                    {
+                        "item_id": rows[1]["goods_transfer_item_id"],
+                        "stock_status": "PENDING_REPAIR",
+                    },
+                    {
+                        "item_id": rows[2]["goods_transfer_item_id"],
+                        "stock_status": "PENDING_DISASSEMBLY",
+                    },
+                ],
+            },
+            content_type="application/json",
+            **self.auth(self.factory_sales_assistant),
+        )
+        self.assertEqual(posting.json()["code"], 0, posting.json())
+        items = posting.json()["data"]["items"]
+        first_repair, second_repair, disassembly = items
+
+        repair_matching = WorkItem.objects.get(
+            type="FACTORY_RETURN_REPAIR_MATCHING",
+            biz_ref=f"lifecycle.GoodsTransfer:{flow['id']}",
+        )
+        self.assertFalse(
+            repair_matching.user_tasks.get(
+                to_openid=self.factory_matching.wx_openid
+            ).need_action
+        )
+
+        diagnosis_without_parts = self.client.post(
+            f"{self.endpoint}{flow['id']}/factory-return/items/"
+            f"{first_repair['id']}/production/",
+            {
+                "action": "REPAIR_DIAGNOSIS",
+                "needs_replacement_material": False,
+                "production_remark": "无需换料，保养后可修复",
+            },
+            content_type="application/json",
+            **self.auth(self.factory_production),
+        )
+        self.assertEqual(
+            diagnosis_without_parts.json()["code"],
+            0,
+            diagnosis_without_parts.json(),
+        )
+        repair_matching.refresh_from_db()
+        self.assertFalse(
+            repair_matching.user_tasks.get(
+                to_openid=self.factory_matching.wx_openid
+            ).need_action
+        )
+
+        diagnosis_with_parts = self.client.post(
+            f"{self.endpoint}{flow['id']}/factory-return/items/"
+            f"{second_repair['id']}/production/",
+            {
+                "action": "REPAIR_DIAGNOSIS",
+                "needs_replacement_material": True,
+                "production_remark": "控制模块故障",
+                "material_requirement": "更换控制模块一件",
+            },
+            content_type="application/json",
+            **self.auth(self.factory_production),
+        )
+        self.assertEqual(
+            diagnosis_with_parts.json()["code"], 0, diagnosis_with_parts.json()
+        )
+        repair_matching.refresh_from_db()
+        self.assertTrue(
+            repair_matching.user_tasks.get(
+                to_openid=self.factory_matching.wx_openid
+            ).need_action
+        )
+
+        matching_plan = self.client.post(
+            f"{self.endpoint}{flow['id']}/factory-return/items/"
+            f"{second_repair['id']}/matching/",
+            {
+                "action": "REPAIR_MATERIAL_PLAN",
+                "material_plan": "沿用原BOM，补领同规格控制模块",
+                "matching_remark": "物料准备完成",
+            },
+            content_type="application/json",
+            **self.auth(self.factory_matching),
+        )
+        self.assertEqual(matching_plan.json()["code"], 0, matching_plan.json())
+        repair_matching.refresh_from_db()
+        self.assertEqual(repair_matching.status, "DONE")
+
+        for item in (first_repair, second_repair):
+            completed = self.client.post(
+                f"{self.endpoint}{flow['id']}/factory-return/items/"
+                f"{item['id']}/production/",
+                {
+                    "action": "REPAIR_COMPLETE",
+                    "production_remark": "修复检测完成",
+                },
+                content_type="application/json",
+                **self.auth(self.factory_production),
+            )
+            self.assertEqual(completed.json()["code"], 0, completed.json())
+        repair_production = WorkItem.objects.get(
+            type="FACTORY_RETURN_REPAIR_PRODUCTION",
+            biz_ref=f"lifecycle.GoodsTransfer:{flow['id']}",
+        )
+        self.assertEqual(repair_production.status, "DONE")
+
+        dismantled = self.client.post(
+            f"{self.endpoint}{flow['id']}/factory-return/items/"
+            f"{disassembly['id']}/production/",
+            {
+                "action": "DISASSEMBLY_COMPLETE",
+                "disassembly_result": "拆出发电机总成和控制模块",
+                "has_warranty_material": True,
+                "production_remark": "整机结束生命周期",
+            },
+            content_type="application/json",
+            **self.auth(self.factory_production),
+        )
+        self.assertEqual(dismantled.json()["code"], 0, dismantled.json())
+        disassembly_production = WorkItem.objects.get(
+            type="FACTORY_RETURN_DISASSEMBLY_PRODUCTION",
+            biz_ref=f"lifecycle.GoodsTransfer:{flow['id']}",
+        )
+        self.assertEqual(disassembly_production.status, "DONE")
+        disassembly_matching = WorkItem.objects.get(
+            type="FACTORY_RETURN_DISASSEMBLY_MATCHING",
+            biz_ref=f"lifecycle.GoodsTransfer:{flow['id']}",
+        )
+        self.assertTrue(
+            disassembly_matching.user_tasks.get(
+                to_openid=self.factory_matching.wx_openid
+            ).need_action
+        )
+
+        disposition = self.client.post(
+            f"{self.endpoint}{flow['id']}/factory-return/items/"
+            f"{disassembly['id']}/matching/",
+            {
+                "action": "DISASSEMBLY_MATERIAL_DISPOSITION",
+                "warranty_disposition": "控制模块进入三包责任追溯",
+                "matching_remark": "待后续关联供应商协作",
+            },
+            content_type="application/json",
+            **self.auth(self.factory_matching),
+        )
+        self.assertEqual(disposition.json()["code"], 0, disposition.json())
+        disassembly_matching.refresh_from_db()
+        self.assertEqual(disassembly_matching.status, "DONE")
+
+        self.assertEqual(
+            FactoryReturnInventoryItem.objects.filter(
+                process__transfer_id=flow["id"],
+                stock_status="PENDING_REISSUE",
+            ).count(),
+            2,
+        )
+        self.assertEqual(
+            FactoryReturnInventoryItem.objects.filter(
+                process__transfer_id=flow["id"],
+                stock_status="LIFECYCLE_ENDED",
+            ).count(),
+            1,
+        )
+        self.assertEqual(
+            DeviceState.objects.get(device=self.devices[2]).status,
+            "SCRAPPED",
+        )
+        self.assertTrue(
+            LifecycleEvent.objects.filter(
+                device=self.devices[2],
+                event_type="LIFECYCLE_CLOSE",
+            ).exists()
+        )
+
+        inventory = self.client.get(
+            "/pldp/api/lifecycle/factory-returns/inventory/",
+            **self.auth(self.factory_stock),
+        )
+        self.assertEqual(inventory.json()["code"], 0, inventory.json())
+        self.assertEqual(inventory.json()["data"]["counts"]["PENDING_REISSUE"], 2)
+        self.assertEqual(inventory.json()["data"]["counts"]["LIFECYCLE_ENDED"], 1)
 
     def test_merchant_stock_cannot_transfer_between_subordinates(self):
         response = self.client.get(
