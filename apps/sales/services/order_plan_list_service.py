@@ -232,7 +232,7 @@ def _stage_data(plan):
     return stages
 
 
-def _stock_confirmation_data(workitem, openid):
+def _stock_confirmation_data(plan, workitem, openid):
     if not workitem:
         return None
     task = next(
@@ -240,13 +240,25 @@ def _stock_confirmation_data(workitem, openid):
         None,
     )
     done = workitem.status == "DONE"
+    qrcodes_ready = not plan.items.filter(qrcode_printed_at__isnull=True).exists()
     return {
         "workitem_id": workitem.pk,
         "task_id": task.pk if task else None,
-        "state": "COMPLETED" if done else "PENDING",
-        "state_name": "已发货" if done else "待发货",
+        "state": (
+            "COMPLETED" if done
+            else ("PENDING_OUTBOUND" if qrcodes_ready else "PENDING_PRINT")
+        ),
+        "state_name": (
+            "已发货" if done
+            else ("待发货" if qrcodes_ready else "待打印新二维码")
+        ),
+        "qrcodes_ready": qrcodes_ready,
         "can_confirm": bool(
-            task and not done and task.state != "DONE" and task.need_action
+            task
+            and not done
+            and qrcodes_ready
+            and task.state != "DONE"
+            and task.need_action
         ),
     }
 
@@ -455,6 +467,8 @@ def _serialize_factory_plan(
                         "name": item.product_model.name,
                     },
                     "quantity": item.quantity,
+                    "return_inventory_quantity": item.return_inventory_quantity,
+                    "production_quantity": item.production_quantity,
                     "order_batch_code": item.order_batch_code,
                     "lifecycle_code": item.lifecycle_code,
                     "bom_confirmation": _confirmation_data(item),
@@ -492,7 +506,7 @@ def _serialize_factory_plan(
             ),
             "fulfillment_stages": _stage_data(plan),
             "stock_confirmation": (
-                _stock_confirmation_data(stock_workitem, openid)
+                _stock_confirmation_data(plan, stock_workitem, openid)
                 if role_code == "factory_stock"
                 else None
             ),
@@ -561,7 +575,7 @@ def _serialize_supplier_plan(plan, identity, supplier_workitems):
         if not supplier_bom_items:
             continue
 
-        visible_total_quantity += order_item.quantity
+        visible_total_quantity += order_item.production_quantity
         visible_items.append(
             {
                 "id": order_item.pk,
@@ -574,7 +588,9 @@ def _serialize_supplier_plan(plan, identity, supplier_workitems):
                     "code": order_item.product_model.code,
                     "name": order_item.product_model.name,
                 },
-                "quantity": order_item.quantity,
+                "quantity": order_item.production_quantity,
+                "total_demand_quantity": order_item.quantity,
+                "return_inventory_quantity": order_item.return_inventory_quantity,
                 "order_batch_code": order_item.order_batch_code,
                 "bom_confirmation": _confirmation_data(order_item),
                 "materials": [
@@ -597,7 +613,7 @@ def _serialize_supplier_plan(plan, identity, supplier_workitems):
                             bom_item.quantity
                         ),
                         "required_quantity": _display_quantity(
-                            bom_item.quantity * order_item.quantity
+                            bom_item.quantity * order_item.production_quantity
                         ),
                         "remark": bom_item.remark,
                         "supplier_confirmation_state": (

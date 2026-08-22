@@ -1,4 +1,6 @@
 from datetime import date, timedelta
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from django.test import TestCase
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -18,10 +20,15 @@ from account.models import (
 )
 from account.services.auth_service import issue_access_token
 from lifecycle.models import (
+    DeviceMaterialFaultRecord,
+    DeviceMaterialWarrantyEvaluation,
     DeviceState,
     FactoryReturnDocument,
     FactoryReturnInventoryItem,
+    FactoryReturnMaterialReturnRecord,
     FactoryReturnProcess,
+    FactoryReturnRepairMaterialRequirement,
+    FactoryReturnWarrantyDispatch,
     GoodsTransfer,
     GoodsTransferAccountCase,
     GoodsTransferCreditAllocation,
@@ -30,8 +37,18 @@ from lifecycle.models import (
     QRCode,
 )
 from lifecycle.services.lifecycle_service import LifecycleService
+from lifecycle.services.factory_return_service import (
+    _original_supplier_task_recipients,
+)
 from manufacturing.models import ProductionBatch
-from product.models import BOM, ProductCategory, ProductModel
+from product.models import BOM, BOMItem, ProductCategory, ProductModel
+from supply_chain.models import (
+    Material,
+    MaterialSpec,
+    MaterialSpecSupplier,
+    SupplierResponsibilityScope,
+    SupplierSalesResponsibility,
+)
 from workflow.models import WorkItem
 
 
@@ -42,6 +59,7 @@ class GoodsTransferApiTests(TestCase):
     def setUpTestData(cls):
         owner_type = OrganizationType.objects.get(code="OWNER")
         merchant_type = OrganizationType.objects.get(code="MERCHANT")
+        supplier_type = OrganizationType.objects.get(code="SUPPLIER")
         cls.factory_sales_role = OrganizationRole.objects.get(code="factory_sales")
         cls.factory_logistics_role = OrganizationRole.objects.get(code="factory_logistics")
         cls.factory_sales_assistant_role = OrganizationRole.objects.get(
@@ -53,6 +71,8 @@ class GoodsTransferApiTests(TestCase):
         cls.merchant_owner_role = OrganizationRole.objects.get(code="merchant_owner")
         cls.merchant_sales_role = OrganizationRole.objects.get(code="merchant_sales")
         cls.merchant_stock_role = OrganizationRole.objects.get(code="merchant_stock")
+        cls.supplier_owner_role = OrganizationRole.objects.get(code="supplier_owner")
+        cls.supplier_sales_role = OrganizationRole.objects.get(code="supplier_sales")
 
         cls.factory = Organization.objects.create(
             name="流转测试厂家",
@@ -73,6 +93,16 @@ class GoodsTransferApiTests(TestCase):
             name="下级商家C",
             code="FLOW-MERCHANT-C",
             organization_type=merchant_type,
+        )
+        cls.supplier = Organization.objects.create(
+            name="流转测试配套供应商",
+            code="FLOW-SUPPLIER",
+            organization_type=supplier_type,
+        )
+        cls.other_supplier = Organization.objects.create(
+            name="同规格备选供应商",
+            code="FLOW-OTHER-SUPPLIER",
+            organization_type=supplier_type,
         )
 
         cls.factory_sales = cls._user(
@@ -116,6 +146,12 @@ class GoodsTransferApiTests(TestCase):
         cls.child_c_stock = cls._user(
             "flow_child_c_stock", cls.child_c, cls.merchant_stock_role
         )
+        cls.supplier_owner = cls._user(
+            "flow_supplier_owner", cls.supplier, cls.supplier_owner_role
+        )
+        cls.supplier_sales = cls._user(
+            "flow_supplier_sales", cls.supplier, cls.supplier_sales_role
+        )
 
         cls._relation(
             cls.factory_sales,
@@ -150,6 +186,41 @@ class GoodsTransferApiTests(TestCase):
             version_no=1,
             version="v1",
             created_by=cls.factory_sales,
+        )
+        cls.fault_material = Material.objects.create(
+            code="FLOW-CONTROL-MODULE",
+            name="流转测试控制模块",
+            product_category=category,
+            is_key_part=True,
+        )
+        cls.fault_material_spec = MaterialSpec.objects.create(
+            material=cls.fault_material,
+            code="FLOW-CONTROL-MODULE-24V",
+            name="24V控制模块",
+        )
+        MaterialSpecSupplier.objects.create(
+            material_spec=cls.fault_material_spec,
+            supplier=cls.supplier,
+            warranty_months=12,
+        )
+        MaterialSpecSupplier.objects.create(
+            material_spec=cls.fault_material_spec,
+            supplier=cls.other_supplier,
+            warranty_months=12,
+        )
+        cls.bom_item = BOMItem.objects.create(
+            bom=bom,
+            material=cls.fault_material,
+            material_spec=cls.fault_material_spec,
+            supplier=cls.supplier,
+            quantity=1,
+        )
+        SupplierSalesResponsibility.objects.create(
+            supplier=cls.supplier,
+            sales_identity=cls.supplier_sales.organization_identity,
+            scope_type=SupplierResponsibilityScope.MATERIAL,
+            material=cls.fault_material,
+            assigned_by=cls.supplier_owner,
         )
         batch = ProductionBatch.objects.create(
             batch_no="FLOW-BATCH-001",
@@ -590,6 +661,37 @@ class GoodsTransferApiTests(TestCase):
         self.assertSetEqual(
             set(pickup_task.user_tasks.values_list("to_openid", flat=True)),
             {self.factory_logistics.wx_openid},
+        )
+        logistics_view = self.client.get(
+            f"{self.endpoint}{flow['id']}/factory-return/",
+            **self.auth(self.factory_logistics),
+        ).json()["data"]
+        self.assertEqual(len(logistics_view["workflow_tasks"]), 1)
+        self.assertTrue(logistics_view["workflow_tasks"][0]["published"])
+        self.assertEqual(
+            logistics_view["workflow_tasks"][0]["read_state"],
+            "UNREAD",
+        )
+        self.assertEqual(
+            logistics_view["workflow_tasks"][0]["action_state"],
+            "PENDING",
+        )
+
+        # The matching role can already see its complete planned branch, but
+        # neither branch is readable/operable before classification publishes
+        # a real task to that role.
+        matching_view = self.client.get(
+            f"{self.endpoint}{flow['id']}/factory-return/",
+            **self.auth(self.factory_matching),
+        ).json()["data"]
+        self.assertEqual(len(matching_view["workflow_tasks"]), 2)
+        self.assertTrue(
+            all(
+                not row["published"]
+                and row["read_state"] == "NOT_PUBLISHED"
+                and row["action_state"] == "NOT_PUBLISHED"
+                for row in matching_view["workflow_tasks"]
+            )
         )
         forbidden_receipt = self.client.post(
             f"{self.endpoint}{flow['id']}/receipt/",
@@ -1068,6 +1170,106 @@ class GoodsTransferApiTests(TestCase):
         self.assertTrue(assistant_task.payload["credit_amount_recorded"])
         self.assertTrue(assistant_task.payload["inventory_posted"])
 
+    def test_return_supplier_recipients_keep_original_order_responsibility_snapshot(self):
+        WorkItem.objects.create(
+            domain="SALES",
+            type="ORDER_PLAN_SUPPLIER_PREPARE",
+            biz_id="snapshot-owner-only",
+            biz_ref="sales.OrderPlan:9001",
+            uniq_key="test:order-plan:9001:supplier",
+            payload={
+                "supplier_id": self.supplier.pk,
+                "recipient_scopes": {
+                    self.supplier_owner.wx_openid: {
+                        "role": "supplier_owner",
+                        "identity_id": self.supplier_owner.organization_identity.pk,
+                        "material_ids": [self.fault_material.pk],
+                    },
+                    # 当前责任范围后来增加了销售经理，但不能回写首次快照。
+                    self.supplier_sales.wx_openid: {
+                        "role": "supplier_sales",
+                        "identity_id": self.supplier_sales.organization_identity.pk,
+                        "material_ids": [self.fault_material.pk],
+                    },
+                },
+                "initial_recipient_scopes": {
+                    self.supplier_owner.wx_openid: {
+                        "role": "supplier_owner",
+                        "identity_id": self.supplier_owner.organization_identity.pk,
+                        "material_ids": [self.fault_material.pk],
+                    },
+                },
+            },
+        )
+        with patch(
+            "lifecycle.services.factory_return_service._source_order_item",
+            return_value=SimpleNamespace(plan_id=9001),
+        ):
+            recipients = _original_supplier_task_recipients(
+                inventory_item=object(),
+                supplier=self.supplier,
+                material_ids={self.fault_material.pk},
+            )
+        self.assertEqual(recipients["openids"], [self.supplier_owner.wx_openid])
+        self.assertEqual(recipients["sales_openids"], [])
+        self.assertEqual(
+            recipients["unassigned_sales_material_ids"],
+            [self.fault_material.pk],
+        )
+        self.assertEqual(
+            recipients["responsibility_source"],
+            "ORDER_CONFIRMATION_INITIAL_SNAPSHOT",
+        )
+
+        WorkItem.objects.create(
+            domain="SALES",
+            type="ORDER_PLAN_SUPPLIER_PREPARE",
+            biz_id="snapshot-with-sales",
+            biz_ref="sales.OrderPlan:9002",
+            uniq_key="test:order-plan:9002:supplier",
+            payload={
+                "supplier_id": self.supplier.pk,
+                "recipient_scopes": {
+                    self.supplier_owner.wx_openid: {
+                        "role": "supplier_owner",
+                        "identity_id": self.supplier_owner.organization_identity.pk,
+                        "material_ids": [self.fault_material.pk],
+                    },
+                    self.supplier_sales.wx_openid: {
+                        "role": "supplier_sales",
+                        "identity_id": self.supplier_sales.organization_identity.pk,
+                        "material_ids": [self.fault_material.pk],
+                    },
+                },
+                "initial_recipient_scopes": {
+                    self.supplier_owner.wx_openid: {
+                        "role": "supplier_owner",
+                        "identity_id": self.supplier_owner.organization_identity.pk,
+                        "material_ids": [self.fault_material.pk],
+                    },
+                    self.supplier_sales.wx_openid: {
+                        "role": "supplier_sales",
+                        "identity_id": self.supplier_sales.organization_identity.pk,
+                        "material_ids": [self.fault_material.pk],
+                    },
+                },
+            },
+        )
+        with patch(
+            "lifecycle.services.factory_return_service._source_order_item",
+            return_value=SimpleNamespace(plan_id=9002),
+        ):
+            recipients = _original_supplier_task_recipients(
+                inventory_item=object(),
+                supplier=self.supplier,
+                material_ids={self.fault_material.pk},
+            )
+        self.assertSetEqual(
+            set(recipients["openids"]),
+            {self.supplier_owner.wx_openid, self.supplier_sales.wx_openid},
+        )
+        self.assertEqual(recipients["unassigned_sales_material_ids"], [])
+
     def test_factory_return_internal_disposition_moves_repaired_items_to_reissue(self):
         for device in self.devices:
             self.set_owner(device, self.parent)
@@ -1161,7 +1363,12 @@ class GoodsTransferApiTests(TestCase):
                 "action": "REPAIR_DIAGNOSIS",
                 "needs_replacement_material": True,
                 "production_remark": "控制模块故障",
-                "material_requirement": "更换控制模块一件",
+                "repair_materials": [
+                    {
+                        "bom_item_id": self.bom_item.pk,
+                        "note": "原控制模块损坏，需要同规格替换",
+                    }
+                ],
             },
             content_type="application/json",
             **self.auth(self.factory_production),
@@ -1169,13 +1376,32 @@ class GoodsTransferApiTests(TestCase):
         self.assertEqual(
             diagnosis_with_parts.json()["code"], 0, diagnosis_with_parts.json()
         )
+        diagnosed_item = next(
+            row
+            for row in diagnosis_with_parts.json()["data"]["items"]
+            if row["id"] == second_repair["id"]
+        )
+        self.assertEqual(diagnosed_item["stock_status"], "REPAIRING")
+        self.assertEqual(diagnosed_item["stock_status_name"], "修复处理中")
         repair_matching.refresh_from_db()
         self.assertTrue(
             repair_matching.user_tasks.get(
                 to_openid=self.factory_matching.wx_openid
             ).need_action
         )
+        requirement = FactoryReturnRepairMaterialRequirement.objects.get(
+            inventory_item_id=second_repair["id"],
+        )
+        self.assertEqual(requirement.material_id, self.fault_material.pk)
+        self.assertEqual(requirement.supplier_id, self.supplier.pk)
+        self.assertEqual(requirement.trace_source, "PRODUCTION_BATCH")
 
+        # 原订单没有匹配责任销售经理时，只通知供应商负责人，不能阻断
+        # 配套经理完成处置，也不能临时随意匹配其他销售经理。
+        SupplierSalesResponsibility.objects.filter(
+            supplier=self.supplier,
+            material=self.fault_material,
+        ).delete()
         matching_plan = self.client.post(
             f"{self.endpoint}{flow['id']}/factory-return/items/"
             f"{second_repair['id']}/matching/",
@@ -1188,8 +1414,43 @@ class GoodsTransferApiTests(TestCase):
             **self.auth(self.factory_matching),
         )
         self.assertEqual(matching_plan.json()["code"], 0, matching_plan.json())
+        requirement.refresh_from_db()
+        self.assertIsNotNone(requirement.notified_at)
+        repair_supplier_task = WorkItem.objects.get(
+            type="FACTORY_RETURN_SUPPLIER_REPAIR_MATERIAL",
+            payload__supplier_id=self.supplier.pk,
+        )
+        self.assertEqual(
+            set(repair_supplier_task.user_tasks.values_list("to_openid", flat=True)),
+            {self.supplier_owner.wx_openid},
+        )
+        self.assertEqual(
+            repair_supplier_task.payload["unassigned_sales_material_ids"],
+            [self.fault_material.pk],
+        )
+        supplier_view = self.client.get(
+            "/pldp/api/lifecycle/supplier-warranty-lists/",
+            **self.auth(self.supplier_owner),
+        )
+        self.assertEqual(supplier_view.json()["code"], 0, supplier_view.json())
+        repair_rows = supplier_view.json()["data"]["repair_material_requests"]
+        self.assertEqual(len(repair_rows), 1)
+        self.assertEqual(repair_rows[0]["material_id"], self.fault_material.pk)
+        self.assertEqual(
+            repair_rows[0]["trace_source"],
+            "PRODUCTION_BATCH",
+        )
         repair_matching.refresh_from_db()
         self.assertEqual(repair_matching.status, "DONE")
+
+        # 后续拆机三包分支继续覆盖“已配置责任销售经理则同步通知”。
+        SupplierSalesResponsibility.objects.create(
+            supplier=self.supplier,
+            sales_identity=self.supplier_sales.organization_identity,
+            scope_type=SupplierResponsibilityScope.MATERIAL,
+            material=self.fault_material,
+            assigned_by=self.supplier_owner,
+        )
 
         for item in (first_repair, second_repair):
             completed = self.client.post(
@@ -1208,14 +1469,67 @@ class GoodsTransferApiTests(TestCase):
             biz_ref=f"lifecycle.GoodsTransfer:{flow['id']}",
         )
         self.assertEqual(repair_production.status, "DONE")
+        requirement.refresh_from_db()
+        self.assertIsNotNone(requirement.returned_material_record_id)
+        repair_old_part = requirement.returned_material_record
+        self.assertEqual(
+            repair_old_part.return_kind,
+            FactoryReturnMaterialReturnRecord.ReturnKind.REPAIR_REPLACED,
+        )
+        self.assertEqual(repair_old_part.returned_quantity, requirement.requested_quantity)
+        self.assertFalse(repair_old_part.is_fault_material)
+        self.assertEqual(repair_old_part.warranty_result, "IN_WARRANTY")
+
+        # 实际退回与故障件次是两层事实：下面增加一件非故障
+        # 但实际拆下退回的关键件，验证它只进实物/结算口径。
+        returned_material = Material.objects.create(
+            code="FLOW-RETURNED-NON-FAULT",
+            name="流转测试非故障关键件",
+            product_category=self.product_model.category,
+            is_key_part=True,
+        )
+        returned_spec = MaterialSpec.objects.create(
+            material=returned_material,
+            code="FLOW-RETURNED-NON-FAULT-SPEC",
+            name="非故障关键件规格",
+        )
+        MaterialSpecSupplier.objects.create(
+            material_spec=returned_spec,
+            supplier=self.supplier,
+            warranty_months=18,
+        )
+        returned_bom_item = BOMItem.objects.create(
+            bom=self.bom_item.bom,
+            material=returned_material,
+            material_spec=returned_spec,
+            supplier=self.supplier,
+            quantity=1,
+        )
+        SupplierSalesResponsibility.objects.create(
+            supplier=self.supplier,
+            sales_identity=self.supplier_sales.organization_identity,
+            scope_type=SupplierResponsibilityScope.MATERIAL,
+            material=returned_material,
+            assigned_by=self.supplier_owner,
+        )
 
         dismantled = self.client.post(
             f"{self.endpoint}{flow['id']}/factory-return/items/"
             f"{disassembly['id']}/production/",
             {
                 "action": "DISASSEMBLY_COMPLETE",
-                "disassembly_result": "拆出发电机总成和控制模块",
-                "has_warranty_material": True,
+                "returned_materials": [
+                    {
+                        "bom_item_id": self.bom_item.pk,
+                        "note": "控制模块烧蚀，生产现场确认直接关联",
+                        "is_fault_material": True,
+                    },
+                    {
+                        "bom_item_id": returned_bom_item.pk,
+                        "note": "实际拆下退回，但不是本次拆机原因",
+                        "is_fault_material": False,
+                    },
+                ],
                 "production_remark": "整机结束生命周期",
             },
             content_type="application/json",
@@ -1236,13 +1550,52 @@ class GoodsTransferApiTests(TestCase):
                 to_openid=self.factory_matching.wx_openid
             ).need_action
         )
+        fault = DeviceMaterialFaultRecord.objects.get(
+            inventory_item_id=disassembly["id"]
+        )
+        self.assertEqual(fault.source_bom_item_id, self.bom_item.pk)
+        self.assertEqual(fault.material_id, self.fault_material.pk)
+        self.assertEqual(fault.supplier_id, self.supplier.pk)
+        self.assertEqual(fault.trace_source, "BOM_INFERRED")
+        self.assertEqual(fault.schema_version, 1)
+        self.assertTrue(fault.is_warranty_candidate)
+        self.assertEqual(fault.material_name_snapshot, "流转测试控制模块")
+        self.assertEqual(fault.supplier_name_snapshot, "流转测试配套供应商")
+        fault.original_note = "试图覆盖生产现场原始事实"
+        with self.assertRaisesMessage(ValueError, "故障物料事实创建后不可覆盖"):
+            fault.save()
+        fault.refresh_from_db()
+        self.assertEqual(
+            fault.original_note,
+            "控制模块烧蚀，生产现场确认直接关联",
+        )
+        actual_returns = FactoryReturnMaterialReturnRecord.objects.filter(
+            inventory_item_id=disassembly["id"],
+            return_kind=(
+                FactoryReturnMaterialReturnRecord.ReturnKind.DISASSEMBLY
+            ),
+        ).order_by("id")
+        self.assertEqual(actual_returns.count(), 2)
+        self.assertEqual(
+            actual_returns.filter(is_fault_material=True).count(),
+            1,
+        )
+        self.assertEqual(
+            DeviceMaterialFaultRecord.objects.filter(
+                inventory_item_id=disassembly["id"]
+            ).count(),
+            1,
+        )
+        self.assertSetEqual(
+            set(actual_returns.values_list("warranty_result", flat=True)),
+            {"IN_WARRANTY"},
+        )
 
         disposition = self.client.post(
             f"{self.endpoint}{flow['id']}/factory-return/items/"
             f"{disassembly['id']}/matching/",
             {
                 "action": "DISASSEMBLY_MATERIAL_DISPOSITION",
-                "warranty_disposition": "控制模块进入三包责任追溯",
                 "matching_remark": "待后续关联供应商协作",
             },
             content_type="application/json",
@@ -1251,6 +1604,119 @@ class GoodsTransferApiTests(TestCase):
         self.assertEqual(disposition.json()["code"], 0, disposition.json())
         disassembly_matching.refresh_from_db()
         self.assertEqual(disassembly_matching.status, "DONE")
+        dispatch = FactoryReturnWarrantyDispatch.objects.get(
+            inventory_item_id=disassembly["id"],
+            supplier=self.supplier,
+        )
+        supplier_workitem = WorkItem.objects.get(
+            type="FACTORY_RETURN_SUPPLIER_WARRANTY",
+            biz_ref=f"lifecycle.FactoryReturnWarrantyDispatch:{dispatch.pk}",
+        )
+        self.assertEqual(supplier_workitem.action_mode, "EACH_ACK")
+        self.assertEqual(supplier_workitem.status, "DONE")
+        self.assertEqual(
+            supplier_workitem.link,
+            f"/pages/supply_chain/warranty_list/warranty_list?dispatch_id={dispatch.pk}",
+        )
+        self.assertSetEqual(
+            set(supplier_workitem.user_tasks.values_list("to_openid", flat=True)),
+            {
+                self.supplier_owner.wx_openid,
+                self.supplier_sales.wx_openid,
+            },
+        )
+        self.assertFalse(
+            supplier_workitem.user_tasks.get(
+                to_openid=self.supplier_owner.wx_openid
+            ).need_action
+        )
+        self.assertFalse(
+            supplier_workitem.user_tasks.get(
+                to_openid=self.supplier_sales.wx_openid
+            ).need_action
+        )
+        evaluation = DeviceMaterialWarrantyEvaluation.objects.get(
+            fault_record=fault
+        )
+        self.assertEqual(evaluation.result, "IN_WARRANTY")
+        self.assertEqual(evaluation.warranty_months, 12)
+        self.assertEqual(evaluation.warranty_start_date, date(2026, 8, 17))
+        self.assertEqual(evaluation.rule_source, "EXACT_SUPPLIER_SPEC")
+        supplier_detail = self.client.get(
+            f"/pldp/api/lifecycle/factory-return-warranty-dispatches/{dispatch.pk}/",
+            **self.auth(self.supplier_sales),
+        )
+        self.assertEqual(supplier_detail.json()["code"], 0, supplier_detail.json())
+        self.assertEqual(
+            supplier_detail.json()["data"]["materials"][0]["id"],
+            fault.pk,
+        )
+        self.assertFalse(
+            supplier_detail.json()["data"]["actions"]["can_receive"]
+        )
+        supplier_lists = self.client.get(
+            "/pldp/api/lifecycle/supplier-warranty-lists/",
+            **self.auth(self.supplier_sales),
+        )
+        self.assertEqual(supplier_lists.json()["code"], 0, supplier_lists.json())
+        supplier_summary = supplier_lists.json()["data"]["summary"]
+        self.assertEqual(supplier_summary["return_case_count"], 1)
+        self.assertEqual(supplier_summary["returned_material_count"], 2)
+        self.assertEqual(supplier_summary["returned_material_quantity"], "2.00")
+        self.assertEqual(supplier_summary["fault_material_count"], 1)
+        self.assertEqual(supplier_summary["fault_occurrence_count"], 1)
+        self.assertEqual(
+            len(supplier_lists.json()["data"]["return_materials"]),
+            2,
+        )
+        # 修复需求推送时未给该销售经理分配责任，后来新增责任
+        # 也不得让其继承这条历史清单。
+        self.assertEqual(
+            supplier_lists.json()["data"]["repair_material_requests"],
+            [],
+        )
+        self.assertEqual(
+            supplier_lists.json()["data"]["fault_materials"][0]["id"],
+            fault.pk,
+        )
+        owner_lists = self.client.get(
+            "/pldp/api/lifecycle/supplier-warranty-lists/",
+            **self.auth(self.supplier_owner),
+        )
+        self.assertEqual(owner_lists.json()["code"], 0, owner_lists.json())
+        self.assertEqual(
+            owner_lists.json()["data"]["viewer"]["scope_name"],
+            "本供应商全部退回、故障与修复数据",
+        )
+        repair_list_row = owner_lists.json()["data"][
+            "repair_material_requests"
+        ][0]
+        self.assertTrue(repair_list_row["actual_return_recorded"])
+        self.assertEqual(repair_list_row["actual_return_quantity"], "1.00")
+        self.assertEqual(
+            repair_list_row["new_material_quantity_rule"],
+            "新换入物料由后续订单计划重新计数，本清单只统计换下退回旧件。",
+        )
+        sales_task = supplier_workitem.user_tasks.get(
+            to_openid=self.supplier_sales.wx_openid
+        )
+        owner_task = supplier_workitem.user_tasks.get(
+            to_openid=self.supplier_owner.wx_openid
+        )
+        opened = self.client.post(
+            "/pldp/api/workflow/task/open/",
+            {"usertask_id": sales_task.pk},
+            content_type="application/json",
+            **self.auth(self.supplier_sales),
+        )
+        self.assertEqual(opened.json()["code"], 0, opened.json())
+        sales_task.refresh_from_db()
+        owner_task.refresh_from_db()
+        dispatch.refresh_from_db()
+        self.assertEqual(sales_task.state, "DONE")
+        self.assertEqual(sales_task.done_reason, "OPENED")
+        self.assertEqual(owner_task.state, "NEW")
+        self.assertEqual(dispatch.status, "NOTIFIED")
 
         self.assertEqual(
             FactoryReturnInventoryItem.objects.filter(

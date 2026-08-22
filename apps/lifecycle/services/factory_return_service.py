@@ -1,18 +1,26 @@
 from collections import defaultdict
+import calendar
+from decimal import Decimal
 from pathlib import Path
 import uuid
 
 from django.db import transaction
-from django.db.models import Max
+from django.db.models import Max, OuterRef, Subquery, Sum
 from django.utils import timezone
 
 from account.models import UserOrganization
 from account.services.auth_service import get_active_identity
 from lifecycle.models import (
+    DeviceMaterialFaultRecord,
+    DeviceMaterialWarrantyEvaluation,
     DeviceState,
     FactoryReturnDocument,
     FactoryReturnInventoryItem,
+    FactoryReturnMaterialReturnRecord,
     FactoryReturnProcess,
+    FactoryReturnRepairMaterialRequirement,
+    FactoryReturnWarrantyDispatch,
+    FactoryReturnWarrantyDispatchItem,
     GoodsTransfer,
     GoodsTransferAccountCase,
     GoodsTransferItem,
@@ -20,7 +28,14 @@ from lifecycle.models import (
     OrganizationDevice,
     QRCode,
 )
-from workflow.models import WorkItem
+from sales.models import OrderPlanItem
+from supply_chain.models import MaterialSpecSupplier
+from supply_chain.services.supplier_responsibility_service import (
+    SupplierResponsibilityError,
+    get_supplier_identity,
+    get_supplier_task_recipients,
+)
+from workflow.models import UserTask, WorkItem
 from workflow.services.workflow_service import publish_workitem
 
 
@@ -36,6 +51,8 @@ REPAIR_MATCHING_WORK_TYPE = "FACTORY_RETURN_REPAIR_MATCHING"
 RETURN_DOCUMENT_WORK_TYPE = "FACTORY_RETURN_DOCUMENT_UPLOAD"
 RETURN_LOGISTICS_NOTICE_TYPE = "FACTORY_RETURN_LOGISTICS_DOCUMENT_NOTICE"
 RETURN_GOODS_LIST_NOTICE_TYPE = "FACTORY_RETURN_GOODS_LIST_NOTICE"
+SUPPLIER_WARRANTY_WORK_TYPE = "FACTORY_RETURN_SUPPLIER_WARRANTY"
+SUPPLIER_REPAIR_MATERIAL_WORK_TYPE = "FACTORY_RETURN_SUPPLIER_REPAIR_MATERIAL"
 
 MERCHANT_RETURN_DOCUMENT_ROLES = {
     "merchant_owner",
@@ -90,6 +107,64 @@ INTERNAL_BRANCH_CONFIG = {
         "matching_suffix": "disassembly-matching",
         "matching_title": "退货拆机三包物料待处理",
     },
+}
+
+# The domain detail renders a role-specific workflow strip.  These are planned
+# nodes, not replacement inbox rows: an unpublished node is visible but cannot
+# be read or operated, while a published node points to its real UserTask.
+FACTORY_RETURN_ROLE_TASK_NODES = {
+    "factory_sales": (
+        {
+            "type": SALES_NOTICE_SUBMITTED,
+            "title": "退货提交与取回进度",
+            "is_action": False,
+        },
+    ),
+    "factory_logistics": (
+        {
+            "type": PICKUP_WORK_TYPE,
+            "title": "厂家物流取回退货",
+            "is_action": True,
+        },
+    ),
+    "factory_sales_assistant": (
+        {
+            "type": POSTING_WORK_TYPE,
+            "title": "退货下账与分类入库",
+            "is_action": True,
+        },
+    ),
+    "factory_stock": (
+        {
+            "type": STOCK_NOTICE_WORK_TYPE,
+            "title": "退货分类入库知晓",
+            "is_action": False,
+        },
+    ),
+    "factory_production": (
+        {
+            "type": DISASSEMBLY_PRODUCTION_WORK_TYPE,
+            "title": "退货设备拆机处置",
+            "is_action": True,
+        },
+        {
+            "type": REPAIR_PRODUCTION_WORK_TYPE,
+            "title": "退货设备修复处置",
+            "is_action": True,
+        },
+    ),
+    "factory_matching": (
+        {
+            "type": DISASSEMBLY_MATCHING_WORK_TYPE,
+            "title": "拆机三包物料配套处置",
+            "is_action": True,
+        },
+        {
+            "type": REPAIR_MATCHING_WORK_TYPE,
+            "title": "修复换料配套处置",
+            "is_action": True,
+        },
+    ),
 }
 
 
@@ -1611,6 +1686,1189 @@ def _locked_internal_inventory_item(transfer, item_id):
     return item
 
 
+def _source_order_item(inventory_item):
+    """Resolve the exact order line that created the production batch."""
+
+    return (
+        OrderPlanItem.objects.select_related(
+            "plan",
+            "bom_confirmation__confirmed_bom",
+        )
+        .filter(order_batch_code=inventory_item.source_production_batch.batch_no)
+        .order_by("id")
+        .first()
+    )
+
+
+def _original_supplier_task_recipients(*, inventory_item, supplier, material_ids):
+    """Resolve supplier recipients without rewriting the original sales chain.
+
+    Supplier owners are resolved from the supplier's current active identities so
+    the notification always reaches the current owner slot. Responsible sales
+    managers, however, are taken from the supplier-task snapshot created when the
+    original order BOM was confirmed. A material that had no responsible sales
+    manager at that time remains owner-only during return tracing.
+
+    Legacy devices that cannot be linked to an order line keep the previous
+    current-responsibility fallback; the returned source marker makes that
+    limitation explicit in the new task payload.
+    """
+
+    material_ids = {
+        int(material_id)
+        for material_id in material_ids or ()
+        if material_id
+    }
+    current = get_supplier_task_recipients(
+        supplier=supplier,
+        material_ids=material_ids,
+    )
+    order_item = _source_order_item(inventory_item)
+    if not order_item:
+        assigned_material_ids = {
+            int(material_id)
+            for scope in current["recipient_scopes"].values()
+            if scope.get("role") == "supplier_sales"
+            for material_id in scope.get("material_ids", [])
+        }
+        current.update(
+            {
+                "responsibility_source": "CURRENT_FALLBACK",
+                "responsibility_source_name": "历史订单无法定位，按当前责任范围兼容",
+                "unassigned_sales_material_ids": sorted(
+                    material_ids - assigned_material_ids
+                ),
+            }
+        )
+        return current
+
+    source_workitem = None
+    for candidate in WorkItem.objects.filter(
+        type="ORDER_PLAN_SUPPLIER_PREPARE",
+        biz_ref=f"sales.OrderPlan:{order_item.plan_id}",
+    ).order_by("id"):
+        payload = candidate.payload if isinstance(candidate.payload, dict) else {}
+        try:
+            payload_supplier_id = int(payload.get("supplier_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if payload_supplier_id == supplier.pk:
+            source_workitem = candidate
+            break
+
+    owner_openids = list(current["owner_openids"])
+    owner_scopes = {
+        openid: scope
+        for openid, scope in current["recipient_scopes"].items()
+        if scope.get("role") == "supplier_owner"
+    }
+    if not source_workitem:
+        return {
+            "openids": owner_openids,
+            "owner_openids": owner_openids,
+            "sales_openids": [],
+            "sales_identity_ids": [],
+            "recipient_scopes": owner_scopes,
+            "responsibility_source": "ORDER_CONFIRMATION_TASK_MISSING",
+            "responsibility_source_name": "原订单责任快照缺失，本次仅通知供应商负责人",
+            "unassigned_sales_material_ids": sorted(material_ids),
+        }
+
+    source_payload = (
+        source_workitem.payload
+        if isinstance(source_workitem.payload, dict)
+        else {}
+    )
+    initial_scopes = source_payload.get("initial_recipient_scopes")
+    has_initial_snapshot = isinstance(initial_scopes, dict)
+    source_scopes = (
+        initial_scopes
+        if has_initial_snapshot
+        else source_payload.get("recipient_scopes")
+    ) or {}
+    identity_materials = defaultdict(set)
+    for scope in source_scopes.values():
+        if not isinstance(scope, dict) or scope.get("role") != "supplier_sales":
+            continue
+        try:
+            identity_id = int(scope.get("identity_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if identity_id <= 0:
+            continue
+        scoped_material_ids = set()
+        for value in scope.get("material_ids", []):
+            try:
+                scoped_material_ids.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        identity_materials[identity_id].update(material_ids & scoped_material_ids)
+
+    sales_identities = {
+        identity.pk: identity
+        for identity in UserOrganization.objects.select_related(
+            "user",
+            "role",
+        ).filter(
+            pk__in=identity_materials,
+            organization=supplier,
+            role__code="supplier_sales",
+            role__is_active=True,
+            is_active=True,
+            user__is_active=True,
+            user__wx_openid__isnull=False,
+        ).exclude(user__wx_openid="")
+    }
+    sales_openids = []
+    sales_scopes = {}
+    assigned_material_ids = set()
+    for identity_id, scoped_material_ids in identity_materials.items():
+        identity = sales_identities.get(identity_id)
+        if not identity or not scoped_material_ids:
+            continue
+        openid = identity.user.wx_openid
+        sales_openids.append(openid)
+        assigned_material_ids.update(scoped_material_ids)
+        sales_scopes[openid] = {
+            "role": "supplier_sales",
+            "identity_id": identity.pk,
+            "name": (
+                identity.user.wx_nickname
+                or identity.user.get_full_name()
+                or identity.user.username
+            ),
+            "material_ids": sorted(scoped_material_ids),
+        }
+
+    recipient_scopes = dict(owner_scopes)
+    recipient_scopes.update(sales_scopes)
+    sales_openids = list(dict.fromkeys(sales_openids))
+    return {
+        "openids": list(dict.fromkeys(owner_openids + sales_openids)),
+        "owner_openids": owner_openids,
+        "sales_openids": sales_openids,
+        "sales_identity_ids": sorted(sales_identities),
+        "recipient_scopes": recipient_scopes,
+        "responsibility_source": (
+            "ORDER_CONFIRMATION_INITIAL_SNAPSHOT"
+            if has_initial_snapshot
+            else "ORDER_CONFIRMATION_TASK_SNAPSHOT_LEGACY"
+        ),
+        "responsibility_source_name": (
+            "原订单首次确认配套不可变责任快照"
+            if has_initial_snapshot
+            else "原订单历史任务责任快照（兼容旧数据）"
+        ),
+        "unassigned_sales_material_ids": sorted(
+            material_ids - assigned_material_ids
+        ),
+    }
+
+
+def _matching_bom_item(bom, source_bom_item):
+    if not bom:
+        return None
+    return (
+        bom.items.select_related(
+            "material",
+            "material_spec",
+            "supplier",
+        )
+        .filter(
+            material_id=source_bom_item.material_id,
+            material_spec_id=source_bom_item.material_spec_id,
+        )
+        .order_by("id")
+        .first()
+    )
+
+
+def _resolve_material_trace(inventory_item, source_bom_item, order_item=None):
+    """
+    Resolve a supplier without consulting the many-to-many spec supplier list.
+
+    The current project has no per-device material-binding table yet, so the
+    ACTUAL_BINDING branch intentionally remains an extension point. Existing
+    data starts at the confirmed production BOM and falls back to the source
+    BOM row; an unresolved supplier remains explicit.
+    """
+
+    order_item = order_item or _source_order_item(inventory_item)
+    confirmation = getattr(order_item, "bom_confirmation", None) if order_item else None
+    confirmed_bom_item = _matching_bom_item(
+        confirmation.confirmed_bom if confirmation else None,
+        source_bom_item,
+    )
+    if confirmed_bom_item and confirmed_bom_item.supplier_id:
+        return {
+            "supplier": confirmed_bom_item.supplier,
+            "trace_source": DeviceMaterialFaultRecord.TraceSource.PRODUCTION_BATCH,
+            "trace_source_name": "原生产批次确认BOM",
+            "actual_binding_reference": "",
+            "material_batch": "",
+        }
+    if source_bom_item.supplier_id:
+        return {
+            "supplier": source_bom_item.supplier,
+            "trace_source": DeviceMaterialFaultRecord.TraceSource.BOM_INFERRED,
+            "trace_source_name": "BOM默认供应商推定",
+            "actual_binding_reference": "",
+            "material_batch": "",
+        }
+    return {
+        "supplier": None,
+        "trace_source": DeviceMaterialFaultRecord.TraceSource.UNRESOLVED,
+        "trace_source_name": "供应商待确认",
+        "actual_binding_reference": "",
+        "material_batch": "",
+    }
+
+
+def _material_warranty_snapshot(
+    *,
+    material_spec_id,
+    supplier_id,
+    production_date,
+    evaluated_at,
+):
+    """Return a deterministic, read-only warranty snapshot for one material.
+
+    The first operational version uses the original production-batch date as
+    the warranty start.  Every result records the exact rule source so a later
+    material-batch binding can be added without rewriting historical facts.
+    """
+
+    evaluated_date = (
+        timezone.localtime(evaluated_at).date()
+        if hasattr(evaluated_at, "tzinfo")
+        else evaluated_at
+    )
+    relation = None
+    result = DeviceMaterialWarrantyEvaluation.Result.UNKNOWN
+    warranty_months = None
+    warranty_end_date = None
+    if not material_spec_id or not supplier_id:
+        rule_source = DeviceMaterialWarrantyEvaluation.RuleSource.MISSING_TRACE
+    else:
+        relation = MaterialSpecSupplier.objects.filter(
+            material_spec_id=material_spec_id,
+            supplier_id=supplier_id,
+        ).first()
+        if not production_date:
+            rule_source = (
+                DeviceMaterialWarrantyEvaluation.RuleSource.MISSING_PRODUCTION_DATE
+            )
+        elif not relation:
+            rule_source = (
+                DeviceMaterialWarrantyEvaluation.RuleSource.MISSING_EXACT_RULE
+            )
+        else:
+            rule_source = (
+                DeviceMaterialWarrantyEvaluation.RuleSource.EXACT_SUPPLIER_SPEC
+            )
+            warranty_months = relation.warranty_months
+            warranty_end_date = _add_calendar_months(
+                production_date,
+                warranty_months,
+            )
+            result = (
+                DeviceMaterialWarrantyEvaluation.Result.IN_WARRANTY
+                if evaluated_date <= warranty_end_date
+                else DeviceMaterialWarrantyEvaluation.Result.OUT_OF_WARRANTY
+            )
+    return {
+        "result": result,
+        "result_name": dict(DeviceMaterialWarrantyEvaluation.Result.choices)[result],
+        "rule_source": rule_source,
+        "rule_source_name": dict(
+            DeviceMaterialWarrantyEvaluation.RuleSource.choices
+        )[rule_source],
+        "relation": relation,
+        "warranty_months": warranty_months,
+        "warranty_start_date": production_date,
+        "warranty_end_date": warranty_end_date,
+        "evaluated_date": evaluated_date,
+    }
+
+
+def _serialize_material_warranty(snapshot):
+    return {
+        "result": snapshot["result"],
+        "result_name": snapshot["result_name"],
+        "rule_source": snapshot["rule_source"],
+        "rule_source_name": snapshot["rule_source_name"],
+        "warranty_months": snapshot["warranty_months"],
+        "warranty_start_date": (
+            snapshot["warranty_start_date"].isoformat()
+            if snapshot["warranty_start_date"]
+            else ""
+        ),
+        "warranty_end_date": (
+            snapshot["warranty_end_date"].isoformat()
+            if snapshot["warranty_end_date"]
+            else ""
+        ),
+        "evaluated_date": snapshot["evaluated_date"].isoformat(),
+        "computed_automatically": True,
+    }
+
+
+def _bom_material_options(inventory_item):
+    order_item = _source_order_item(inventory_item)
+    existing = {
+        row.source_bom_item_id: row
+        for row in inventory_item.material_fault_records.select_related(
+            "supplier",
+        ).filter(source_bom_item__isnull=False)
+    }
+    repair_existing = {
+        row.source_bom_item_id: row
+        for row in inventory_item.repair_material_requirements.select_related(
+            "supplier",
+        ).all()
+    }
+    returned_existing = {
+        (row.source_bom_item_id, row.return_kind): row
+        for row in inventory_item.material_return_records.select_related(
+            "supplier",
+            "material_spec_supplier",
+        ).all()
+    }
+    has_return_records = bool(returned_existing)
+    options = []
+    bom_items = inventory_item.source_bom.items.select_related(
+        "material",
+        "material_spec",
+        "supplier",
+    ).order_by("-material__is_key_part", "material__code", "id")
+    for bom_item in bom_items:
+        trace = _resolve_material_trace(inventory_item, bom_item, order_item)
+        fact = existing.get(bom_item.pk)
+        repair_requirement = repair_existing.get(bom_item.pk)
+        return_record = returned_existing.get(
+            (
+                bom_item.pk,
+                FactoryReturnMaterialReturnRecord.ReturnKind.DISASSEMBLY,
+            )
+        )
+        supplier = (
+            return_record.supplier
+            if return_record
+            else (fact.supplier if fact else trace["supplier"])
+        )
+        trace_source = (
+            return_record.trace_source
+            if return_record
+            else (fact.trace_source if fact else trace["trace_source"])
+        )
+        trace_name = dict(DeviceMaterialFaultRecord.TraceSource.choices).get(
+            trace_source,
+            trace["trace_source_name"],
+        )
+        if return_record:
+            warranty = {
+                "result": return_record.warranty_result,
+                "result_name": return_record.get_warranty_result_display(),
+                "rule_source": return_record.warranty_rule_source,
+                "rule_source_name": return_record.get_warranty_rule_source_display(),
+                "warranty_months": return_record.warranty_months,
+                "warranty_start_date": return_record.warranty_start_date,
+                "warranty_end_date": return_record.warranty_end_date,
+                "evaluated_date": return_record.warranty_evaluated_date,
+            }
+        else:
+            warranty = _material_warranty_snapshot(
+                material_spec_id=bom_item.material_spec_id,
+                supplier_id=supplier.pk if supplier else None,
+                production_date=inventory_item.source_production_batch.production_date,
+                evaluated_at=timezone.now(),
+            )
+        options.append(
+            {
+                "bom_item_id": bom_item.pk,
+                "material_id": bom_item.material_id,
+                "material_code": bom_item.material.code,
+                "material_name": bom_item.material.name,
+                "is_key_part": bom_item.material.is_key_part,
+                "material_spec_id": bom_item.material_spec_id,
+                "material_spec_code": (
+                    bom_item.material_spec.code if bom_item.material_spec_id else ""
+                ),
+                "material_spec_name": (
+                    bom_item.material_spec.name if bom_item.material_spec_id else "未指定规格"
+                ),
+                "quantity": bom_item.quantity,
+                "supplier_id": supplier.pk if supplier else None,
+                "supplier_name": supplier.name if supplier else "供应商待确认",
+                "trace_source": trace_source,
+                "trace_source_name": trace_name,
+                "supplier_inferred": trace_source
+                == DeviceMaterialFaultRecord.TraceSource.BOM_INFERRED,
+                "material_batch": (
+                    return_record.material_batch_snapshot
+                    if return_record
+                    else (
+                        fact.material_batch_snapshot
+                        if fact
+                        else trace["material_batch"]
+                    )
+                ),
+                # 关键件默认作为实物退回，生产经理可反选；故障标记独立。
+                "returned_selected": bool(return_record) or (
+                    not has_return_records
+                    and bool(bom_item.material.is_key_part)
+                ),
+                "selected": bool(fact),
+                "fault_selected": bool(fact),
+                "original_note": (
+                    return_record.original_note
+                    if return_record
+                    else (fact.original_note if fact else "")
+                ),
+                "is_warranty_candidate": (
+                    fact.is_warranty_candidate if fact else False
+                ),
+                "warranty_evaluation": _serialize_material_warranty(warranty),
+                "repair_selected": bool(repair_requirement),
+                "repair_note": (
+                    repair_requirement.original_note
+                    if repair_requirement
+                    else ""
+                ),
+            }
+        )
+    return options
+
+
+def _create_repair_material_requirements(
+    *,
+    inventory_item,
+    selections,
+    actor,
+    requested_at,
+):
+    if inventory_item.repair_material_requirements.exists():
+        raise FactoryReturnProcessError("该设备已经保存结构化换料需求，不能重复覆盖。")
+    selected_ids = [int(row.get("bom_item_id") or 0) for row in selections]
+    if not selected_ids or any(value <= 0 for value in selected_ids):
+        raise FactoryReturnProcessError("需要换料时，请至少勾选一项原BOM物料。")
+    if len(selected_ids) != len(set(selected_ids)):
+        raise FactoryReturnProcessError("同一BOM物料不能重复选择。")
+    bom_items = {
+        row.pk: row
+        for row in inventory_item.source_bom.items.select_related(
+            "material",
+            "material_spec",
+            "supplier",
+        ).filter(pk__in=selected_ids)
+    }
+    if set(bom_items) != set(selected_ids):
+        raise FactoryReturnProcessError("所选换料需求不属于该设备原BOM。")
+
+    transfer = inventory_item.process.transfer
+    device = inventory_item.transfer_item.device
+    order_item = _source_order_item(inventory_item)
+    records = []
+    for selection in selections:
+        bom_item = bom_items[int(selection["bom_item_id"])]
+        trace = _resolve_material_trace(inventory_item, bom_item, order_item)
+        spec = bom_item.material_spec
+        supplier = trace["supplier"]
+        records.append(
+            FactoryReturnRepairMaterialRequirement.objects.create(
+                inventory_item=inventory_item,
+                device=device,
+                source_order_plan=order_item.plan if order_item else None,
+                source_order_plan_item=order_item,
+                source_production_batch=inventory_item.source_production_batch,
+                source_bom=inventory_item.source_bom,
+                source_bom_item=bom_item,
+                material=bom_item.material,
+                material_spec=spec,
+                supplier=supplier,
+                trace_source=trace["trace_source"],
+                schema_version=1,
+                requested_quantity=bom_item.quantity,
+                original_note=str(selection.get("note") or "").strip()[:500],
+                requested_by=actor,
+                requested_at=requested_at,
+                device_sn_snapshot=device.sn,
+                return_flow_no_snapshot=transfer.flow_no,
+                production_batch_no_snapshot=(
+                    inventory_item.source_production_batch.batch_no
+                ),
+                bom_version_snapshot=inventory_item.source_bom.version,
+                material_code_snapshot=bom_item.material.code,
+                material_name_snapshot=bom_item.material.name,
+                material_spec_code_snapshot=spec.code if spec else "",
+                material_spec_name_snapshot=spec.name if spec else "",
+                supplier_name_snapshot=supplier.name if supplier else "",
+            )
+        )
+    return records
+
+
+def _serialize_repair_material_requirement(record):
+    returned_record = getattr(record, "returned_material_record", None)
+    return {
+        "id": record.pk,
+        "schema_version": record.schema_version,
+        "material_id": record.material_id,
+        "material_code": record.material_code_snapshot,
+        "material_name": record.material_name_snapshot,
+        "material_spec_id": record.material_spec_id,
+        "material_spec_code": record.material_spec_code_snapshot,
+        "material_spec_name": record.material_spec_name_snapshot,
+        "requested_quantity": str(record.requested_quantity),
+        "supplier_id": record.supplier_id,
+        "supplier_name": record.supplier_name_snapshot or "供应商待确认",
+        "trace_source": record.trace_source,
+        "trace_source_name": record.get_trace_source_display(),
+        "supplier_inferred": (
+            record.trace_source
+            == DeviceMaterialFaultRecord.TraceSource.BOM_INFERRED
+        ),
+        "supplier_pending_confirmation": not bool(record.supplier_id),
+        "original_note": record.original_note,
+        "requested_by_name": _display_name(record.requested_by),
+        "requested_at": record.requested_at.isoformat(),
+        "notified": bool(record.notified_at),
+        "notified_at": record.notified_at.isoformat() if record.notified_at else "",
+        "actual_return_recorded": bool(returned_record),
+        "actual_return_quantity": (
+            str(returned_record.returned_quantity) if returned_record else "0.00"
+        ),
+        "actual_return_record": (
+            _serialize_material_return_record(returned_record)
+            if returned_record
+            else None
+        ),
+        "new_material_quantity_rule": (
+            "新换入物料由后续订单计划重新计数，本清单只统计换下退回旧件。"
+        ),
+    }
+
+
+def _create_material_return_record(
+    *,
+    inventory_item,
+    bom_item,
+    return_kind,
+    is_fault_material,
+    note,
+    actor,
+    recorded_at,
+    data_origin=FactoryReturnMaterialReturnRecord.DataOrigin.OPERATION,
+):
+    transfer = inventory_item.process.transfer
+    device = inventory_item.transfer_item.device
+    order_item = _source_order_item(inventory_item)
+    trace = _resolve_material_trace(inventory_item, bom_item, order_item)
+    spec = bom_item.material_spec
+    supplier = trace["supplier"]
+    warranty = _material_warranty_snapshot(
+        material_spec_id=bom_item.material_spec_id,
+        supplier_id=supplier.pk if supplier else None,
+        production_date=inventory_item.source_production_batch.production_date,
+        evaluated_at=recorded_at,
+    )
+    return FactoryReturnMaterialReturnRecord.objects.create(
+        inventory_item=inventory_item,
+        device=device,
+        return_transfer=transfer,
+        source_order_plan=order_item.plan if order_item else None,
+        source_order_plan_item=order_item,
+        source_production_batch=inventory_item.source_production_batch,
+        source_bom=inventory_item.source_bom,
+        source_bom_item=bom_item,
+        material=bom_item.material,
+        material_spec=spec,
+        supplier=supplier,
+        material_spec_supplier=warranty["relation"],
+        return_kind=return_kind,
+        returned_quantity=Decimal(str(bom_item.quantity)),
+        is_fault_material=bool(is_fault_material),
+        trace_source=trace["trace_source"],
+        data_origin=data_origin,
+        schema_version=2,
+        actual_binding_reference=trace["actual_binding_reference"],
+        material_batch_snapshot=trace["material_batch"],
+        original_note=str(note or "").strip()[:500],
+        returned_at=recorded_at,
+        recorded_by=actor,
+        recorded_organization=transfer.to_organization,
+        recorded_role_snapshot="factory_production",
+        warranty_result=warranty["result"],
+        warranty_rule_source=warranty["rule_source"],
+        warranty_months=warranty["warranty_months"],
+        warranty_start_date=warranty["warranty_start_date"],
+        warranty_end_date=warranty["warranty_end_date"],
+        warranty_evaluated_date=warranty["evaluated_date"],
+        device_sn_snapshot=device.sn,
+        return_flow_no_snapshot=transfer.flow_no,
+        production_batch_no_snapshot=inventory_item.source_production_batch.batch_no,
+        bom_version_snapshot=inventory_item.source_bom.version,
+        material_code_snapshot=bom_item.material.code,
+        material_name_snapshot=bom_item.material.name,
+        material_spec_code_snapshot=spec.code if spec else "",
+        material_spec_name_snapshot=spec.name if spec else "",
+        supplier_name_snapshot=supplier.name if supplier else "",
+    )
+
+
+def _create_fault_record_from_return(*, return_record, actor, recorded_at):
+    inventory_item = return_record.inventory_item
+    order_item = return_record.source_order_plan_item
+    record = DeviceMaterialFaultRecord.objects.create(
+        inventory_item=inventory_item,
+        return_record=return_record,
+        device=return_record.device,
+        return_transfer=return_record.return_transfer,
+        source_order_plan=return_record.source_order_plan,
+        source_order_plan_item=order_item,
+        source_production_batch=return_record.source_production_batch,
+        source_bom=return_record.source_bom,
+        source_bom_item=return_record.source_bom_item,
+        material=return_record.material,
+        material_spec=return_record.material_spec,
+        supplier=return_record.supplier,
+        trace_source=return_record.trace_source,
+        schema_version=2,
+        actual_binding_reference=return_record.actual_binding_reference,
+        material_batch_snapshot=return_record.material_batch_snapshot,
+        is_warranty_candidate=(
+            return_record.warranty_result
+            == DeviceMaterialWarrantyEvaluation.Result.IN_WARRANTY
+        ),
+        original_note=return_record.original_note,
+        dismantled_at=recorded_at,
+        recorded_by=actor,
+        recorded_organization=return_record.recorded_organization,
+        recorded_role_snapshot=return_record.recorded_role_snapshot,
+        device_sn_snapshot=return_record.device_sn_snapshot,
+        lifecycle_code_snapshot=order_item.lifecycle_code if order_item else "",
+        return_flow_no_snapshot=return_record.return_flow_no_snapshot,
+        order_plan_code_snapshot=(
+            order_item.plan.plan_code if order_item else ""
+        ),
+        order_batch_code_snapshot=(
+            order_item.order_batch_code if order_item else ""
+        ),
+        production_batch_no_snapshot=return_record.production_batch_no_snapshot,
+        bom_version_snapshot=return_record.bom_version_snapshot,
+        material_code_snapshot=return_record.material_code_snapshot,
+        material_name_snapshot=return_record.material_name_snapshot,
+        material_spec_code_snapshot=return_record.material_spec_code_snapshot,
+        material_spec_name_snapshot=return_record.material_spec_name_snapshot,
+        supplier_name_snapshot=return_record.supplier_name_snapshot,
+        recorded_at=recorded_at,
+    )
+    DeviceMaterialWarrantyEvaluation.objects.create(
+        fault_record=record,
+        version=1,
+        result=return_record.warranty_result,
+        rule_source=return_record.warranty_rule_source,
+        material_spec_supplier=return_record.material_spec_supplier,
+        warranty_months=return_record.warranty_months,
+        warranty_start_date=return_record.warranty_start_date,
+        warranty_end_date=return_record.warranty_end_date,
+        evaluated_date=return_record.warranty_evaluated_date,
+        supplier_name_snapshot=return_record.supplier_name_snapshot,
+        evaluated_by=actor,
+    )
+    return record
+
+
+def _create_disassembly_material_records(
+    *,
+    inventory_item,
+    selections,
+    actor,
+    recorded_at,
+):
+    if inventory_item.material_return_records.filter(
+        return_kind=FactoryReturnMaterialReturnRecord.ReturnKind.DISASSEMBLY,
+    ).exists():
+        raise FactoryReturnProcessError("该设备已经保存拆机退回物料，不能覆盖原始事实。")
+    selected_ids = [int(row.get("bom_item_id") or 0) for row in selections]
+    if not selected_ids or any(value <= 0 for value in selected_ids):
+        raise FactoryReturnProcessError("请至少勾选一项实际拆下退回物料。")
+    if len(selected_ids) != len(set(selected_ids)):
+        raise FactoryReturnProcessError("同一BOM物料不能重复选择。")
+    if not any(bool(row.get("is_fault_material")) for row in selections):
+        raise FactoryReturnProcessError("请至少标记一项导致本次拆机的故障物料。")
+    bom_items = {
+        row.pk: row
+        for row in inventory_item.source_bom.items.select_related(
+            "material",
+            "material_spec",
+            "supplier",
+        ).filter(pk__in=selected_ids)
+    }
+    if set(bom_items) != set(selected_ids):
+        raise FactoryReturnProcessError("所选退回物料不属于该设备实际BOM。")
+
+    return_records = []
+    fault_records = []
+    for selection in selections:
+        return_record = _create_material_return_record(
+            inventory_item=inventory_item,
+            bom_item=bom_items[int(selection["bom_item_id"])],
+            return_kind=FactoryReturnMaterialReturnRecord.ReturnKind.DISASSEMBLY,
+            is_fault_material=bool(selection.get("is_fault_material")),
+            note=selection.get("note"),
+            actor=actor,
+            recorded_at=recorded_at,
+        )
+        return_records.append(return_record)
+        if return_record.is_fault_material:
+            fault_records.append(
+                _create_fault_record_from_return(
+                    return_record=return_record,
+                    actor=actor,
+                    recorded_at=recorded_at,
+                )
+            )
+    return return_records, fault_records
+
+
+def _create_repair_return_records(*, inventory_item, actor, recorded_at):
+    """Record old parts actually removed when repair is completed.
+
+    Requested replacement quantities remain planning data.  Only these return
+    facts participate in returned-material and future settlement statistics.
+    """
+
+    records = []
+    for requirement in inventory_item.repair_material_requirements.select_related(
+        "source_bom_item__material",
+        "source_bom_item__material_spec",
+        "source_bom_item__supplier",
+    ).order_by("id"):
+        if requirement.returned_material_record_id:
+            records.append(requirement.returned_material_record)
+            continue
+        return_record = _create_material_return_record(
+            inventory_item=inventory_item,
+            bom_item=requirement.source_bom_item,
+            return_kind=FactoryReturnMaterialReturnRecord.ReturnKind.REPAIR_REPLACED,
+            is_fault_material=False,
+            note=requirement.original_note,
+            actor=actor,
+            recorded_at=recorded_at,
+        )
+        FactoryReturnRepairMaterialRequirement.objects.filter(
+            pk=requirement.pk,
+        ).update(returned_material_record=return_record)
+        requirement.returned_material_record = return_record
+        records.append(return_record)
+    return records
+
+
+def _serialize_fault_record(record):
+    evaluation = getattr(record, "_current_warranty_evaluation", None)
+    data = {
+        "id": record.pk,
+        "schema_version": record.schema_version,
+        "trace_source": record.trace_source,
+        "trace_source_name": record.get_trace_source_display(),
+        "supplier_inferred": record.trace_source
+        == DeviceMaterialFaultRecord.TraceSource.BOM_INFERRED,
+        "supplier_pending_confirmation": record.trace_source
+        == DeviceMaterialFaultRecord.TraceSource.UNRESOLVED,
+        "material_id": record.material_id,
+        "material_code": record.material_code_snapshot,
+        "material_name": record.material_name_snapshot or "历史拆机自由文本",
+        "material_spec_id": record.material_spec_id,
+        "material_spec_code": record.material_spec_code_snapshot,
+        "material_spec_name": record.material_spec_name_snapshot,
+        "material_batch": record.material_batch_snapshot,
+        "supplier_id": record.supplier_id,
+        "supplier_name": record.supplier_name_snapshot or "供应商待确认",
+        "is_warranty_candidate": record.is_warranty_candidate,
+        "original_note": record.original_note,
+        "recorded_by_name": (
+            _display_name(record.recorded_by) if record.recorded_by_id else "历史数据"
+        ),
+        "recorded_role": record.recorded_role_snapshot,
+        "recorded_at": record.recorded_at.isoformat(),
+        "dismantled_at": record.dismantled_at.isoformat(),
+    }
+    if evaluation:
+        data["warranty_evaluation"] = _serialize_warranty_evaluation(evaluation)
+    return data
+
+
+def _serialize_material_return_record(record):
+    warranty = {
+        "result": record.warranty_result,
+        "result_name": record.get_warranty_result_display(),
+        "rule_source": record.warranty_rule_source,
+        "rule_source_name": record.get_warranty_rule_source_display(),
+        "warranty_months": record.warranty_months,
+        "warranty_start_date": record.warranty_start_date,
+        "warranty_end_date": record.warranty_end_date,
+        "evaluated_date": record.warranty_evaluated_date,
+    }
+    return {
+        "id": record.pk,
+        "schema_version": record.schema_version,
+        "return_kind": record.return_kind,
+        "return_kind_name": record.get_return_kind_display(),
+        "returned_quantity": str(record.returned_quantity),
+        "is_fault_material": record.is_fault_material,
+        "material_id": record.material_id,
+        "material_code": record.material_code_snapshot,
+        "material_name": record.material_name_snapshot,
+        "material_spec_id": record.material_spec_id,
+        "material_spec_code": record.material_spec_code_snapshot,
+        "material_spec_name": record.material_spec_name_snapshot,
+        "material_batch": record.material_batch_snapshot,
+        "supplier_id": record.supplier_id,
+        "supplier_name": record.supplier_name_snapshot or "供应商待确认",
+        "trace_source": record.trace_source,
+        "trace_source_name": record.get_trace_source_display(),
+        "supplier_inferred": (
+            record.trace_source
+            == DeviceMaterialFaultRecord.TraceSource.BOM_INFERRED
+        ),
+        "supplier_pending_confirmation": not bool(record.supplier_id),
+        "original_note": record.original_note,
+        "returned_at": record.returned_at.isoformat(),
+        "recorded_by_name": (
+            _display_name(record.recorded_by) if record.recorded_by_id else "历史数据"
+        ),
+        "data_origin": record.data_origin,
+        "data_origin_name": record.get_data_origin_display(),
+        "settlement_status": record.settlement_status,
+        "settlement_status_name": record.get_settlement_status_display(),
+        "warranty_evaluation": _serialize_material_warranty(warranty),
+    }
+
+
+def _serialize_warranty_evaluation(evaluation):
+    return {
+        "id": evaluation.pk,
+        "version": evaluation.version,
+        "result": evaluation.result,
+        "result_name": evaluation.get_result_display(),
+        "rule_source": evaluation.rule_source,
+        "rule_source_name": evaluation.get_rule_source_display(),
+        "warranty_months": evaluation.warranty_months,
+        "warranty_start_date": (
+            evaluation.warranty_start_date.isoformat()
+            if evaluation.warranty_start_date
+            else ""
+        ),
+        "warranty_end_date": (
+            evaluation.warranty_end_date.isoformat()
+            if evaluation.warranty_end_date
+            else ""
+        ),
+        "evaluated_date": evaluation.evaluated_date.isoformat(),
+    }
+
+
+def _add_calendar_months(value, months):
+    month_index = value.month - 1 + int(months)
+    year = value.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(value.day, calendar.monthrange(year, month)[1])
+    return value.replace(year=year, month=month, day=day)
+
+
+def _evaluate_fault_warranty(*, record, actor, evaluated_at):
+    """固化自动质保结果；新数据直接复用对应实际退回物料快照。"""
+
+    existing = record.warranty_evaluations.order_by("-version", "-id").first()
+    if existing:
+        return existing
+
+    return_record = getattr(record, "return_record", None)
+    if return_record:
+        return DeviceMaterialWarrantyEvaluation.objects.create(
+            fault_record=record,
+            version=1,
+            result=return_record.warranty_result,
+            rule_source=return_record.warranty_rule_source,
+            material_spec_supplier=return_record.material_spec_supplier,
+            warranty_months=return_record.warranty_months,
+            warranty_start_date=return_record.warranty_start_date,
+            warranty_end_date=return_record.warranty_end_date,
+            evaluated_date=return_record.warranty_evaluated_date,
+            supplier_name_snapshot=return_record.supplier_name_snapshot,
+            evaluated_by=actor,
+        )
+
+    snapshot = _material_warranty_snapshot(
+        material_spec_id=record.material_spec_id,
+        supplier_id=record.supplier_id,
+        production_date=record.source_production_batch.production_date,
+        evaluated_at=evaluated_at,
+    )
+
+    return DeviceMaterialWarrantyEvaluation.objects.create(
+        fault_record=record,
+        version=1,
+        result=snapshot["result"],
+        rule_source=snapshot["rule_source"],
+        material_spec_supplier=snapshot["relation"],
+        warranty_months=snapshot["warranty_months"],
+        warranty_start_date=snapshot["warranty_start_date"],
+        warranty_end_date=snapshot["warranty_end_date"],
+        evaluated_date=snapshot["evaluated_date"],
+        supplier_name_snapshot=record.supplier_name_snapshot,
+        evaluated_by=actor,
+    )
+
+
+def _supplier_warranty_link(dispatch):
+    return (
+        "/pages/supply_chain/warranty_list/warranty_list"
+        f"?dispatch_id={dispatch.pk}"
+    )
+
+
+def _publish_supplier_warranty_dispatches(*, inventory_item, actor, confirmed_at):
+    returned_records = list(
+        inventory_item.material_return_records.select_related(
+            "material",
+            "supplier",
+            "material_spec_supplier",
+        ).filter(
+            return_kind=FactoryReturnMaterialReturnRecord.ReturnKind.DISASSEMBLY,
+        )
+    )
+    if not returned_records:
+        raise FactoryReturnProcessError("该设备没有结构化拆机退回物料。")
+    unresolved = [
+        row.material_name_snapshot for row in returned_records if not row.supplier_id
+    ]
+    if unresolved:
+        raise FactoryReturnProcessError(
+            "以下实际退回物料的供应商待确认，暂不能通知：" + "、".join(unresolved)
+        )
+
+    grouped = defaultdict(list)
+    for row in returned_records:
+        grouped[row.supplier_id].append(row)
+    dispatches = []
+    for supplier_id, material_return_records in grouped.items():
+        supplier = material_return_records[0].supplier
+        material_ids = {
+            row.material_id for row in material_return_records if row.material_id
+        }
+        recipients = _original_supplier_task_recipients(
+            inventory_item=inventory_item,
+            supplier=supplier,
+            material_ids=material_ids,
+        )
+        if not recipients["owner_openids"]:
+            raise FactoryReturnProcessError(
+                f"供应商“{supplier.name}”缺少有效负责人账号。"
+            )
+        dispatch = FactoryReturnWarrantyDispatch.objects.create(
+            inventory_item=inventory_item,
+            supplier=supplier,
+            supplier_name_snapshot=supplier.name,
+            confirmed_by=actor,
+            confirmed_role_snapshot="factory_matching",
+            confirmed_at=confirmed_at,
+        )
+        fault_records = list(
+            inventory_item.material_fault_records.filter(
+                return_record_id__in=[row.pk for row in material_return_records],
+            ).order_by("id")
+        )
+        FactoryReturnWarrantyDispatchItem.objects.bulk_create(
+            [
+                FactoryReturnWarrantyDispatchItem(
+                    dispatch=dispatch,
+                    fault_record=record,
+                )
+                for record in fault_records
+            ]
+        )
+        transfer = inventory_item.process.transfer
+        payload_materials = [
+            {
+                "return_record_id": record.pk,
+                "material_id": record.material_id,
+                "material_name": record.material_name_snapshot,
+                "material_spec_name": record.material_spec_name_snapshot,
+                "material_batch": record.material_batch_snapshot,
+                "returned_quantity": str(record.returned_quantity),
+                "is_fault_material": record.is_fault_material,
+                "warranty_result": record.warranty_result,
+                "warranty_result_name": record.get_warranty_result_display(),
+                "warranty_start_date": (
+                    record.warranty_start_date.isoformat()
+                    if record.warranty_start_date else ""
+                ),
+                "warranty_end_date": (
+                    record.warranty_end_date.isoformat()
+                    if record.warranty_end_date else ""
+                ),
+                "trace_source": record.trace_source,
+                "trace_source_name": record.get_trace_source_display(),
+                "production_note": record.original_note,
+            }
+            for record in material_return_records
+        ]
+        publish_workitem(
+            domain="AFTERSALE",
+            type=SUPPLIER_WARRANTY_WORK_TYPE,
+            biz_id=str(dispatch.pk),
+            biz_ref=f"lifecycle.FactoryReturnWarrantyDispatch:{dispatch.pk}",
+            uniq_key=f"lifecycle:factory-return-warranty:{dispatch.pk}",
+            title="厂家已推送拆机退回物料及自动质保结果",
+            summary=(
+                f"{inventory_item.transfer_item.device.sn}｜"
+                f"{len(material_return_records)}项实际退回｜{transfer.flow_no}"
+            ),
+            link=_supplier_warranty_link(dispatch),
+            recipients_openids=recipients["openids"],
+            need_action=False,
+            action_mode="EACH_ACK",
+            payload={
+                "dispatch_id": dispatch.pk,
+                "inventory_item_id": inventory_item.pk,
+                "supplier_id": supplier.pk,
+                "supplier_name": supplier.name,
+                "factory_organization_id": transfer.to_organization_id,
+                "factory_organization_name": transfer.to_organization.name,
+                "return_flow_no": transfer.flow_no,
+                "device_sn": inventory_item.transfer_item.device.sn,
+                "materials": payload_materials,
+                "recipient_scopes": recipients["recipient_scopes"],
+                "responsibility_source": recipients[
+                    "responsibility_source"
+                ],
+                "responsibility_source_name": recipients[
+                    "responsibility_source_name"
+                ],
+                "unassigned_sales_material_ids": recipients[
+                    "unassigned_sales_material_ids"
+                ],
+                "notice_mode": "EACH_ACK",
+                "actual_return_count": len(material_return_records),
+                "fault_occurrence_count": len(fault_records),
+                "schema_version": 4,
+            },
+            actor_openid=actor.wx_openid or "",
+            mark_workitem_done_immediately=True,
+        )
+        dispatches.append(dispatch)
+    return dispatches
+
+
+def _publish_supplier_repair_material_requests(*, inventory_item, actor, confirmed_at):
+    requirements = list(
+        inventory_item.repair_material_requirements.select_related(
+            "material",
+            "material_spec",
+            "supplier",
+        ).order_by("id")
+    )
+    if not requirements:
+        raise FactoryReturnProcessError("该设备没有结构化修复换料需求。")
+    unresolved = [
+        row.material_name_snapshot for row in requirements if not row.supplier_id
+    ]
+    if unresolved:
+        raise FactoryReturnProcessError(
+            "以下换料需求的原供应商待确认，暂不能推送：" + "、".join(unresolved)
+        )
+
+    transfer = inventory_item.process.transfer
+    grouped = defaultdict(list)
+    for row in requirements:
+        grouped[row.supplier_id].append(row)
+    notified_supplier_count = 0
+    for supplier_id, rows in grouped.items():
+        supplier = rows[0].supplier
+        material_ids = {row.material_id for row in rows}
+        recipients = _original_supplier_task_recipients(
+            inventory_item=inventory_item,
+            supplier=supplier,
+            material_ids=material_ids,
+        )
+        if not recipients["owner_openids"]:
+            raise FactoryReturnProcessError(
+                f"供应商“{supplier.name}”缺少有效负责人账号。"
+            )
+        payload_materials = [
+            {
+                "requirement_id": row.pk,
+                "material_id": row.material_id,
+                "material_name": row.material_name_snapshot,
+                "material_spec_name": row.material_spec_name_snapshot,
+                "requested_quantity": str(row.requested_quantity),
+                "trace_source": row.trace_source,
+                "trace_source_name": row.get_trace_source_display(),
+                "production_note": row.original_note,
+            }
+            for row in rows
+        ]
+        publish_workitem(
+            domain="SUPPLY_CHAIN",
+            type=SUPPLIER_REPAIR_MATERIAL_WORK_TYPE,
+            biz_id=f"{inventory_item.pk}:{supplier.pk}",
+            biz_ref=(
+                "lifecycle.FactoryReturnRepairMaterialRequirement:"
+                f"{inventory_item.pk}:{supplier.pk}"
+            ),
+            uniq_key=(
+                "lifecycle:factory-return-repair-material:"
+                f"{inventory_item.pk}:{supplier.pk}"
+            ),
+            title="厂家退货修复需要原配套物料",
+            summary=(
+                f"{inventory_item.transfer_item.device.sn}｜"
+                f"{len(rows)}项物料｜{transfer.flow_no}"
+            ),
+            link=(
+                "/pages/supply_chain/warranty_list/warranty_list"
+                f"?tab=repair&repair_item_id={inventory_item.pk}"
+            ),
+            recipients_openids=recipients["openids"],
+            need_action=False,
+            action_mode="EACH_ACK",
+            payload={
+                "inventory_item_id": inventory_item.pk,
+                "supplier_id": supplier.pk,
+                "supplier_name": supplier.name,
+                "factory_organization_id": transfer.to_organization_id,
+                "factory_organization_name": transfer.to_organization.name,
+                "return_flow_no": transfer.flow_no,
+                "device_sn": inventory_item.transfer_item.device.sn,
+                "materials": payload_materials,
+                "recipient_scopes": recipients["recipient_scopes"],
+                "responsibility_source": recipients[
+                    "responsibility_source"
+                ],
+                "responsibility_source_name": recipients[
+                    "responsibility_source_name"
+                ],
+                "unassigned_sales_material_ids": recipients[
+                    "unassigned_sales_material_ids"
+                ],
+                "notice_mode": "EACH_ACK",
+                "schema_version": 2,
+            },
+            actor_openid=actor.wx_openid or "",
+            mark_workitem_done_immediately=True,
+        )
+        FactoryReturnRepairMaterialRequirement.objects.filter(
+            pk__in=[row.pk for row in rows],
+        ).update(
+            notified_by=actor,
+            notified_at=confirmed_at,
+        )
+        notified_supplier_count += 1
+    return notified_supplier_count
+
+
 @transaction.atomic
 def process_factory_return_production_item(
     *,
@@ -1621,8 +2879,11 @@ def process_factory_return_production_item(
     needs_replacement_material=None,
     production_remark="",
     material_requirement="",
+    repair_materials=None,
     disassembly_result="",
     has_warranty_material=None,
+    fault_materials=None,
+    returned_materials=None,
 ):
     identity = _factory_identity(user, {"factory_production"})
     transfer = (
@@ -1651,11 +2912,22 @@ def process_factory_return_production_item(
             raise FactoryReturnProcessError("该设备当前不能重复提交修复诊断。")
         item.needs_replacement_material = bool(needs_replacement_material)
         item.production_remark = str(production_remark or "").strip()[:1000]
-        item.material_requirement = str(material_requirement or "").strip()[:1000]
         item.stock_status = FactoryReturnInventoryItem.StockStatus.REPAIRING
         if item.needs_replacement_material:
-            if not item.material_requirement:
-                raise FactoryReturnProcessError("需要换料时必须填写物料需求。")
+            requirements = _create_repair_material_requirements(
+                inventory_item=item,
+                selections=list(repair_materials or []),
+                actor=user,
+                requested_at=now,
+            )
+            item.material_requirement = (
+                "结构化换料需求："
+                + "、".join(
+                    f"{row.material_name_snapshot}"
+                    f"({row.material_spec_name_snapshot or '未指定规格'})"
+                    for row in requirements
+                )
+            )[:1000]
             item.production_status = (
                 FactoryReturnInventoryItem.ProductionStatus.WAITING_MATCHING
             )
@@ -1663,6 +2935,7 @@ def process_factory_return_production_item(
                 FactoryReturnInventoryItem.MatchingStatus.PENDING
             )
         else:
+            item.material_requirement = ""
             item.production_status = (
                 FactoryReturnInventoryItem.ProductionStatus.READY_TO_COMPLETE
             )
@@ -1674,6 +2947,11 @@ def process_factory_return_production_item(
             "needs_replacement_material": item.needs_replacement_material,
             "production_remark": item.production_remark,
             "material_requirement": item.material_requirement,
+            "repair_material_requirement_ids": (
+                [row.pk for row in requirements]
+                if item.needs_replacement_material
+                else []
+            ),
         }
     elif action == "REPAIR_COMPLETE":
         if (
@@ -1691,6 +2969,15 @@ def process_factory_return_production_item(
         completion_remark = str(production_remark or "").strip()[:1000]
         if completion_remark:
             item.production_remark = completion_remark
+        repair_return_records = (
+            _create_repair_return_records(
+                inventory_item=item,
+                actor=user,
+                recorded_at=now,
+            )
+            if item.needs_replacement_material
+            else []
+        )
         item.stock_status = FactoryReturnInventoryItem.StockStatus.PENDING_REISSUE
         item.production_status = (
             FactoryReturnInventoryItem.ProductionStatus.COMPLETED
@@ -1700,6 +2987,15 @@ def process_factory_return_production_item(
             "production_remark": item.production_remark,
             "needs_replacement_material": item.needs_replacement_material,
             "material_plan": item.material_plan,
+            "actual_repair_return_record_ids": [
+                row.pk for row in repair_return_records
+            ],
+            "actual_repair_return_quantity": str(
+                sum(
+                    (row.returned_quantity for row in repair_return_records),
+                    Decimal("0"),
+                )
+            ),
             "ready_for_reissue": True,
         }
     elif action == "DISASSEMBLY_COMPLETE":
@@ -1710,26 +3006,66 @@ def process_factory_return_production_item(
             != FactoryReturnInventoryItem.ProductionStatus.PENDING
         ):
             raise FactoryReturnProcessError("该设备当前不能重复完成拆机。")
-        result = str(disassembly_result or "").strip()[:1000]
-        if not result:
-            raise FactoryReturnProcessError("请填写拆机结果和拆出物料清单。")
-        item.disassembly_result = result
-        item.has_warranty_material = bool(has_warranty_material)
+        selections = list(returned_materials or [])
+        if not selections and fault_materials:
+            # Compatibility with the previously released client: rows in the
+            # old field were already explicitly selected as fault materials.
+            selections = [
+                {
+                    "bom_item_id": row.get("bom_item_id"),
+                    "note": row.get("note", ""),
+                    "is_fault_material": True,
+                }
+                for row in fault_materials
+            ]
+        return_records, fault_records = _create_disassembly_material_records(
+            inventory_item=item,
+            selections=selections,
+            actor=user,
+            recorded_at=now,
+        )
+        material_names = [row.material_name_snapshot for row in return_records]
+        fault_material_names = [
+            row.material_name_snapshot for row in fault_records
+        ]
+        legacy_summary = str(disassembly_result or "").strip()[:1000]
+        item.disassembly_result = legacy_summary or (
+            "实际退回物料："
+            + "、".join(material_names)
+            + "；故障物料："
+            + "、".join(fault_material_names)
+        )[:1000]
+        item.has_warranty_material = any(
+            row.warranty_result
+            == DeviceMaterialWarrantyEvaluation.Result.IN_WARRANTY
+            for row in return_records
+        )
         item.production_remark = str(production_remark or "").strip()[:1000]
         item.stock_status = FactoryReturnInventoryItem.StockStatus.LIFECYCLE_ENDED
         item.production_status = (
             FactoryReturnInventoryItem.ProductionStatus.COMPLETED
         )
-        item.matching_status = (
-            FactoryReturnInventoryItem.MatchingStatus.PENDING
-            if item.has_warranty_material
-            else FactoryReturnInventoryItem.MatchingStatus.NOT_REQUIRED
-        )
+        item.matching_status = FactoryReturnInventoryItem.MatchingStatus.PENDING
         event_type = "FACTORY_RETURN_DISASSEMBLY_COMPLETE"
         event_data = {
             "disassembly_result": item.disassembly_result,
             "has_warranty_material": item.has_warranty_material,
             "production_remark": item.production_remark,
+            "material_return_record_ids": [row.pk for row in return_records],
+            "returned_material_count": len(return_records),
+            "returned_material_quantity": str(
+                sum(
+                    (row.returned_quantity for row in return_records),
+                    Decimal("0"),
+                )
+            ),
+            "fault_record_ids": [row.pk for row in fault_records],
+            "fault_occurrence_count": len(fault_records),
+            "in_warranty_return_count": sum(
+                row.warranty_result
+                == DeviceMaterialWarrantyEvaluation.Result.IN_WARRANTY
+                for row in return_records
+            ),
             "lifecycle_closed": True,
         }
     else:
@@ -1780,29 +3116,45 @@ def process_factory_return_matching_item(
     action = str(action or "").upper()
     if action == "REPAIR_MATERIAL_PLAN":
         plan = str(material_plan or "").strip()[:1000]
-        if not plan:
-            raise FactoryReturnProcessError("请填写修复物料方案。")
         if (
             item.stock_status != FactoryReturnInventoryItem.StockStatus.REPAIRING
             or not item.needs_replacement_material
         ):
             raise FactoryReturnProcessError("该设备没有待处理的修复物料需求。")
-        item.material_plan = plan
+        notified_supplier_count = _publish_supplier_repair_material_requests(
+            inventory_item=item,
+            actor=user,
+            confirmed_at=timezone.now(),
+        )
+        item.material_plan = (
+            plan
+            or f"已核对原BOM换料需求，并向{notified_supplier_count}家原供应商推送"
+        )[:1000]
         item.production_status = (
             FactoryReturnInventoryItem.ProductionStatus.READY_TO_COMPLETE
         )
         branch = "REPAIR"
     elif action == "DISASSEMBLY_MATERIAL_DISPOSITION":
-        disposition = str(warranty_disposition or "").strip()[:1000]
-        if not disposition:
-            raise FactoryReturnProcessError("请填写拆机三包物料处置意见。")
         if (
             item.stock_status
             != FactoryReturnInventoryItem.StockStatus.LIFECYCLE_ENDED
-            or not item.has_warranty_material
+            or not item.material_return_records.filter(
+                return_kind=(
+                    FactoryReturnMaterialReturnRecord.ReturnKind.DISASSEMBLY
+                )
+            ).exists()
         ):
-            raise FactoryReturnProcessError("该设备没有待处理的三包拆机物料。")
-        item.warranty_disposition = disposition
+            raise FactoryReturnProcessError("该设备没有待核对的拆机实际退回物料。")
+        now = timezone.now()
+        dispatches = _publish_supplier_warranty_dispatches(
+            inventory_item=item,
+            actor=user,
+            confirmed_at=now,
+        )
+        item.warranty_disposition = (
+            f"已确认{item.material_return_records.filter(return_kind='DISASSEMBLY').count()}项"
+            f"实际退回物料及自动质保结果，并向{len(dispatches)}家供应商生成协同任务"
+        )[:1000]
         branch = "DISASSEMBLY"
     else:
         raise FactoryReturnProcessError("配套处置动作无效。")
@@ -1822,6 +3174,16 @@ def process_factory_return_matching_item(
             "material_plan": item.material_plan,
             "warranty_disposition": item.warranty_disposition,
             "matching_remark": item.matching_remark,
+            "warranty_dispatch_ids": (
+                [row.pk for row in dispatches]
+                if action == "DISASSEMBLY_MATERIAL_DISPOSITION"
+                else []
+            ),
+            "repair_supplier_count": (
+                notified_supplier_count
+                if action == "REPAIR_MATERIAL_PLAN"
+                else 0
+            ),
         },
     )
     _sync_internal_branch_tasks(transfer, branch, user)
@@ -1832,6 +3194,53 @@ def _serialize_inventory_item(item, can_post, role_code=""):
     transfer_item = item.transfer_item
     device = transfer_item.device
     qrcode = getattr(device, "qrcode", None)
+    fault_records = list(
+        item.material_fault_records.select_related(
+            "material",
+            "material_spec",
+            "supplier",
+            "recorded_by",
+        ).order_by("id")
+    )
+    warranty_candidates = [
+        row for row in fault_records if row.is_warranty_candidate
+    ]
+    unresolved_warranty_count = sum(
+        not row.supplier_id for row in warranty_candidates
+    )
+    material_return_records = list(
+        item.material_return_records.select_related(
+            "material",
+            "material_spec",
+            "supplier",
+            "material_spec_supplier",
+            "recorded_by",
+        ).order_by("return_kind", "id")
+    )
+    disassembly_return_records = [
+        row
+        for row in material_return_records
+        if row.return_kind
+        == FactoryReturnMaterialReturnRecord.ReturnKind.DISASSEMBLY
+    ]
+    unresolved_return_count = sum(
+        not row.supplier_id for row in disassembly_return_records
+    )
+    repair_requirements = list(
+        item.repair_material_requirements.select_related(
+            "material",
+            "material_spec",
+            "supplier",
+            "requested_by",
+            "returned_material_record__material",
+            "returned_material_record__material_spec",
+            "returned_material_record__supplier",
+            "returned_material_record__recorded_by",
+        ).order_by("id")
+    )
+    unresolved_repair_count = sum(
+        not row.supplier_id for row in repair_requirements
+    )
     return {
         "id": item.pk,
         "goods_transfer_item_id": transfer_item.pk,
@@ -1892,6 +3301,60 @@ def _serialize_inventory_item(item, can_post, role_code=""):
             "version": item.source_bom.version,
             "version_no": item.source_bom.version_no,
         },
+        "bom_material_options": _bom_material_options(item),
+        "repair_material_requirements": [
+            _serialize_repair_material_requirement(record)
+            for record in repair_requirements
+        ],
+        "repair_material_summary": {
+            "total": len(repair_requirements),
+            "supplier_pending_confirmation": unresolved_repair_count,
+            "notified": sum(bool(row.notified_at) for row in repair_requirements),
+        },
+        "material_return_records": [
+            _serialize_material_return_record(record)
+            for record in material_return_records
+        ],
+        "material_return_summary": {
+            "actual_line_count": len(material_return_records),
+            "actual_quantity": str(
+                sum(
+                    (row.returned_quantity for row in material_return_records),
+                    Decimal("0"),
+                )
+            ),
+            "disassembly_line_count": len(disassembly_return_records),
+            "fault_occurrence_count": sum(
+                bool(row.is_fault_material) for row in material_return_records
+            ),
+            "in_warranty_count": sum(
+                row.warranty_result
+                == DeviceMaterialWarrantyEvaluation.Result.IN_WARRANTY
+                for row in material_return_records
+            ),
+            "supplier_pending_confirmation": unresolved_return_count,
+        },
+        "fault_material_records": [
+            _serialize_fault_record(record) for record in fault_records
+        ],
+        "fault_material_summary": {
+            "total": len(fault_records),
+            "warranty_candidates": len(warranty_candidates),
+            "supplier_pending_confirmation": unresolved_warranty_count,
+        },
+        "warranty_dispatches": [
+            {
+                "id": dispatch.pk,
+                "supplier_id": dispatch.supplier_id,
+                "supplier_name": dispatch.supplier_name_snapshot,
+                "status": dispatch.status,
+                "status_name": dispatch.get_status_display(),
+                "material_count": dispatch.dispatch_items.count(),
+            }
+            for dispatch in item.warranty_dispatches.select_related(
+                "supplier",
+            ).order_by("supplier_name_snapshot", "id")
+        ],
         "actions": {
             "can_classify": bool(can_post),
             "can_submit_repair_diagnosis": bool(
@@ -1923,16 +3386,146 @@ def _serialize_inventory_item(item, can_post, role_code=""):
                 == FactoryReturnInventoryItem.MatchingStatus.PENDING
                 and item.needs_replacement_material
             ),
+            "can_notify_repair_suppliers": bool(
+                role_code == "factory_matching"
+                and item.stock_status
+                == FactoryReturnInventoryItem.StockStatus.REPAIRING
+                and item.matching_status
+                == FactoryReturnInventoryItem.MatchingStatus.PENDING
+                and item.needs_replacement_material
+                and repair_requirements
+                and unresolved_repair_count == 0
+            ),
             "can_submit_disassembly_disposition": bool(
                 role_code == "factory_matching"
                 and item.stock_status
                 == FactoryReturnInventoryItem.StockStatus.LIFECYCLE_ENDED
                 and item.matching_status
                 == FactoryReturnInventoryItem.MatchingStatus.PENDING
-                and item.has_warranty_material
+                and disassembly_return_records
+            ),
+            "can_notify_warranty_suppliers": bool(
+                role_code == "factory_matching"
+                and item.stock_status
+                == FactoryReturnInventoryItem.StockStatus.LIFECYCLE_ENDED
+                and item.matching_status
+                == FactoryReturnInventoryItem.MatchingStatus.PENDING
+                and disassembly_return_records
+                and unresolved_return_count == 0
             ),
         },
     }
+
+
+def _serialize_role_workflow_tasks(transfer, identity):
+    """Return planned and published nodes for the current factory role.
+
+    A node becomes readable only when a real UserTask addressed to the current
+    OpenID exists.  Keeping unpublished nodes in the response lets the client
+    explain the whole role workflow without fabricating tasks or permissions.
+    """
+
+    node_definitions = FACTORY_RETURN_ROLE_TASK_NODES.get(
+        identity.role.code,
+        (),
+    )
+    if not node_definitions:
+        return []
+
+    task_types = [node["type"] for node in node_definitions]
+    workitems = list(
+        WorkItem.objects.filter(
+            biz_ref=f"lifecycle.GoodsTransfer:{transfer.pk}",
+            type__in=task_types,
+        )
+        .prefetch_related("user_tasks")
+        .order_by("-id")
+    )
+    workitem_by_type = {}
+    for workitem in workitems:
+        workitem_by_type.setdefault(workitem.type, workitem)
+
+    openid = identity.user.wx_openid or ""
+    nodes = []
+    for sequence, definition in enumerate(node_definitions, start=1):
+        workitem = workitem_by_type.get(definition["type"])
+        user_task = None
+        if workitem and openid:
+            user_task = next(
+                (
+                    row
+                    for row in workitem.user_tasks.all()
+                    if row.to_openid == openid
+                ),
+                None,
+            )
+
+        published = bool(user_task)
+        read_state = "UNREAD" if published and user_task.state == "NEW" else "READ"
+        read_state_name = "未读" if read_state == "UNREAD" else "已读"
+        if not published:
+            read_state = "NOT_PUBLISHED"
+            read_state_name = "尚未推送"
+
+        action_state = ""
+        action_state_name = ""
+        if definition["is_action"]:
+            if not published:
+                action_state = "NOT_PUBLISHED"
+                action_state_name = "尚未推送"
+            elif (
+                user_task.state == "DONE"
+                or workitem.status == "DONE"
+            ):
+                action_state = "COMPLETED"
+                action_state_name = "已完成"
+            elif user_task.need_action:
+                action_state = "PENDING"
+                action_state_name = "待处理"
+            elif workitem.status == "CANCELLED":
+                action_state = "CANCELLED"
+                action_state_name = "已取消"
+            else:
+                action_state = "WAITING"
+                action_state_name = "等待前置步骤"
+
+        nodes.append(
+            {
+                "sequence": sequence,
+                "type": definition["type"],
+                "title": definition["title"],
+                "event_title": (
+                    user_task.display_title_snapshot
+                    or workitem.title
+                    or definition["title"]
+                    if user_task
+                    else ""
+                ),
+                "summary": (
+                    user_task.display_subtitle_snapshot
+                    or workitem.summary
+                    or ""
+                    if user_task
+                    else "业务条件满足后由系统推送"
+                ),
+                "is_action": definition["is_action"],
+                "published": published,
+                "task_id": user_task.pk if user_task else None,
+                "read_state": read_state,
+                "read_state_name": read_state_name,
+                "action_state": action_state,
+                "action_state_name": action_state_name,
+                "can_mark_read": bool(
+                    published and user_task.state == "NEW"
+                ),
+                "cursor_time": (
+                    user_task.cursor_time.isoformat()
+                    if user_task
+                    else ""
+                ),
+            }
+        )
+    return nodes
 
 
 def _serialize_process(process, identity):
@@ -1983,6 +3576,7 @@ def _serialize_process(process, identity):
     inventory_summary = defaultdict(int)
     for inventory_item in inventory_items:
         inventory_summary[inventory_item.stock_status] += 1
+    workflow_tasks = _serialize_role_workflow_tasks(transfer, identity)
     return {
         "transfer": {
             "id": transfer.pk,
@@ -2009,6 +3603,18 @@ def _serialize_process(process, identity):
         "viewer": {
             "role": identity.role.code,
             "role_name": identity.role.name,
+        },
+        "workflow_tasks": workflow_tasks,
+        "workflow_task_summary": {
+            "total": len(workflow_tasks),
+            "published": sum(row["published"] for row in workflow_tasks),
+            "unread": sum(
+                row["read_state"] == "UNREAD" for row in workflow_tasks
+            ),
+            "pending_action": sum(
+                row["action_state"] == "PENDING"
+                for row in workflow_tasks
+            ),
         },
         "account_case": (
             {
@@ -2190,3 +3796,592 @@ def get_factory_return_inventory(*, user):
             for item in items
         ],
     }
+
+
+def _supplier_warranty_dispatch_access(user, dispatch, *, require_open_task=False):
+    identity = get_active_identity(user)
+    if (
+        not identity
+        or not identity.is_active
+        or identity.organization_id != dispatch.supplier_id
+        or identity.organization.organization_type.code != "SUPPLIER"
+        or identity.role.code not in {"supplier_owner", "supplier_sales"}
+    ):
+        raise FactoryReturnProcessError("当前账号不能查看该供应商三包任务。")
+    workitem = WorkItem.objects.filter(
+        type=SUPPLIER_WARRANTY_WORK_TYPE,
+        uniq_key=f"lifecycle:factory-return-warranty:{dispatch.pk}",
+    ).first()
+    if not workitem:
+        raise FactoryReturnProcessError("供应商三包协同任务不存在。")
+    task = workitem.user_tasks.filter(to_openid=user.wx_openid).first()
+    if not task:
+        raise FactoryReturnProcessError("当前账号不在该三包任务的责任范围内。")
+    if require_open_task and (
+        workitem.status != "OPEN" or task.state == "DONE" or not task.need_action
+    ):
+        raise FactoryReturnProcessError("该三包任务已经由协同账号接收。")
+    return identity, workitem, task
+
+
+def _serialize_supplier_warranty_dispatch(dispatch, identity, workitem):
+    payload = workitem.payload if isinstance(workitem.payload, dict) else {}
+    scope = (payload.get("recipient_scopes") or {}).get(
+        identity.user.wx_openid,
+        {},
+    )
+    scoped_material_ids = {
+        int(value) for value in scope.get("material_ids", []) if value
+    }
+    fault_records = list(
+        dispatch.fault_records.select_related(
+            "material",
+            "material_spec",
+            "supplier",
+            "recorded_by",
+        ).order_by("id")
+    )
+    return_records = list(
+        dispatch.inventory_item.material_return_records.select_related(
+            "material",
+            "material_spec",
+            "supplier",
+            "material_spec_supplier",
+            "recorded_by",
+        ).filter(
+            return_kind=(
+                FactoryReturnMaterialReturnRecord.ReturnKind.DISASSEMBLY
+            ),
+            supplier_id=dispatch.supplier_id,
+        ).order_by("id")
+    )
+    if identity.role.code == "supplier_sales":
+        fault_records = [
+            row for row in fault_records if row.material_id in scoped_material_ids
+        ]
+        return_records = [
+            row
+            for row in return_records
+            if row.material_id in scoped_material_ids
+        ]
+    evaluations = {}
+    for evaluation in DeviceMaterialWarrantyEvaluation.objects.filter(
+        fault_record_id__in=[record.pk for record in fault_records],
+    ).order_by("fault_record_id", "-version", "-id"):
+        evaluations.setdefault(evaluation.fault_record_id, evaluation)
+    for record in fault_records:
+        evaluation = evaluations.get(record.pk)
+        if evaluation:
+            record._current_warranty_evaluation = evaluation
+    return {
+        "id": dispatch.pk,
+        "status": dispatch.status,
+        "status_name": dispatch.get_status_display(),
+        "supplier": {
+            "id": dispatch.supplier_id,
+            "name": dispatch.supplier_name_snapshot,
+        },
+        "factory": {
+            "id": dispatch.inventory_item.process.transfer.to_organization_id,
+            "name": dispatch.inventory_item.process.transfer.to_organization.name,
+        },
+        "return_flow_no": (
+            dispatch.inventory_item.process.transfer.flow_no
+        ),
+        "device_sn": dispatch.inventory_item.transfer_item.device.sn,
+        "product_model_name": (
+            dispatch.inventory_item.source_product_model.name
+        ),
+        "confirmed_by_name": _display_name(dispatch.confirmed_by),
+        "confirmed_at": dispatch.confirmed_at.isoformat(),
+        "received_by_name": (
+            _display_name(dispatch.received_by) if dispatch.received_by_id else ""
+        ),
+        "received_at": (
+            dispatch.received_at.isoformat() if dispatch.received_at else ""
+        ),
+        # materials 保留为兼容字段；新页面必须分别使用下面两个事实集合。
+        "materials": [_serialize_fault_record(row) for row in fault_records],
+        "returned_materials": [
+            _serialize_material_return_record(row) for row in return_records
+        ],
+        "fault_materials": [
+            _serialize_fault_record(row) for row in fault_records
+        ],
+        "summary": {
+            "returned_material_lines": len(return_records),
+            "returned_quantity": str(
+                sum(
+                    (row.returned_quantity for row in return_records),
+                    Decimal("0"),
+                )
+            ),
+            "fault_occurrences": len(fault_records),
+            "in_warranty_lines": sum(
+                row.warranty_result
+                == DeviceMaterialWarrantyEvaluation.Result.IN_WARRANTY
+                for row in return_records
+            ),
+        },
+        "viewer": {
+            "role": identity.role.code,
+            "role_name": identity.role.name,
+        },
+        "actions": {
+            "can_receive": False,
+        },
+        "rules": {
+            "owner_and_sales_ack_independently": True,
+            "fact_records_are_immutable": True,
+            "returned_materials_and_fault_occurrences_are_separate": True,
+            "warranty_is_computed_automatically": True,
+            "quality_conclusion_not_in_this_version": True,
+        },
+    }
+
+
+def _supplier_sales_historical_material_scopes(*, identity):
+    """Resolve visibility from immutable task snapshots, never current routing.
+
+    A responsibility manager can change after an order was matched. Historical
+    supplier pages therefore use the recipient scope captured when the task was
+    published. This prevents a newly assigned salesperson from inheriting old
+    cases, and prevents an original recipient from losing the cases already
+    delivered to them.
+    """
+
+    return_pairs = set()
+    repair_pairs = set()
+    warranty_dispatch_scopes = []
+    openid = identity.user.wx_openid or ""
+    workitems = WorkItem.objects.filter(
+        type__in=(SUPPLIER_WARRANTY_WORK_TYPE, SUPPLIER_REPAIR_MATERIAL_WORK_TYPE),
+    ).order_by("id")
+    for workitem in workitems:
+        payload = workitem.payload if isinstance(workitem.payload, dict) else {}
+        if int(payload.get("supplier_id") or 0) != identity.organization_id:
+            continue
+        recipient_scope = (payload.get("recipient_scopes") or {}).get(openid)
+        if not isinstance(recipient_scope, dict):
+            continue
+        material_ids = {
+            int(value)
+            for value in recipient_scope.get("material_ids", [])
+            if value
+        }
+        if not material_ids:
+            continue
+        if workitem.type == SUPPLIER_WARRANTY_WORK_TYPE:
+            inventory_item_id = int(payload.get("inventory_item_id") or 0)
+            dispatch_id = int(payload.get("dispatch_id") or 0)
+            if inventory_item_id:
+                return_pairs.update(
+                    (inventory_item_id, material_id)
+                    for material_id in material_ids
+                )
+            elif dispatch_id:
+                warranty_dispatch_scopes.append((dispatch_id, material_ids))
+        else:
+            inventory_item_id = int(payload.get("inventory_item_id") or 0)
+            if inventory_item_id:
+                repair_pairs.update(
+                    (inventory_item_id, material_id)
+                    for material_id in material_ids
+                )
+
+    # Older published warranty tasks did not include inventory_item_id. Resolve
+    # their dispatch FK without mutating the original task payload.
+    if warranty_dispatch_scopes:
+        inventory_by_dispatch = dict(
+            FactoryReturnWarrantyDispatch.objects.filter(
+                pk__in=[row[0] for row in warranty_dispatch_scopes],
+            ).values_list("id", "inventory_item_id")
+        )
+        for dispatch_id, material_ids in warranty_dispatch_scopes:
+            inventory_item_id = inventory_by_dispatch.get(dispatch_id)
+            if inventory_item_id:
+                return_pairs.update(
+                    (inventory_item_id, material_id)
+                    for material_id in material_ids
+                )
+    return return_pairs, repair_pairs
+
+
+def get_supplier_warranty_lists(*, user):
+    """Return three supplier lists without mixing their accounting meanings.
+
+    ``return_materials`` is the physical/settlement fact, ``fault_materials``
+    is the quality occurrence fact, and ``repair_material_requests`` keeps the
+    requested new-part quantity separate from the old part actually returned.
+    Warranty is a read-only snapshot on every physical-return row.
+    """
+
+    try:
+        identity = get_supplier_identity(user)
+    except SupplierResponsibilityError as exc:
+        raise FactoryReturnProcessError(str(exc)) from exc
+
+    return_records = list(
+        FactoryReturnMaterialReturnRecord.objects.select_related(
+            "material",
+            "material_spec",
+            "supplier",
+            "material_spec_supplier",
+            "recorded_by",
+            "source_production_batch",
+            "source_bom",
+            "inventory_item__source_product_model",
+            "inventory_item__process__transfer__from_organization",
+            "inventory_item__process__transfer__to_organization",
+            "inventory_item__transfer_item__device",
+        )
+        .filter(
+            supplier_id=identity.organization_id,
+            return_kind=(
+                FactoryReturnMaterialReturnRecord.ReturnKind.DISASSEMBLY
+            ),
+        )
+        .order_by("-returned_at", "-id")
+    )
+    if identity.role.code == "supplier_sales":
+        return_scope_pairs, repair_scope_pairs = (
+            _supplier_sales_historical_material_scopes(identity=identity)
+        )
+        return_records = [
+            row
+            for row in return_records
+            if (row.inventory_item_id, row.material_id) in return_scope_pairs
+        ]
+    else:
+        return_scope_pairs = None
+        repair_scope_pairs = None
+
+    fault_records = list(
+        DeviceMaterialFaultRecord.objects.select_related(
+            "material",
+            "material_spec",
+            "supplier",
+            "recorded_by",
+            "source_production_batch",
+            "source_bom",
+            "inventory_item__source_product_model",
+            "inventory_item__process__transfer__from_organization",
+            "inventory_item__process__transfer__to_organization",
+            "inventory_item__transfer_item__device",
+            "warranty_dispatch_item__dispatch",
+        )
+        .filter(
+            supplier_id=identity.organization_id,
+            return_record_id__in=[row.pk for row in return_records],
+        )
+        .order_by("-dismantled_at", "-id")
+    )
+    latest_evaluations = {}
+    for evaluation in DeviceMaterialWarrantyEvaluation.objects.filter(
+        fault_record_id__in=[row.pk for row in fault_records],
+    ).order_by("fault_record_id", "-version", "-id"):
+        latest_evaluations.setdefault(evaluation.fault_record_id, evaluation)
+    for record in fault_records:
+        evaluation = latest_evaluations.get(record.pk)
+        if evaluation:
+            record._current_warranty_evaluation = evaluation
+
+    repair_requirements = list(
+        FactoryReturnRepairMaterialRequirement.objects.select_related(
+            "material",
+            "material_spec",
+            "supplier",
+            "requested_by",
+            "returned_material_record__material",
+            "returned_material_record__material_spec",
+            "returned_material_record__supplier",
+            "returned_material_record__material_spec_supplier",
+            "returned_material_record__recorded_by",
+            "inventory_item__source_product_model",
+            "inventory_item__process__transfer__from_organization",
+            "inventory_item__process__transfer__to_organization",
+            "inventory_item__transfer_item__device",
+        )
+        .filter(
+            supplier_id=identity.organization_id,
+            notified_at__isnull=False,
+        )
+        .order_by("-notified_at", "-id")
+    )
+    if repair_scope_pairs is not None:
+        repair_requirements = [
+            row
+            for row in repair_requirements
+            if (row.inventory_item_id, row.material_id) in repair_scope_pairs
+        ]
+
+    dispatch_by_inventory = {
+        inventory_id: dispatch_id
+        for inventory_id, dispatch_id in FactoryReturnWarrantyDispatch.objects.filter(
+            supplier_id=identity.organization_id,
+            inventory_item_id__in={row.inventory_item_id for row in return_records},
+        ).values_list("inventory_item_id", "id")
+    }
+    return_rows = []
+    case_map = {}
+    for record in return_records:
+        inventory_item = record.inventory_item
+        transfer = inventory_item.process.transfer
+        dispatch_id = dispatch_by_inventory.get(inventory_item.pk)
+        return_rows.append(
+            {
+                **_serialize_material_return_record(record),
+                "dispatch_id": dispatch_id,
+                "return_flow_no": record.return_flow_no_snapshot,
+                "device_sn": record.device_sn_snapshot,
+                "product_model_name": inventory_item.source_product_model.name,
+                "return_merchant_name": transfer.from_organization.name,
+                "factory_name": transfer.to_organization.name,
+                "production_date": (
+                    record.source_production_batch.production_date.isoformat()
+                ),
+                "production_batch_no": record.production_batch_no_snapshot,
+                "bom_version": record.bom_version_snapshot,
+            }
+        )
+        case = case_map.setdefault(
+            inventory_item.pk,
+            {
+                "inventory_item_id": inventory_item.pk,
+                "dispatch_id": dispatch_id,
+                "return_flow_no": record.return_flow_no_snapshot,
+                "device_sn": record.device_sn_snapshot,
+                "product_model_name": inventory_item.source_product_model.name,
+                "return_merchant_name": transfer.from_organization.name,
+                "factory_name": transfer.to_organization.name,
+                "dismantled_at": record.returned_at.isoformat(),
+                "production_date": (
+                    record.source_production_batch.production_date.isoformat()
+                ),
+                "production_batch_no": record.production_batch_no_snapshot,
+                "bom_version": record.bom_version_snapshot,
+                "returned_material_lines": 0,
+                "returned_quantity": Decimal("0"),
+                "fault_occurrence_count": 0,
+                "material_names": [],
+            },
+        )
+        case["returned_material_lines"] += 1
+        case["returned_quantity"] += record.returned_quantity
+        case["fault_occurrence_count"] += int(record.is_fault_material)
+        case["material_names"].append(record.material_name_snapshot)
+
+    case_rows = []
+    for case in case_map.values():
+        case["material_count"] = case["returned_material_lines"]
+        case["returned_quantity"] = str(case["returned_quantity"])
+        case_rows.append(case)
+
+    fault_rows = []
+    for record in fault_records:
+        inventory_item = record.inventory_item
+        transfer = inventory_item.process.transfer
+        fault_rows.append(
+            {
+                **_serialize_fault_record(record),
+                "dispatch_id": dispatch_by_inventory.get(inventory_item.pk),
+                "return_flow_no": record.return_flow_no_snapshot,
+                "device_sn": record.device_sn_snapshot,
+                "product_model_name": inventory_item.source_product_model.name,
+                "return_merchant_name": transfer.from_organization.name,
+                "factory_name": transfer.to_organization.name,
+                "production_date": (
+                    record.source_production_batch.production_date.isoformat()
+                ),
+                "production_batch_no": record.production_batch_no_snapshot,
+                "bom_version": record.bom_version_snapshot,
+            }
+        )
+
+    repair_rows = []
+    repair_return_quantity = Decimal("0")
+    for row in repair_requirements:
+        serialized = _serialize_repair_material_requirement(row)
+        returned_record = row.returned_material_record
+        if returned_record:
+            repair_return_quantity += returned_record.returned_quantity
+            warranty_evaluation = serialized["actual_return_record"][
+                "warranty_evaluation"
+            ]
+        else:
+            warranty_evaluation = _serialize_material_warranty(
+                _material_warranty_snapshot(
+                    material_spec_id=row.material_spec_id,
+                    supplier_id=row.supplier_id,
+                    production_date=row.source_production_batch.production_date,
+                    evaluated_at=row.requested_at,
+                )
+            )
+        repair_rows.append(
+            {
+                **serialized,
+                "inventory_item_id": row.inventory_item_id,
+                "device_sn": row.device_sn_snapshot,
+                "product_model_name": row.inventory_item.source_product_model.name,
+                "return_flow_no": row.return_flow_no_snapshot,
+                "return_merchant_name": (
+                    row.inventory_item.process.transfer.from_organization.name
+                ),
+                "factory_name": (
+                    row.inventory_item.process.transfer.to_organization.name
+                ),
+                "production_batch_no": row.production_batch_no_snapshot,
+                "bom_version": row.bom_version_snapshot,
+                "warranty_evaluation": warranty_evaluation,
+            }
+        )
+
+    return {
+        "viewer": {
+            "role": identity.role.code,
+            "role_name": identity.role.name,
+            "supplier_id": identity.organization_id,
+            "supplier_name": identity.organization.name,
+            "scope_name": (
+                "本供应商全部退回、故障与修复数据"
+                if identity.role.code == "supplier_owner"
+                else "本人责任范围内物料"
+            ),
+        },
+        "summary": {
+            "return_case_count": len(case_map),
+            "returned_material_count": len(return_rows),
+            "returned_material_quantity": str(
+                sum(
+                    (row.returned_quantity for row in return_records),
+                    Decimal("0"),
+                )
+            ),
+            "fault_material_count": len(fault_rows),
+            "fault_occurrence_count": len(fault_rows),
+            "repair_material_count": len(repair_requirements),
+            "repair_return_quantity": str(repair_return_quantity),
+        },
+        "return_cases": case_rows,
+        "return_materials": return_rows,
+        "fault_materials": fault_rows,
+        "repair_material_requests": repair_rows,
+        "rules": {
+            "physical_returns_and_fault_occurrences_are_separate": True,
+            "warranty_is_computed_automatically": True,
+            "all_warranty_results_are_visible": True,
+            "repair_new_parts_are_recounted_by_future_order_plan": True,
+            "supplier_owner_sees_all": True,
+            "supplier_sales_filtered_by_responsibility": True,
+            "awareness_tasks_are_independent": True,
+        },
+    }
+
+
+def get_supplier_warranty_dispatch(*, user, dispatch_id):
+    dispatch = (
+        FactoryReturnWarrantyDispatch.objects.select_related(
+            "supplier__organization_type",
+            "confirmed_by",
+            "received_by",
+            "inventory_item__source_product_model",
+            "inventory_item__transfer_item__device",
+            "inventory_item__process__transfer__to_organization",
+        )
+        .filter(pk=dispatch_id)
+        .first()
+    )
+    if not dispatch:
+        raise FactoryReturnProcessError("供应商三包协同批次不存在。")
+    identity, workitem, _task = _supplier_warranty_dispatch_access(user, dispatch)
+    return _serialize_supplier_warranty_dispatch(dispatch, identity, workitem)
+
+
+@transaction.atomic
+def receive_supplier_warranty_dispatch(*, user, dispatch_id):
+    dispatch = (
+        FactoryReturnWarrantyDispatch.objects.select_for_update()
+        .select_related(
+            "supplier__organization_type",
+            "confirmed_by",
+            "received_by",
+            "inventory_item__source_product_model",
+            "inventory_item__transfer_item__device",
+            "inventory_item__process__transfer__to_organization",
+        )
+        .filter(pk=dispatch_id)
+        .first()
+    )
+    if not dispatch:
+        raise FactoryReturnProcessError("供应商三包协同批次不存在。")
+    # 兼容旧版小程序的 receive 请求：新流程是独立知晓，不再改写批次或他人任务。
+    if dispatch.status == FactoryReturnWarrantyDispatch.Status.NOTIFIED:
+        identity, workitem, _task = _supplier_warranty_dispatch_access(
+            user,
+            dispatch,
+        )
+        return _serialize_supplier_warranty_dispatch(
+            dispatch,
+            identity,
+            workitem,
+        ), False
+    if dispatch.status == FactoryReturnWarrantyDispatch.Status.RECEIVED:
+        identity, workitem, _task = _supplier_warranty_dispatch_access(
+            user,
+            dispatch,
+        )
+        return _serialize_supplier_warranty_dispatch(
+            dispatch,
+            identity,
+            workitem,
+        ), False
+    identity, workitem, _task = _supplier_warranty_dispatch_access(
+        user,
+        dispatch,
+        require_open_task=True,
+    )
+    workitem = WorkItem.objects.select_for_update().get(pk=workitem.pk)
+    now = timezone.now()
+    actor_name = _display_name(user)
+    dispatch.status = FactoryReturnWarrantyDispatch.Status.RECEIVED
+    dispatch.received_by = user
+    dispatch.received_at = now
+    dispatch.save(
+        update_fields=("status", "received_by", "received_at", "updated_at")
+    )
+    workitem.status = "DONE"
+    workitem.done_by_openid = user.wx_openid or ""
+    workitem.done_at = now
+    workitem.last_activity_at = now
+    workitem.save(
+        update_fields=(
+            "status",
+            "done_by_openid",
+            "done_at",
+            "last_activity_at",
+            "updated_at",
+        )
+    )
+    UserTask.objects.filter(workitem=workitem).update(
+        state="DONE",
+        need_action=False,
+        done_at=now,
+        done_reason="OTHER_ACTION",
+        display_title_snapshot=f"已由{actor_name}接收三包物料通知",
+        display_subtitle_snapshot="同供应商协同账号无需重复操作",
+        cursor_time=now,
+        updated_at=now,
+    )
+    UserTask.objects.filter(
+        workitem=workitem,
+        to_openid=user.wx_openid,
+    ).update(
+        done_reason="SELF_ACTION",
+        display_title_snapshot="三包物料通知已接收",
+        display_subtitle_snapshot="由你完成",
+    )
+    return _serialize_supplier_warranty_dispatch(
+        dispatch,
+        identity,
+        workitem,
+    ), True

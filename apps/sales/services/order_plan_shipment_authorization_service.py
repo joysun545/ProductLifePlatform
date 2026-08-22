@@ -42,7 +42,7 @@ def _sales_identity(user):
         or identity.organization.organization_type.code != "OWNER"
     ):
         raise OrderPlanShipmentAuthorizationError(
-            "只有创建订单的厂家销售经理可以下达发货指令。"
+            "只有创建订单的厂家销售经理可以确认发货。"
         )
     return identity
 
@@ -67,7 +67,7 @@ def _plan(identity, plan_id, *, lock=False):
         )
     if plan.created_by_id != identity.user_id:
         raise OrderPlanShipmentAuthorizationError(
-            "只有创建该订单的厂家销售经理可以下达发货指令。"
+            "只有创建该订单的厂家销售经理可以确认发货。"
         )
     return plan
 
@@ -83,6 +83,8 @@ def _payload(plan):
                 "product_model_code": item.product_model.code,
                 "product_model_name": item.product_model.name,
                 "quantity": item.quantity,
+                "return_inventory_quantity": item.return_inventory_quantity,
+                "production_quantity": item.production_quantity,
                 "order_batch_code": item.order_batch_code,
                 "lifecycle_code": item.lifecycle_code,
             }
@@ -105,7 +107,7 @@ def publish_shipment_authorization_task(*, plan, actor_openid):
         biz_id=plan.plan_code,
         biz_ref=f"sales.OrderPlan:{plan.pk}",
         uniq_key=f"sales:order-plan:{plan.pk}:shipment-authorization",
-        title="生产完成，待下达发货指令",
+        title="生产完成，待确认发货",
         summary=(
             f"{plan.merchant_organization.name}｜"
             f"{plan.brand.name}｜共{plan.total_quantity}台"
@@ -176,7 +178,7 @@ def _notify_factory_stock(plan, user, payload):
         biz_id=plan.plan_code,
         biz_ref=f"sales.OrderPlan:{plan.pk}",
         uniq_key=f"sales:order-plan:{plan.pk}:shipment-authorized:stock",
-        title="销售经理已下达发货指令",
+        title="销售经理已确认发货",
         summary=(
             f"{plan.merchant_organization.name}｜"
             f"{plan.brand.name}｜共{plan.total_quantity}台；"
@@ -216,7 +218,7 @@ def confirm_shipment_authorization(*, user, plan_id):
 
     if plan.status != OrderPlan.Status.PRODUCTION_COMPLETED:
         raise OrderPlanShipmentAuthorizationError(
-            "只有已确认生产完成、尚未实际发货的订单可以下达发货指令。"
+            "只有已确认生产完成、尚未实际发货的订单可以确认发货。"
         )
 
     workitem = WorkItem.objects.select_for_update().filter(
@@ -233,7 +235,7 @@ def confirm_shipment_authorization(*, user, plan_id):
         )
     if workitem.status == "DONE":
         raise OrderPlanShipmentAuthorizationError(
-            "发货授权任务已完成，请刷新订单列表。"
+            "发货确认任务已完成，请刷新订单列表。"
         )
 
     actor_task = workitem.user_tasks.select_for_update().filter(
@@ -242,7 +244,7 @@ def confirm_shipment_authorization(*, user, plan_id):
     ).first()
     if not actor_task:
         raise OrderPlanShipmentAuthorizationError(
-            "当前账号不是该发货授权任务的处理人。"
+            "当前账号不是该发货确认任务的处理人。"
         )
 
     now = timezone.now()

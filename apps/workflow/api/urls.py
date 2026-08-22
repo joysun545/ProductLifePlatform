@@ -1,6 +1,7 @@
 from django.urls import path
 
 from .views import (
+    TaskGroupAPI,
     TaskSummaryAPI,
     TaskListAPI,
     TaskOpenAPI,
@@ -22,6 +23,12 @@ urlpatterns = [
         "task/list/",
         TaskListAPI.as_view(),
         name="task_list"
+    ),
+
+    path(
+        "task/group/",
+        TaskGroupAPI.as_view(),
+        name="task_group"
     ),
 
     path(

@@ -89,7 +89,7 @@ class OrderPlan(models.Model):
         null=True,
         blank=True,
         db_index=True,
-        verbose_name="发货授权时间",
+        verbose_name="发货确认时间",
     )
     shipment_authorized_by = models.ForeignKey(
         "account.User",
@@ -97,7 +97,7 @@ class OrderPlan(models.Model):
         blank=True,
         on_delete=models.SET_NULL,
         related_name="authorized_order_plan_shipments",
-        verbose_name="发货授权人",
+        verbose_name="发货确认人",
     )
     shipped_at = models.DateTimeField(null=True, blank=True, verbose_name="发货时间")
     shipped_by = models.ForeignKey(
@@ -196,6 +196,14 @@ class OrderPlanItem(models.Model):
         verbose_name="产品型号",
     )
     quantity = models.PositiveIntegerField(verbose_name="计划数量")
+    return_inventory_quantity = models.PositiveIntegerField(
+        default=0,
+        verbose_name="调用退货待流转库存数量",
+    )
+    production_quantity = models.PositiveIntegerField(
+        default=0,
+        verbose_name="本次新生产数量",
+    )
     order_batch_code = models.CharField(
         max_length=64,
         unique=True,
@@ -243,10 +251,31 @@ class OrderPlanItem(models.Model):
                 condition=Q(quantity__gt=0),
                 name="sales_order_plan_item_quantity_positive",
             ),
+            models.CheckConstraint(
+                condition=Q(
+                    quantity=(
+                        F("return_inventory_quantity")
+                        + F("production_quantity")
+                    )
+                ),
+                name="sales_order_item_quantity_split_matches_total",
+            ),
         ]
 
     def __str__(self):
         return f"{self.order_batch_code}-{self.product_model.name}"
+
+    def save(self, *args, **kwargs):
+        # 兼容历史脚本和测试中仅传 quantity 的创建方式；新订单服务会
+        # 显式写入退货库存/新生产拆分。
+        if (
+            self._state.adding
+            and self.quantity
+            and self.return_inventory_quantity == 0
+            and self.production_quantity == 0
+        ):
+            self.production_quantity = self.quantity
+        return super().save(*args, **kwargs)
 
     def clean(self):
         super().clean()
@@ -256,6 +285,122 @@ class OrderPlanItem(models.Model):
                 errors["category"] = "产品型号与产品品类不一致。"
         if errors:
             raise ValidationError(errors)
+
+
+class OrderPlanReturnInventoryAllocation(models.Model):
+    """订单逐台占用的厂家退货待流转库存，作为新旧生命周期的桥接事实。"""
+
+    class Status(models.TextChoices):
+        RESERVED = "RESERVED", "订单已预占"
+        READY_TO_SHIP = "READY_TO_SHIP", "生产完成待发货"
+        REISSUED = "REISSUED", "已重新流转"
+        RELEASED = "RELEASED", "已释放"
+
+    order_plan_item = models.ForeignKey(
+        OrderPlanItem,
+        on_delete=models.PROTECT,
+        related_name="return_inventory_allocations",
+        verbose_name="订单计划明细",
+    )
+    inventory_item = models.OneToOneField(
+        "lifecycle.FactoryReturnInventoryItem",
+        on_delete=models.PROTECT,
+        related_name="order_allocation",
+        verbose_name="退货待流转库存设备",
+    )
+    source_device = models.ForeignKey(
+        "lifecycle.Device",
+        on_delete=models.PROTECT,
+        related_name="return_inventory_order_allocations",
+        verbose_name="沿用实体设备",
+    )
+    source_bom = models.ForeignKey(
+        "product.BOM",
+        on_delete=models.PROTECT,
+        related_name="return_inventory_order_allocations",
+        verbose_name="退货设备实际BOM",
+    )
+    source_order_batch_snapshot = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        verbose_name="原订单批次快照",
+    )
+    source_lifecycle_snapshot = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        verbose_name="原生命周期编码快照",
+    )
+    source_qr_code_snapshot = models.CharField(
+        max_length=128,
+        blank=True,
+        default="",
+        verbose_name="原二维码快照",
+    )
+    original_qr = models.ForeignKey(
+        "lifecycle.QRCode",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="reissue_source_allocations",
+        verbose_name="原二维码记录",
+    )
+    replacement_qr = models.OneToOneField(
+        "lifecycle.QRCode",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="return_inventory_allocation",
+        verbose_name="新生命周期二维码",
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.RESERVED,
+        db_index=True,
+        verbose_name="占用状态",
+    )
+    reserved_by = models.ForeignKey(
+        "account.User",
+        on_delete=models.PROTECT,
+        related_name="reserved_return_inventory_allocations",
+        verbose_name="预占操作人",
+    )
+    reserved_at = models.DateTimeField(default=timezone.now, verbose_name="预占时间")
+    ready_to_ship_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="转待发货时间",
+    )
+    reissued_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="重新流转时间",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="更新时间")
+
+    class Meta:
+        ordering = ("order_plan_item_id", "id")
+        verbose_name = "订单退货库存逐台占用"
+        verbose_name_plural = "订单退货库存逐台占用"
+        indexes = (
+            models.Index(
+                fields=("order_plan_item", "status"),
+                name="sales_reissue_item_status_idx",
+            ),
+            models.Index(
+                fields=("source_device", "status"),
+                name="sales_reissue_dev_st_idx",
+            ),
+        )
+
+    def __str__(self):
+        return (
+            f"{self.order_plan_item.order_batch_code}-"
+            f"{self.source_device.sn}-{self.get_status_display()}"
+        )
 
 
 class OrderPlanItemBOMConfirmation(models.Model):

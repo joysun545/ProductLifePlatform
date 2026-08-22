@@ -128,6 +128,44 @@ class FactoryReturnPostingSerializer(serializers.Serializer):
     )
 
 
+class FactoryReturnMaterialReturnSerializer(serializers.Serializer):
+    bom_item_id = serializers.IntegerField(min_value=1)
+    note = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=500,
+        trim_whitespace=True,
+    )
+    is_fault_material = serializers.BooleanField(default=False)
+
+
+class FactoryReturnFaultMaterialSerializer(serializers.Serializer):
+    """兼容已发布但尚未升级的小程序请求。
+
+    ``is_warranty_candidate`` 不再代表人工质保判断；兼容请求只把该字段
+    映射为“故障物料”，质保状态仍由服务端重新计算。
+    """
+
+    bom_item_id = serializers.IntegerField(min_value=1)
+    note = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=500,
+        trim_whitespace=True,
+    )
+    is_warranty_candidate = serializers.BooleanField(default=False)
+
+
+class FactoryReturnRepairMaterialSerializer(serializers.Serializer):
+    bom_item_id = serializers.IntegerField(min_value=1)
+    note = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=500,
+        trim_whitespace=True,
+    )
+
+
 class FactoryReturnProductionActionSerializer(serializers.Serializer):
     action = serializers.ChoiceField(
         choices=(
@@ -162,6 +200,21 @@ class FactoryReturnProductionActionSerializer(serializers.Serializer):
         required=False,
         allow_null=True,
     )
+    fault_materials = FactoryReturnFaultMaterialSerializer(
+        many=True,
+        required=False,
+        allow_empty=False,
+    )
+    returned_materials = FactoryReturnMaterialReturnSerializer(
+        many=True,
+        required=False,
+        allow_empty=False,
+    )
+    repair_materials = FactoryReturnRepairMaterialSerializer(
+        many=True,
+        required=False,
+        allow_empty=False,
+    )
 
     def validate(self, attrs):
         action = attrs["action"]
@@ -175,19 +228,21 @@ class FactoryReturnProductionActionSerializer(serializers.Serializer):
         if (
             action == "REPAIR_DIAGNOSIS"
             and attrs.get("needs_replacement_material")
-            and not attrs.get("material_requirement", "")
+            and not attrs.get("repair_materials")
         ):
             raise serializers.ValidationError(
-                {"material_requirement": "需要换料时必须填写物料需求"}
+                {"repair_materials": "需要换料时请至少勾选一项原BOM物料"}
             )
         if action == "DISASSEMBLY_COMPLETE":
-            if not attrs.get("disassembly_result", ""):
+            returned = attrs.get("returned_materials")
+            legacy = attrs.get("fault_materials")
+            if not returned and not legacy:
                 raise serializers.ValidationError(
-                    {"disassembly_result": "请填写拆机结果和拆出物料清单"}
+                    {"returned_materials": "请至少勾选一项实际拆下退回物料"}
                 )
-            if "has_warranty_material" not in attrs:
+            if returned and not any(row.get("is_fault_material") for row in returned):
                 raise serializers.ValidationError(
-                    {"has_warranty_material": "请选择是否包含三包物料"}
+                    {"returned_materials": "请至少标记一项导致本次拆机的故障物料"}
                 )
         return attrs
 
@@ -217,20 +272,3 @@ class FactoryReturnMatchingActionSerializer(serializers.Serializer):
         max_length=1000,
         trim_whitespace=True,
     )
-
-    def validate(self, attrs):
-        if (
-            attrs["action"] == "REPAIR_MATERIAL_PLAN"
-            and not attrs.get("material_plan", "")
-        ):
-            raise serializers.ValidationError(
-                {"material_plan": "请填写修复物料方案"}
-            )
-        if (
-            attrs["action"] == "DISASSEMBLY_MATERIAL_DISPOSITION"
-            and not attrs.get("warranty_disposition", "")
-        ):
-            raise serializers.ValidationError(
-                {"warranty_disposition": "请填写三包物料处置意见"}
-            )
-        return attrs

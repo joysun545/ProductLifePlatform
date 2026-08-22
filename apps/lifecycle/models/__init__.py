@@ -32,9 +32,15 @@ from .goods_transfer_accounts import (
 )
 
 from .factory_return import (
+    DeviceMaterialFaultRecord,
+    DeviceMaterialWarrantyEvaluation,
     FactoryReturnDocument,
     FactoryReturnInventoryItem,
+    FactoryReturnMaterialReturnRecord,
     FactoryReturnProcess,
+    FactoryReturnRepairMaterialRequirement,
+    FactoryReturnWarrantyDispatch,
+    FactoryReturnWarrantyDispatchItem,
 )
 
 
@@ -78,6 +84,18 @@ __all__ = [
 
     "FactoryReturnInventoryItem",
 
+    "FactoryReturnMaterialReturnRecord",
+
     "FactoryReturnDocument",
+
+    "FactoryReturnRepairMaterialRequirement",
+
+    "DeviceMaterialFaultRecord",
+
+    "DeviceMaterialWarrantyEvaluation",
+
+    "FactoryReturnWarrantyDispatch",
+
+    "FactoryReturnWarrantyDispatchItem",
 
 ]

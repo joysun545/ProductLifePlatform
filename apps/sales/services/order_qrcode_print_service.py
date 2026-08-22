@@ -5,6 +5,7 @@ from account.models import UserOrganization
 from lifecycle.services.lifecycle_service import LifecycleService
 from manufacturing.models import ProductionBatch
 from sales.models import OrderPlan, OrderPlanItem
+from sales.services.order_plan_reissue_service import ensure_reissue_qrcodes
 from workflow.services.workflow_service import publish_workitem
 
 
@@ -20,7 +21,7 @@ ELIGIBLE_STATUSES = {
 def _ensure_shipment_authorized(plan):
     if not plan.shipment_authorized_at or not plan.shipment_authorized_by_id:
         raise OrderQRCodePrintError(
-            "创建订单的厂家销售经理尚未下达发货指令。"
+            "创建订单的厂家销售经理尚未确认发货。"
         )
 
 
@@ -31,6 +32,8 @@ def _item_payload(item):
         "product_model_code": item.product_model.code,
         "product_model_name": item.product_model.name,
         "quantity": item.quantity,
+        "return_inventory_quantity": item.return_inventory_quantity,
+        "production_quantity": item.production_quantity,
         "order_batch_code": item.order_batch_code,
         "generated": item.qrcode_generated_at is not None,
         "printed": item.qrcode_printed_at is not None,
@@ -91,7 +94,7 @@ def _get_item(item_id, *, lock=False):
     _ensure_shipment_authorized(item.plan)
     if item.qrcode_printed_at:
         raise OrderQRCodePrintError("该产品型号的二维码已经打印完成。")
-    if not hasattr(item, "bom_confirmation"):
+    if item.production_quantity > 0 and not hasattr(item, "bom_confirmation"):
         raise OrderQRCodePrintError("该产品型号尚未确认生产BOM。")
     return item
 
@@ -111,7 +114,7 @@ def _factory_stock_openids(plan):
     )
 
 
-def _publish_stock_outbound_task(plan):
+def _publish_stock_outbound_task(plan, *, qrcodes_ready):
     _ensure_shipment_authorized(plan)
     stock_openids = _factory_stock_openids(plan)
     if not stock_openids:
@@ -130,6 +133,8 @@ def _publish_stock_outbound_task(plan):
                 "product_model_code": row.product_model.code,
                 "product_model_name": row.product_model.name,
                 "quantity": row.quantity,
+                "return_inventory_quantity": row.return_inventory_quantity,
+                "production_quantity": row.production_quantity,
                 "order_batch_code": row.order_batch_code,
                 "lifecycle_code": row.lifecycle_code,
             }
@@ -147,10 +152,15 @@ def _publish_stock_outbound_task(plan):
         biz_id=plan.plan_code,
         biz_ref=f"sales.OrderPlan:{plan.pk}",
         uniq_key=f"sales:order-plan:{plan.pk}:stock-outbound",
-        title="订单二维码已打印，待一键出库",
+        title=(
+            "订单二维码已打印，待一键出库"
+            if qrcodes_ready
+            else "全量调用退货库存，待打印新二维码并发货"
+        ),
         summary=(
             f"{plan.merchant_organization.name}｜"
-            f"{plan.brand.name}｜共{plan.total_quantity}台"
+            f"{plan.brand.name}｜共{plan.total_quantity}台｜"
+            + ("二维码已完成" if qrcodes_ready else "请先在网页打印中心完成二维码")
         ),
         link=(
             "/pages/sales/order_plan_list/order_plan_list"
@@ -159,18 +169,20 @@ def _publish_stock_outbound_task(plan):
         recipients_openids=stock_openids,
         need_action=True,
         action_mode="ANYONE_DO",
-        payload=payload,
+        payload={**payload, "qrcodes_ready": qrcodes_ready},
         actor_openid=actor_openid,
         mark_workitem_done_immediately=False,
     )
     # publish_workitem 会复用同一 uniq_key。旧订单部署迁移时可能暂时
     # 关闭过未授权的出库任务，因此重新打开时显式清理旧完成痕迹，
-    # 并把本轮真正的发货授权人记录为任务发起人。
+    # 并把本轮真正的发货确认人记录为任务发起人。
+    workitem.status = "OPEN"
     workitem.actor_openid = actor_openid
     workitem.done_by_openid = ""
     workitem.done_at = None
     workitem.save(
         update_fields=(
+            "status",
             "actor_openid",
             "done_by_openid",
             "done_at",
@@ -180,6 +192,19 @@ def _publish_stock_outbound_task(plan):
     return workitem
 
 
+def publish_stock_outbound_preparation_task(*, plan):
+    """全退货库存订单在创建时直接通知库管打印新二维码并发货。
+
+    任务使用与最终出库相同的 uniq_key；全部二维码打印后，
+    只更新这一条任务为“待发货”，不再制造第二条任务。
+    """
+
+    _ensure_shipment_authorized(plan)
+    if plan.status not in ELIGIBLE_STATUSES:
+        return None
+    return _publish_stock_outbound_task(plan, qrcodes_ready=False)
+
+
 def publish_stock_outbound_task_if_ready(plan):
     """销售已授权且全部二维码已打印时，发布或重新打开库管出库任务。"""
     _ensure_shipment_authorized(plan)
@@ -187,54 +212,65 @@ def publish_stock_outbound_task_if_ready(plan):
         return False
     if plan.items.filter(qrcode_printed_at__isnull=True).exists():
         return False
-    _publish_stock_outbound_task(plan)
+    _publish_stock_outbound_task(plan, qrcodes_ready=True)
     return True
 
 
 @transaction.atomic
 def generate_item_qrcodes(*, item_id):
     item = _get_item(item_id, lock=True)
-    batch, created = ProductionBatch.objects.select_for_update().get_or_create(
-        batch_no=item.order_batch_code,
-        defaults={
-            "product_model": item.product_model,
-            "bom": item.bom_confirmation.confirmed_bom,
-            "manufacturer": item.plan.factory_organization,
-            "production_date": timezone.localdate(),
-            "quantity": item.quantity,
-        },
+    devices = []
+    if item.production_quantity > 0:
+        batch, created = ProductionBatch.objects.select_for_update().get_or_create(
+            batch_no=item.order_batch_code,
+            defaults={
+                "product_model": item.product_model,
+                "bom": item.bom_confirmation.confirmed_bom,
+                "manufacturer": item.plan.factory_organization,
+                "production_date": timezone.localdate(),
+                "quantity": item.production_quantity,
+            },
+        )
+        if not created:
+            expected = (
+                item.product_model_id,
+                item.bom_confirmation.confirmed_bom_id,
+                item.plan.factory_organization_id,
+                item.production_quantity,
+            )
+            actual = (
+                batch.product_model_id,
+                batch.bom_id,
+                batch.manufacturer_id,
+                batch.quantity,
+            )
+            if actual != expected:
+                raise OrderQRCodePrintError(
+                    "现有生产批次与订单新生产数量不一致，请停止打印并检查数据。"
+                )
+
+        devices = list(batch.devices.select_related("qrcode").order_by("id"))
+        if len(devices) > item.production_quantity:
+            raise OrderQRCodePrintError("该生产批次的设备数超过新生产数量。")
+        while len(devices) < item.production_quantity:
+            device = LifecycleService.create_device(
+                product_model=item.product_model,
+                operator=item.plan.created_by,
+                organization=item.plan.factory_organization,
+                batch=batch,
+            )
+            devices.append(device)
+
+        devices = list(batch.devices.select_related("qrcode").order_by("id"))
+        if any(not hasattr(device, "qrcode") for device in devices):
+            raise OrderQRCodePrintError("生产批次中存在未绑定二维码的设备。")
+
+    reissue_qrcodes = ensure_reissue_qrcodes(
+        order_plan_item=item,
+        actor=item.plan.created_by,
     )
-    if not created:
-        expected = (
-            item.product_model_id,
-            item.bom_confirmation.confirmed_bom_id,
-            item.plan.factory_organization_id,
-            item.quantity,
-        )
-        actual = (
-            batch.product_model_id,
-            batch.bom_id,
-            batch.manufacturer_id,
-            batch.quantity,
-        )
-        if actual != expected:
-            raise OrderQRCodePrintError("现有生产批次与订单产品明细不一致，请停止打印并检查数据。")
-
-    devices = list(batch.devices.select_related("qrcode").order_by("id"))
-    if len(devices) > item.quantity:
-        raise OrderQRCodePrintError("该生产批次的设备数超过订单数量，请停止打印并检查数据。")
-    while len(devices) < item.quantity:
-        device = LifecycleService.create_device(
-            product_model=item.product_model,
-            operator=item.plan.created_by,
-            organization=item.plan.factory_organization,
-            batch=batch,
-        )
-        devices.append(device)
-
-    devices = list(batch.devices.select_related("qrcode").order_by("id"))
-    if any(not hasattr(device, "qrcode") for device in devices):
-        raise OrderQRCodePrintError("生产批次中存在未绑定二维码的设备。")
+    if len(devices) + len(reissue_qrcodes) != item.quantity:
+        raise OrderQRCodePrintError("新生产设备与退货库存设备合计数量不等于订单需求。")
 
     if item.qrcode_generated_at is None:
         item.qrcode_generated_at = timezone.now()
@@ -245,6 +281,13 @@ def generate_item_qrcodes(*, item_id):
         "qrcodes": [
             {"device_sn": device.sn, "code": device.qrcode.code}
             for device in devices
+        ] + [
+            {
+                "device_sn": qrcode.device.sn,
+                "code": qrcode.code,
+                "source": "RETURN_INVENTORY",
+            }
+            for qrcode in reissue_qrcodes
         ],
     }
 
@@ -275,9 +318,21 @@ def confirm_item_printed(*, item_id):
     _ensure_shipment_authorized(plan)
     if not item.qrcode_generated_at:
         raise OrderQRCodePrintError("请先生成该产品型号的全部二维码。")
-    batch = ProductionBatch.objects.filter(batch_no=item.order_batch_code).first()
-    if not batch or batch.devices.count() != item.quantity:
-        raise OrderQRCodePrintError("二维码数量尚未达到订单计划数量。")
+    production_count = 0
+    if item.production_quantity > 0:
+        batch = ProductionBatch.objects.filter(batch_no=item.order_batch_code).first()
+        if not batch:
+            raise OrderQRCodePrintError("新生产设备二维码尚未生成。")
+        production_count = batch.devices.count()
+    reissue_count = item.return_inventory_allocations.filter(
+        replacement_qr__isnull=False
+    ).count()
+    if (
+        production_count != item.production_quantity
+        or reissue_count != item.return_inventory_quantity
+        or production_count + reissue_count != item.quantity
+    ):
+        raise OrderQRCodePrintError("二维码数量尚未达到订单总需求数量。")
     item.qrcode_printed_at = timezone.now()
     item.save(update_fields=("qrcode_printed_at", "updated_at"))
     remaining = plan.items.filter(qrcode_printed_at__isnull=True).count()

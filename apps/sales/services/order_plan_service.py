@@ -15,6 +15,15 @@ from lifecycle.utils.id_generator import gen_life_id
 from product.models import BOM, Brand, ProductModel
 from sales.models import OrderPlan, OrderPlanItem
 from sales.services.order_finance_service import initialize_order_finance
+from sales.services.order_plan_reissue_service import (
+    get_return_inventory_options,
+    mark_return_inventory_ready_to_ship,
+    reserve_return_inventory,
+    serialize_item_reissue,
+)
+from sales.services.order_qrcode_print_service import (
+    publish_stock_outbound_preparation_task,
+)
 from workflow.services.workflow_service import publish_workitem
 
 
@@ -182,6 +191,23 @@ def get_order_plan_options(user):
     }
 
 
+def get_order_plan_reissue_options(*, user, merchant_id, product_model_id):
+    identity = _get_sales_identity(user)
+    relation = _get_direct_relation(user, identity, merchant_id)
+    try:
+        product_model_id = int(product_model_id)
+    except (TypeError, ValueError) as exc:
+        raise OrderPlanError("请选择有效的产品型号") from exc
+    product_model = ProductModel.objects.filter(pk=product_model_id).first()
+    if not product_model:
+        raise OrderPlanError("产品型号不存在")
+    return get_return_inventory_options(
+        factory_organization=identity.organization,
+        merchant_organization=relation.target_organization,
+        product_model=product_model,
+    )
+
+
 @transaction.atomic
 def configure_direct_merchant(*, user, merchant_id, brand_id, region):
     identity = _get_sales_identity(user)
@@ -259,7 +285,12 @@ def _validated_items(raw_items):
         if model_id in model_ids:
             raise OrderPlanError("同一个产品型号不能重复添加")
         model_ids.add(model_id)
-        parsed.append((index, category_id, model_id, quantity))
+        use_return_inventory = raw_item.get("use_return_inventory", False)
+        if not isinstance(use_return_inventory, bool):
+            raise OrderPlanError(f"第{index}项退货库存选择格式不正确")
+        parsed.append(
+            (index, category_id, model_id, quantity, use_return_inventory)
+        )
 
     product_models = {
         product_model.pk: product_model
@@ -268,7 +299,7 @@ def _validated_items(raw_items):
     }
 
     result = []
-    for index, category_id, model_id, quantity in parsed:
+    for index, category_id, model_id, quantity, use_return_inventory in parsed:
         product_model = product_models.get(model_id)
         if not product_model:
             raise OrderPlanError(f"第{index}项产品型号不存在")
@@ -280,7 +311,9 @@ def _validated_items(raw_items):
             is_active=True,
         ).exists():
             raise OrderPlanError(f"{product_model.name}尚未建立有效的v1版BOM")
-        result.append((product_model.category, product_model, quantity))
+        result.append(
+            (product_model.category, product_model, quantity, use_return_inventory)
+        )
     return result
 
 
@@ -345,7 +378,7 @@ def _serialize_plan(plan):
         "remark": plan.remark,
         "submitted_at": plan.submitted_at.isoformat(),
         "items": [
-            {
+            dict({
                 "id": item.pk,
                 "category_id": item.category_id,
                 "category_name": item.category.name,
@@ -356,7 +389,7 @@ def _serialize_plan(plan):
                 "order_batch_code": item.order_batch_code,
                 "lifecycle_code": item.lifecycle_code,
                 "status": item.status,
-            }
+            }, **serialize_item_reissue(item))
             for item in plan.items.select_related("category", "product_model").all()
         ],
     }
@@ -406,10 +439,6 @@ def create_order_plan(
         raise OrderPlanError("请先为该直接商家指定负责区域和品牌")
 
     validated_items = _validated_items(items)
-    matching_openids = _matching_openids(identity.organization)
-    if not matching_openids:
-        raise OrderPlanError("厂家尚未配置有效的配套经理账号，暂时无法提交")
-
     total_quantity = sum(item[2] for item in validated_items)
     plan = OrderPlan.objects.create(
         plan_code=_new_code("OP"),
@@ -426,59 +455,118 @@ def create_order_plan(
         remark=str(remark or "").strip()[:2000],
     )
 
-    for category, product_model, quantity in validated_items:
-        OrderPlanItem.objects.create(
+    created_items = []
+    for category, product_model, quantity, use_return_inventory in validated_items:
+        order_item = OrderPlanItem.objects.create(
             plan=plan,
             category=category,
             product_model=product_model,
             quantity=quantity,
+            return_inventory_quantity=0,
+            production_quantity=quantity,
             order_batch_code=_new_code("OB", product_model.code),
             lifecycle_code=gen_life_id(),
         )
+        allocations = reserve_return_inventory(
+            order_plan_item=order_item,
+            requested_quantity=quantity if use_return_inventory else 0,
+            actor=user,
+        )
+        order_item.return_inventory_quantity = len(allocations)
+        order_item.production_quantity = quantity - len(allocations)
+        order_item.save(
+            update_fields=(
+                "return_inventory_quantity",
+                "production_quantity",
+                "updated_at",
+            )
+        )
+        created_items.append(order_item)
+
+    production_total = sum(item.production_quantity for item in created_items)
+    return_inventory_total = sum(
+        item.return_inventory_quantity for item in created_items
+    )
 
     model_summary = "、".join(
-        f"{product_model.name}×{quantity}"
-        for _category, product_model, quantity in validated_items
-    )
-    publish_workitem(
-        domain="SALES",
-        type="ORDER_PLAN_MATCHING",
-        biz_id=plan.plan_code,
-        biz_ref=f"sales.OrderPlan:{plan.pk}",
-        uniq_key=f"sales:order-plan:{plan.pk}:matching",
-        title="新订单计划待配套",
-        summary=(
-            f"{relation.target_organization.name}｜{assignment.region}｜"
-            f"{assignment.brand.name}｜{model_summary}"
-        ),
-        link=(
-            "/pages/sales/matching_confirm/matching_confirm"
-            f"?order_plan_id={plan.pk}"
-        ),
-        recipients_openids=matching_openids,
-        need_action=True,
-        action_mode="ANYONE_DO",
-        payload={
-            "order_plan_id": plan.pk,
-            "plan_code": plan.plan_code,
-            "merchant_id": relation.target_organization_id,
-            "merchant_name": relation.target_organization.name,
-            "brand_id": assignment.brand_id,
-            "brand_name": assignment.brand.name,
-            "region": assignment.region,
-            "total_quantity": total_quantity,
-        },
-        actor_openid=user.wx_openid or "",
-        mark_workitem_done_immediately=False,
-    )
-
-    production_openids = _production_openids(identity.organization)
-    if production_openids:
-        creator_name = (
-            user.wx_nickname
-            or user.get_full_name()
-            or user.username
+        (
+            f"{item.product_model.name}×{item.quantity}"
+            f"（退货库存{item.return_inventory_quantity}，"
+            f"新生产{item.production_quantity}）"
         )
+        for item in created_items
+    )
+    if production_total:
+        production_openids = _production_openids(identity.organization)
+        if not production_openids:
+            raise OrderPlanError("厂家尚未配置有效生产经理，暂时无法提交订单")
+        matching_openids = _matching_openids(identity.organization)
+        if not matching_openids:
+            raise OrderPlanError("厂家尚未配置有效的配套经理账号，暂时无法提交")
+        for item in created_items:
+            if item.production_quantity == 0:
+                item.status = OrderPlan.Status.MATCHING_COMPLETED
+                item.save(update_fields=("status", "updated_at"))
+        publish_workitem(
+            domain="SALES",
+            type="ORDER_PLAN_MATCHING",
+            biz_id=plan.plan_code,
+            biz_ref=f"sales.OrderPlan:{plan.pk}",
+            uniq_key=f"sales:order-plan:{plan.pk}:matching",
+            title="新订单计划待配套",
+            summary=(
+                f"{relation.target_organization.name}｜{assignment.region}｜"
+                f"{assignment.brand.name}｜{model_summary}"
+            ),
+            link=(
+                "/pages/sales/matching_confirm/matching_confirm"
+                f"?order_plan_id={plan.pk}"
+            ),
+            recipients_openids=matching_openids,
+            need_action=True,
+            action_mode="ANYONE_DO",
+            payload={
+                "order_plan_id": plan.pk,
+                "plan_code": plan.plan_code,
+                "merchant_id": relation.target_organization_id,
+                "merchant_name": relation.target_organization.name,
+                "brand_id": assignment.brand_id,
+                "brand_name": assignment.brand.name,
+                "region": assignment.region,
+                "total_quantity": total_quantity,
+                "return_inventory_quantity": return_inventory_total,
+                "production_quantity": production_total,
+            },
+            actor_openid=user.wx_openid or "",
+            mark_workitem_done_immediately=False,
+        )
+    else:
+        # 整单全部由已完成退货处置的待流转库存满足时，不存在
+        # 新的配套和生产事实。创建订单的销售经理已经明确了本次
+        # 重新流转，因此在同一事务内完成发货确认，直接进入新
+        # 二维码打印与库房发货阶段。
+        now = timezone.now()
+        plan.status = OrderPlan.Status.PRODUCTION_COMPLETED
+        plan.shipment_authorized_at = now
+        plan.shipment_authorized_by = user
+        plan.save(
+            update_fields=(
+                "status",
+                "shipment_authorized_at",
+                "shipment_authorized_by",
+                "updated_at",
+            )
+        )
+        plan.items.update(status=OrderPlan.Status.PRODUCTION_COMPLETED)
+        mark_return_inventory_ready_to_ship(plan=plan)
+        publish_stock_outbound_preparation_task(plan=plan)
+
+    creator_name = (
+        user.wx_nickname
+        or user.get_full_name()
+        or user.username
+    )
+    if production_total:
         publish_workitem(
             domain="SALES",
             type="ORDER_PLAN_CREATED_PRODUCTION_NOTICE",
@@ -502,6 +590,8 @@ def create_order_plan(
                 "brand_name": assignment.brand.name,
                 "region": assignment.region,
                 "total_quantity": total_quantity,
+                "return_inventory_quantity": return_inventory_total,
+                "production_quantity": production_total,
             },
             actor_openid=user.wx_openid or "",
             mark_workitem_done_immediately=True,

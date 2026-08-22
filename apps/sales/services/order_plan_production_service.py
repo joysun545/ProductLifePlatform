@@ -15,6 +15,9 @@ from sales.services.order_plan_shipment_authorization_service import (
     publish_shipment_authorization_task,
 )
 from sales.services.order_logistics_service import publish_logistics_upload_task
+from sales.services.order_plan_reissue_service import (
+    mark_return_inventory_ready_to_ship,
+)
 
 
 class OrderPlanProductionError(Exception):
@@ -60,6 +63,8 @@ def _item_data(item):
         "product_model_code": item.product_model.code,
         "product_model_name": item.product_model.name,
         "quantity": item.quantity,
+        "return_inventory_quantity": item.return_inventory_quantity,
+        "production_quantity": item.production_quantity,
         "order_batch_code": item.order_batch_code,
         "lifecycle_code": item.lifecycle_code,
     }
@@ -103,6 +108,7 @@ def confirm_order_plan_production(*, user, plan_id):
     plan.status = OrderPlan.Status.PRODUCTION_COMPLETED
     plan.save(update_fields=("status", "updated_at"))
     plan.items.update(status=OrderPlan.Status.PRODUCTION_COMPLETED)
+    mark_return_inventory_ready_to_ship(plan=plan)
 
     item_rows = [_item_data(item) for item in _items(plan)]
     common = {

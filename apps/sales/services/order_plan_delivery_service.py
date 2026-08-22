@@ -55,6 +55,45 @@ def _context(user, plan_id, *, lock=False):
     return identity, plan, supplier_tasks, aggregate
 
 
+def publish_production_confirmation_task(*, plan, actor_openid=""):
+    """存在新生产数量的订单，在物料到齐后进入生产确认节点。"""
+
+    production = sum(item.production_quantity for item in plan.items.all())
+    if production <= 0:
+        # 防御性约束：全量调用退货待流转库存时，不论由哪个入口
+        # 触发本服务，都不得产生厂家生产经理任务。
+        return None
+    production_openids = _role_openids(plan.factory_organization, "factory_production")
+    if not production_openids:
+        return None
+    reused = sum(item.return_inventory_quantity for item in plan.items.all())
+    return publish_workitem(
+        domain="SALES",
+        type="ORDER_PLAN_PRODUCTION_CONFIRM",
+        biz_id=plan.plan_code,
+        biz_ref=f"sales.OrderPlan:{plan.pk}",
+        uniq_key=f"sales:order-plan:{plan.pk}:production-confirm",
+        title="确认生产完成",
+        summary=(
+            f"{plan.merchant_organization.name}｜{plan.brand.name}｜"
+            f"总需求{plan.total_quantity}台｜调用退货库存{reused}台｜新生产{production}台"
+        ),
+        link="/pages/sales/order_plan_list/order_plan_list",
+        recipients_openids=production_openids,
+        need_action=True,
+        action_mode="ANYONE_DO",
+        payload={
+            "order_plan_id": plan.pk,
+            "plan_code": plan.plan_code,
+            "total_quantity": plan.total_quantity,
+            "return_inventory_quantity": reused,
+            "production_quantity": production,
+        },
+        actor_openid=actor_openid,
+        mark_workitem_done_immediately=False,
+    )
+
+
 def _serialize(plan, supplier_tasks, aggregate):
     suppliers = []
     material_statuses = []
@@ -129,19 +168,10 @@ def confirm_order_plan_delivery(*, user, plan_id):
     plan.items.update(status=OrderPlan.Status.PRODUCTION_PENDING)
 
     common_payload = {"order_plan_id": plan.pk, "plan_code": plan.plan_code}
-    production_openids = _role_openids(plan.factory_organization, "factory_production")
-    if production_openids:
-        publish_workitem(
-            domain="SALES", type="ORDER_PLAN_PRODUCTION_CONFIRM",
-            biz_id=plan.plan_code, biz_ref=f"sales.OrderPlan:{plan.pk}",
-            uniq_key=f"sales:order-plan:{plan.pk}:production-confirm",
-            title="确认生产完成",
-            summary=f"{plan.merchant_organization.name}｜{plan.brand.name}｜共{plan.total_quantity}台",
-            link="/pages/sales/order_plan_list/order_plan_list",
-            recipients_openids=production_openids, need_action=True,
-            action_mode="ANYONE_DO", payload=common_payload,
-            actor_openid=user.wx_openid or "", mark_workitem_done_immediately=False,
-        )
+    publish_production_confirmation_task(
+        plan=plan,
+        actor_openid=user.wx_openid or "",
+    )
     sales_openid = plan.created_by.wx_openid or ""
     if sales_openid:
         publish_workitem(

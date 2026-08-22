@@ -8,6 +8,7 @@ from account.services.auth_service import (
 )
 
 from workflow.services.task_query import (
+    get_task_group,
     get_task_summary,
     get_task_list,
 )
@@ -69,6 +70,26 @@ class TaskListAPI(APIView):
         return Response({
             "code": 0,
             "data": data
+        })
+
+
+class TaskGroupAPI(APIView):
+
+    def get(self, request):
+        openid, error_response = authenticated_openid(request)
+        if error_response:
+            return error_response
+
+        data = get_task_group(openid, request.GET.get("group_id"))
+        if data is None:
+            return Response(
+                {"code": 1, "msg": "任务组不存在或无权查看", "data": {}},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        return Response({
+            "code": 0,
+            "data": data,
         })
 
 

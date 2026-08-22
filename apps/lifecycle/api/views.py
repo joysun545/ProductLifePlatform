@@ -92,10 +92,13 @@ from lifecycle.services.factory_return_service import (
     get_factory_return_document_file,
     get_factory_return_inventory,
     get_factory_return_process,
+    get_supplier_warranty_lists,
+    get_supplier_warranty_dispatch,
     post_factory_return_inventory,
     process_factory_return_matching_item,
     process_factory_return_production_item,
     record_factory_return_credit_amount,
+    receive_supplier_warranty_dispatch,
     upload_factory_return_document,
 )
 
@@ -425,6 +428,61 @@ class FactoryReturnMatchingActionAPI(APIView):
         return Response({
             "code": 0,
             "msg": "配套处置已保存" if changed else "配套处置未变化",
+            "data": data,
+        })
+
+
+class SupplierWarrantyDispatchAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request, dispatch_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            data = get_supplier_warranty_dispatch(
+                user=user,
+                dispatch_id=dispatch_id,
+            )
+        except FactoryReturnProcessError as exc:
+            return _factory_return_process_error(exc)
+        return Response({"code": 0, "msg": "success", "data": data})
+
+
+class SupplierWarrantyListsAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            data = get_supplier_warranty_lists(user=user)
+        except FactoryReturnProcessError as exc:
+            return _factory_return_process_error(exc)
+        return Response({"code": 0, "msg": "success", "data": data})
+
+
+class SupplierWarrantyDispatchReceiveAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, dispatch_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            data, changed = receive_supplier_warranty_dispatch(
+                user=user,
+                dispatch_id=dispatch_id,
+            )
+        except FactoryReturnProcessError as exc:
+            return _factory_return_process_error(exc)
+        return Response({
+            "code": 0,
+            "msg": "三包物料通知已接收" if changed else "知晓任务无需重复确认",
             "data": data,
         })
 

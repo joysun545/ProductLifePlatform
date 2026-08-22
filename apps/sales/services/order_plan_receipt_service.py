@@ -5,6 +5,7 @@ from account.models import UserOrganization
 from lifecycle.models import Device, DeviceState, LifecycleEvent, OrganizationDevice
 from manufacturing.models import ProductionBatch
 from sales.models import OrderPlan
+from sales.services.order_plan_reissue_service import mark_return_inventory_reissued
 from workflow.models import WorkItem
 from workflow.services.workflow_service import publish_workitem
 
@@ -142,19 +143,39 @@ def _existing_plan_event(*, device, event_type, plan):
 def _devices(plan):
     result = []
     for item in plan.items.select_related("product_model"):
-        batch = ProductionBatch.objects.filter(
-            batch_no=item.order_batch_code,
-            manufacturer=plan.factory_organization,
-            product_model=item.product_model,
-        ).first()
-        if not batch:
-            raise OrderPlanReceiptError(f"订单批次 {item.order_batch_code} 尚未生成设备。")
-        devices = list(Device.objects.filter(batch=batch).order_by("id"))
-        if len(devices) != item.quantity:
+        devices = []
+        if item.production_quantity > 0:
+            batch = ProductionBatch.objects.filter(
+                batch_no=item.order_batch_code,
+                manufacturer=plan.factory_organization,
+                product_model=item.product_model,
+            ).first()
+            if not batch:
+                raise OrderPlanReceiptError(
+                    f"订单批次 {item.order_batch_code} 尚未生成新设备。"
+                )
+            devices = list(Device.objects.filter(batch=batch).order_by("id"))
+            if len(devices) != item.production_quantity:
+                raise OrderPlanReceiptError(
+                    f"{item.product_model.name} 应新生产 {item.production_quantity} 台，"
+                    f"实际找到 {len(devices)} 台。"
+                )
+        reissue_devices = [
+            allocation.source_device
+            for allocation in item.return_inventory_allocations.select_related(
+                "source_device", "replacement_qr"
+            ).order_by("id")
+        ]
+        if len(reissue_devices) != item.return_inventory_quantity:
             raise OrderPlanReceiptError(
-                f"{item.product_model.name} 应有 {item.quantity} 台，实际找到 {len(devices)} 台。"
+                f"{item.product_model.name} 应调用退货库存 "
+                f"{item.return_inventory_quantity} 台，实际找到 {len(reissue_devices)} 台。"
             )
-        result.extend(devices)
+        if len(devices) + len(reissue_devices) != item.quantity:
+            raise OrderPlanReceiptError(
+                f"{item.product_model.name} 新生产与退货库存合计数量不正确。"
+            )
+        result.extend(devices + reissue_devices)
     return result
 
 
@@ -189,6 +210,7 @@ def mark_devices_shipped(*, plan, user, now):
                 "last_event": event,
             },
         )
+    mark_return_inventory_reissued(plan=plan)
 
 
 def _mark_devices_received(*, plan, user, now):

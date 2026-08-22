@@ -9,6 +9,7 @@ from sales.services.order_plan_service import (
     configure_direct_merchant,
     create_order_plan,
     get_order_plan_options,
+    get_order_plan_reissue_options,
 )
 from sales.services.order_plan_matching_service import (
     OrderPlanMatchingError,
@@ -93,6 +94,23 @@ def order_plan_options(request):
         return error_response
     try:
         data = get_order_plan_options(user)
+    except OrderPlanError as exc:
+        return JsonResponse({"code": 1, "msg": str(exc), "data": {}}, status=200)
+    return JsonResponse({"code": 0, "msg": "", "data": data}, status=200)
+
+
+def order_plan_reissue_options(request):
+    if request.method != "GET":
+        return _method_error("GET")
+    user, error_response = _authenticated_user(request)
+    if error_response:
+        return error_response
+    try:
+        data = get_order_plan_reissue_options(
+            user=user,
+            merchant_id=request.GET.get("merchant_id"),
+            product_model_id=request.GET.get("product_model_id"),
+        )
     except OrderPlanError as exc:
         return JsonResponse({"code": 1, "msg": str(exc), "data": {}}, status=200)
     return JsonResponse({"code": 0, "msg": "", "data": data}, status=200)

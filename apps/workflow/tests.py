@@ -8,6 +8,7 @@ from workflow.models import UserTask, WorkItem
 class WorkflowTaskAuthenticationTests(TestCase):
     summary_url = "/pldp/api/workflow/task/summary/"
     list_url = "/pldp/api/workflow/task/list/"
+    group_url = "/pldp/api/workflow/task/group/"
     open_url = "/pldp/api/workflow/task/open/"
 
     def setUp(self):
@@ -130,3 +131,118 @@ class WorkflowTaskAuthenticationTests(TestCase):
         self.assertEqual(summary["action_pending_count"], 2)
         # 两类任务取并集，未读操作任务不能重复计数。
         self.assertEqual(summary["attention_count"], 3)
+
+    def test_factory_return_tasks_share_one_card_but_keep_real_children(self):
+        task_ids = []
+        for index, (domain, task_type, title) in enumerate((
+            (
+                "LOGISTICS",
+                "FACTORY_RETURN_DISASSEMBLY_PRODUCTION",
+                "退货设备待制定拆机处理",
+            ),
+            (
+                "AFTERSALE",
+                "FACTORY_RETURN_SUPPLIER_WARRANTY",
+                "厂家已推送拆机退回物料及自动质保结果",
+            ),
+            (
+                "SUPPLY_CHAIN",
+                "FACTORY_RETURN_SUPPLIER_REPAIR_MATERIAL",
+                "厂家退货修复需要原配套物料",
+            ),
+        ), start=1):
+            # WorkItem currently accepts deployed domain strings even when a
+            # newer business area is not yet included in display choices.
+            workitem = WorkItem.objects.create(
+                domain=domain,
+                type=task_type,
+                biz_id=f"return-child-{index}",
+                biz_ref=f"return-child:{index}",
+                title=title,
+                summary=f"第{index}项｜GF-TEST-GROUP-001",
+                link=(
+                    "/pages/stock/factory_return_process/"
+                    "factory_return_process?transfer_id=901"
+                ),
+                action_mode="EACH_ACK",
+                uniq_key=f"return-child-{index}-owner",
+                payload={"return_flow_no": "GF-TEST-GROUP-001"},
+            )
+            task_ids.append(
+                UserTask.objects.create(
+                    workitem=workitem,
+                    to_openid=self.user.wx_openid,
+                    state="NEW",
+                    need_action=False,
+                ).pk
+            )
+
+        response = self.client.get(
+            self.list_url,
+            HTTP_AUTHORIZATION=self.authorization,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        groups = [
+            item for item in response.json()["data"]["items"]
+            if item["grouped"]
+        ]
+        self.assertEqual(len(groups), 1)
+        group = groups[0]
+        self.assertEqual(group["child_count"], 3)
+        self.assertEqual(group["unread_count"], 3)
+        self.assertIn("factory_return_process?transfer_id=901", group["link"])
+        self.assertIn(f"task_group_id={group['group_id']}", group["link"])
+        self.assertIn(f"task_id={group['entry_task_id']}", group["link"])
+        self.assertIn(group["entry_task_id"], task_ids)
+        self.assertTrue(group["title"].endswith("……"))
+
+        detail_response = self.client.get(
+            self.group_url,
+            {"group_id": group["group_id"]},
+            HTTP_AUTHORIZATION=self.authorization,
+        )
+        self.assertEqual(detail_response.status_code, 200)
+        detail = detail_response.json()["data"]
+        self.assertEqual(
+            {item["id"] for item in detail["items"]},
+            set(task_ids),
+        )
+        # Opening the projected parent/detail must not acknowledge children.
+        self.assertEqual(
+            UserTask.objects.filter(pk__in=task_ids, state="NEW").count(),
+            3,
+        )
+
+        open_response = self.client.post(
+            self.open_url,
+            {"usertask_id": task_ids[0]},
+            HTTP_AUTHORIZATION=self.authorization,
+        )
+        self.assertEqual(open_response.status_code, 200)
+        self.assertEqual(
+            UserTask.objects.filter(pk__in=task_ids, state="NEW").count(),
+            2,
+        )
+
+        updated_detail = self.client.get(
+            self.group_url,
+            {"group_id": group["group_id"]},
+            HTTP_AUTHORIZATION=self.authorization,
+        ).json()["data"]
+        self.assertEqual(updated_detail["unread_count"], 2)
+
+    def test_task_group_cannot_be_read_by_another_account(self):
+        response = self.client.get(
+            self.list_url,
+            HTTP_AUTHORIZATION=self.authorization,
+        )
+        group_id = response.json()["data"]["items"][0]["group_id"]
+
+        forbidden = self.client.get(
+            self.group_url,
+            {"group_id": group_id},
+            HTTP_AUTHORIZATION=self.other_authorization,
+        )
+
+        self.assertEqual(forbidden.status_code, 404)

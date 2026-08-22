@@ -18,6 +18,11 @@ urlpatterns = [
         name="order_plan_options",
     ),
     path(
+        "order-plans/reissue-options/",
+        views.order_plan_reissue_options,
+        name="order_plan_reissue_options",
+    ),
+    path(
         "direct-merchants/configure/",
         views.configure_merchant_channel,
         name="configure_merchant_channel",

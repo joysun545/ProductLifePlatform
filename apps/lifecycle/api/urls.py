@@ -89,6 +89,24 @@ urlpatterns = [
     ),
 
     path(
+        "supplier-warranty-lists/",
+        views.SupplierWarrantyListsAPI.as_view(),
+        name="supplier_warranty_lists",
+    ),
+
+    path(
+        "factory-return-warranty-dispatches/<int:dispatch_id>/",
+        views.SupplierWarrantyDispatchAPI.as_view(),
+        name="supplier_warranty_dispatch",
+    ),
+
+    path(
+        "factory-return-warranty-dispatches/<int:dispatch_id>/receive/",
+        views.SupplierWarrantyDispatchReceiveAPI.as_view(),
+        name="supplier_warranty_dispatch_receive",
+    ),
+
+    path(
         "goods-transfers/<int:transfer_id>/factory-return/logistics-documents/",
         views.FactoryReturnLogisticsDocumentsAPI.as_view(),
         name="factory_return_logistics_documents",

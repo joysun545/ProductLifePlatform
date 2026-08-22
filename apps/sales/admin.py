@@ -8,6 +8,7 @@ from .models import (
     OrderPlanFinance,
     OrderPlanLogisticsDocument,
     OrderPlanPayment,
+    OrderPlanReturnInventoryAllocation,
     SalesPlan,
 )
 
@@ -15,7 +16,43 @@ from .models import (
 class OrderPlanItemInline(admin.TabularInline):
     model = OrderPlanItem
     extra = 0
-    readonly_fields = ("order_batch_code", "lifecycle_code", "created_at")
+    readonly_fields = (
+        "order_batch_code",
+        "lifecycle_code",
+        "return_inventory_quantity",
+        "production_quantity",
+        "created_at",
+    )
+
+
+@admin.register(OrderPlanReturnInventoryAllocation)
+class OrderPlanReturnInventoryAllocationAdmin(admin.ModelAdmin):
+    list_display = (
+        "order_plan_item",
+        "source_device",
+        "source_bom",
+        "status",
+        "reserved_by",
+        "reserved_at",
+        "reissued_at",
+    )
+    list_filter = ("status", "source_bom")
+    search_fields = (
+        "order_plan_item__plan__plan_code",
+        "order_plan_item__order_batch_code",
+        "source_device__sn",
+        "source_qr_code_snapshot",
+    )
+    readonly_fields = (
+        "source_order_batch_snapshot",
+        "source_lifecycle_snapshot",
+        "source_qr_code_snapshot",
+        "reserved_at",
+        "ready_to_ship_at",
+        "reissued_at",
+        "created_at",
+        "updated_at",
+    )
 
 
 @admin.register(OrderPlanItemBOMConfirmation)

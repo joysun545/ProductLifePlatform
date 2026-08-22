@@ -20,7 +20,18 @@ from account.models import (
 )
 from account.services.auth_service import issue_access_token
 from channel.models import MerchantChannelAssignment
-from lifecycle.models import DeviceState, LifecycleEvent, OrganizationDevice
+from lifecycle.models import (
+    Device,
+    DeviceState,
+    FactoryReturnInventoryItem,
+    FactoryReturnProcess,
+    GoodsTransfer,
+    GoodsTransferItem,
+    LifecycleEvent,
+    OrganizationDevice,
+    QRCode,
+)
+from manufacturing.models import ProductionBatch
 from product.models import BOM, BOMItem, Brand, ProductCategory, ProductModel
 from sales.services.order_qrcode_print_service import (
     OrderQRCodePrintError,
@@ -35,6 +46,7 @@ from sales.models import (
     OrderPlanFinance,
     OrderPlanLogisticsDocument,
     OrderPlanPayment,
+    OrderPlanReturnInventoryAllocation,
 )
 from supply_chain.models import (
     Material,
@@ -439,6 +451,91 @@ class OrderPlanApiTests(TestCase):
             supplier=self.supplier,
         )
         return material, spec
+
+    def _create_return_inventory(self, count, product_model=None):
+        """建立已完成退厂分类、可被新订单逐台预占的真实链路库存。"""
+
+        product_model = product_model or self.generator
+        bom = product_model.boms.get(version="v1")
+        now = timezone.now()
+        suffix = (
+            f"{timezone.now().strftime('%H%M%S%f')}-"
+            f"{GoodsTransfer.objects.count()}"
+        )
+        batch = ProductionBatch.objects.create(
+            batch_no=f"RETURN-BATCH-{suffix}",
+            product_model=product_model,
+            bom=bom,
+            manufacturer=self.factory,
+            production_date=timezone.localdate(),
+            quantity=count,
+        )
+        transfer = GoodsTransfer.objects.create(
+            flow_no=f"RETURN-FLOW-{suffix}",
+            client_request_id=f"return-request-{suffix}",
+            flow_type=GoodsTransfer.FlowType.RETURN,
+            status=GoodsTransfer.Status.COMPLETED,
+            instruction_organization=self.merchant,
+            from_organization=self.merchant,
+            to_organization=self.factory,
+            source_account=self.merchant_owner,
+            target_account=self.sales_user,
+            initiated_by=self.merchant_owner,
+            received_by=self.sales_user,
+            submitted_at=now,
+            received_at=now,
+            completed_at=now,
+        )
+        process = FactoryReturnProcess.objects.create(
+            transfer=transfer,
+            phase=FactoryReturnProcess.Phase.POSTED,
+            picked_by=self.factory_logistics_1,
+            picked_at=now,
+            posted_by=self.factory_assistant_1,
+            posted_at=now,
+        )
+        inventory_items = []
+        for index in range(count):
+            device = Device.objects.create(
+                sn=f"RETURN-SN-{suffix}-{index + 1}",
+                product_model=product_model,
+                batch=batch,
+            )
+            QRCode.objects.create(
+                code=f"RETURN-QR-{suffix}-{index + 1}",
+                device=device,
+                status="DISABLED",
+                created_by=self.sales_user,
+                disabled_at=now,
+            )
+            transfer_item = GoodsTransferItem.objects.create(
+                transfer=transfer,
+                device=device,
+                status=GoodsTransferItem.Status.COMPLETED,
+                scanned_by=self.merchant_owner,
+                completed_at=now,
+            )
+            inventory_items.append(
+                FactoryReturnInventoryItem.objects.create(
+                    process=process,
+                    transfer_item=transfer_item,
+                    source_product_model=product_model,
+                    source_production_batch=batch,
+                    source_bom=bom,
+                    stock_status=(
+                        FactoryReturnInventoryItem.StockStatus.PENDING_REISSUE
+                    ),
+                    classified_by=self.factory_assistant_1,
+                    classified_at=now,
+                    production_status=(
+                        FactoryReturnInventoryItem.ProductionStatus.NOT_REQUIRED
+                    ),
+                    matching_status=(
+                        FactoryReturnInventoryItem.MatchingStatus.NOT_REQUIRED
+                    ),
+                )
+            )
+        return inventory_items
 
     def _create_payload(self, client_request_id="order-request-1"):
         return {
@@ -1536,6 +1633,15 @@ class OrderPlanApiTests(TestCase):
                 second_sales.wx_openid,
             },
         )
+        self.assertEqual(workitem.payload["responsibility_snapshot_version"], 1)
+        self.assertEqual(
+            workitem.payload["initial_responsible_sales_identity_ids"],
+            workitem.payload["responsible_sales_identity_ids"],
+        )
+        self.assertEqual(
+            workitem.payload["initial_recipient_scopes"],
+            workitem.payload["recipient_scopes"],
+        )
 
         first_response = self._get_list(self.supplier_sales_authorization)
         second_response = self._get_list(
@@ -1900,6 +2006,168 @@ class OrderPlanApiTests(TestCase):
                 f"?order_plan_id={plan.pk}"
             ),
         )
+
+    def test_create_order_partially_uses_return_inventory_and_only_matches_new_production(self):
+        return_items = self._create_return_inventory(2)
+        payload = {
+            "merchant_id": self.merchant.pk,
+            "client_request_id": "order-partial-return-inventory",
+            "items": [
+                {
+                    "category_id": self.generator_category.pk,
+                    "product_model_id": self.generator.pk,
+                    "quantity": 3,
+                    "use_return_inventory": True,
+                }
+            ],
+        }
+
+        response = self.client.post(
+            self.create_url,
+            data=json.dumps(payload),
+            content_type="application/json",
+            HTTP_AUTHORIZATION=self.authorization,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["code"], 0, response.json())
+        plan = OrderPlan.objects.get(client_request_id=payload["client_request_id"])
+        item = plan.items.get()
+        self.assertEqual(plan.total_quantity, 3)
+        self.assertEqual(plan.status, OrderPlan.Status.MATCHING_PENDING)
+        self.assertEqual(item.quantity, 3)
+        self.assertEqual(item.return_inventory_quantity, 2)
+        self.assertEqual(item.production_quantity, 1)
+        allocations = OrderPlanReturnInventoryAllocation.objects.filter(
+            order_plan_item=item
+        )
+        self.assertEqual(allocations.count(), 2)
+        self.assertSetEqual(
+            set(allocations.values_list("inventory_item_id", flat=True)),
+            {row.pk for row in return_items},
+        )
+        self.assertEqual(
+            FactoryReturnInventoryItem.objects.filter(
+                pk__in=[row.pk for row in return_items],
+                stock_status=(
+                    FactoryReturnInventoryItem.StockStatus.RESERVED_FOR_ORDER
+                ),
+            ).count(),
+            2,
+        )
+        matching_workitem = WorkItem.objects.get(
+            type="ORDER_PLAN_MATCHING",
+            biz_id=plan.plan_code,
+        )
+        self.assertEqual(matching_workitem.payload["total_quantity"], 3)
+        self.assertEqual(matching_workitem.payload["return_inventory_quantity"], 2)
+        self.assertEqual(matching_workitem.payload["production_quantity"], 1)
+
+        options_response = self.client.get(
+            (
+                "/pldp/api/sales/order-plans/reissue-options/"
+                f"?merchant_id={self.merchant.pk}"
+                f"&product_model_id={self.generator.pk}"
+            ),
+            HTTP_AUTHORIZATION=self.authorization,
+        )
+        self.assertEqual(options_response.json()["code"], 0, options_response.json())
+        self.assertEqual(options_response.json()["data"]["available_count"], 0)
+
+    def test_create_order_fully_uses_return_inventory_and_bypasses_matching(self):
+        return_items = self._create_return_inventory(2)
+        # 该路径本身不需要生产经理参与；即使当前厂家暂时没有有效
+        # 生产经理槽位，也应能直接进入新二维码打印和库房发货。
+        UserOrganization.objects.filter(
+            user=self.factory_production,
+            role=self.factory_production_role,
+        ).update(is_active=False)
+        payload = {
+            "merchant_id": self.merchant.pk,
+            "client_request_id": "order-full-return-inventory",
+            "items": [
+                {
+                    "category_id": self.generator_category.pk,
+                    "product_model_id": self.generator.pk,
+                    "quantity": 2,
+                    "use_return_inventory": True,
+                }
+            ],
+        }
+
+        response = self.client.post(
+            self.create_url,
+            data=json.dumps(payload),
+            content_type="application/json",
+            HTTP_AUTHORIZATION=self.authorization,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["code"], 0, response.json())
+        plan = OrderPlan.objects.get(client_request_id=payload["client_request_id"])
+        item = plan.items.get()
+        self.assertEqual(plan.total_quantity, 2)
+        self.assertEqual(plan.status, OrderPlan.Status.PRODUCTION_COMPLETED)
+        self.assertEqual(plan.shipment_authorized_by, self.sales_user)
+        self.assertIsNotNone(plan.shipment_authorized_at)
+        self.assertEqual(item.quantity, 2)
+        self.assertEqual(item.return_inventory_quantity, 2)
+        self.assertEqual(item.production_quantity, 0)
+        self.assertFalse(
+            WorkItem.objects.filter(
+                type="ORDER_PLAN_MATCHING",
+                biz_id=plan.plan_code,
+            ).exists()
+        )
+        self.assertFalse(
+            WorkItem.objects.filter(
+                type__in=(
+                    "ORDER_PLAN_PRODUCTION_CONFIRM",
+                    "ORDER_PLAN_CREATED_PRODUCTION_NOTICE",
+                ),
+                biz_id=plan.plan_code,
+            ).exists()
+        )
+        self.assertEqual(
+            FactoryReturnInventoryItem.objects.filter(
+                pk__in=[row.pk for row in return_items],
+                stock_status=FactoryReturnInventoryItem.StockStatus.READY_TO_SHIP,
+            ).count(),
+            2,
+        )
+        stock_workitem = WorkItem.objects.get(
+            type="ORDER_PLAN_STOCK_OUTBOUND",
+            biz_id=plan.plan_code,
+        )
+        self.assertEqual(stock_workitem.status, "OPEN")
+        self.assertFalse(stock_workitem.payload["qrcodes_ready"])
+        self.assertIn("待打印新二维码", stock_workitem.title)
+        stock_task = UserTask.objects.get(
+            workitem=stock_workitem,
+            to_openid=self.factory_stock.wx_openid,
+        )
+        self.assertTrue(stock_task.need_action)
+        print_orders = get_print_center_data()["orders"]
+        self.assertIn(plan.pk, {row["id"] for row in print_orders})
+
+        # 全量退货库存订单在创建时已经建立库管任务。打印新二维码后
+        # 必须更新同一母任务为“待发货”，不能再给库管制造第二条任务。
+        generated = generate_item_qrcodes(item_id=item.pk)
+        self.assertEqual(len(generated["qrcodes"]), 2)
+        printed = confirm_item_printed(item_id=item.pk)
+        self.assertTrue(printed["order_printed"])
+        self.assertTrue(printed["stock_task_created"])
+        self.assertEqual(
+            WorkItem.objects.filter(
+                type="ORDER_PLAN_STOCK_OUTBOUND",
+                biz_id=plan.plan_code,
+            ).count(),
+            1,
+        )
+        stock_workitem.refresh_from_db()
+        self.assertTrue(stock_workitem.payload["qrcodes_ready"])
+        self.assertIn("待一键出库", stock_workitem.title)
+        self.assertTrue(OrderPlanFinance.objects.filter(order_plan=plan).exists())
 
     def test_repeated_client_request_is_idempotent(self):
         payload = self._create_payload("same-client-request")

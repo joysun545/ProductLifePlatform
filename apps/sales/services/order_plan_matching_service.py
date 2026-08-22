@@ -17,6 +17,7 @@ from supply_chain.services.supplier_responsibility_service import (
 )
 from workflow.models import UserTask, WorkItem
 from workflow.services.workflow_service import publish_workitem
+from sales.services.order_plan_reissue_service import serialize_item_reissue
 
 
 class OrderPlanMatchingError(Exception):
@@ -77,8 +78,8 @@ def _default_bom_for_item(item):
                 item.plan.merchant_organization_id
             ),
             order_plan_item__product_model_id=item.product_model_id,
-            order_plan_item__plan__status=OrderPlan.Status.MATCHING_COMPLETED,
         )
+        .exclude(order_plan_item__plan__status=OrderPlan.Status.CANCELLED)
         .exclude(order_plan_item__plan_id=item.plan_id)
         .order_by("-confirmed_at", "-id")
         .first()
@@ -224,8 +225,9 @@ def _serialize_matching_plan(plan):
         available_boms = _available_boms_for_item(item)
         if not any(bom.pk == default_bom.pk for bom in available_boms):
             available_boms.append(default_bom)
+        reissue = serialize_item_reissue(item)
         serialized_items.append(
-            {
+            dict({
                 "id": item.pk,
                 "category": {
                     "id": item.category_id,
@@ -238,6 +240,9 @@ def _serialize_matching_plan(plan):
                     "name": item.product_model.name,
                 },
                 "quantity": item.quantity,
+                "return_inventory_quantity": item.return_inventory_quantity,
+                "production_quantity": item.production_quantity,
+                "requires_matching": item.production_quantity > 0,
                 "order_batch_code": item.order_batch_code,
                 "lifecycle_code": item.lifecycle_code,
                 "default_bom": {
@@ -269,8 +274,12 @@ def _serialize_matching_plan(plan):
                     if confirmation
                     else None
                 ),
-                "materials": _serialize_materials(item, default_bom),
-            }
+                "materials": (
+                    _serialize_materials(item, default_bom)
+                    if item.production_quantity > 0
+                    else []
+                ),
+            }, **reissue)
         )
 
     return {
@@ -355,6 +364,10 @@ def get_order_plan_item_bom_detail(*, user, plan_id, item_id, bom_id):
     )
     if not item:
         raise OrderPlanMatchingError("订单产品不存在或不属于当前订单")
+    if item.production_quantity == 0:
+        raise OrderPlanMatchingError(
+            "该型号全部调用退货待流转库存，无需重新选择BOM或物料配套"
+        )
     bom = _get_selectable_source_bom(item, bom_id)
     return {
         "order_plan_item_id": item.pk,
@@ -584,8 +597,10 @@ def _publish_followup_tasks(plan, confirmed_pairs, actor_openid):
                         bom_item.material_spec.name if bom_item.material_spec else ""
                     ),
                     "quantity_per_device": bom_item.quantity,
-                    "order_quantity": item.quantity,
-                    "required_quantity": bom_item.quantity * item.quantity,
+                    "order_quantity": item.production_quantity,
+                    "required_quantity": (
+                        bom_item.quantity * item.production_quantity
+                    ),
                 }
             )
 
@@ -639,6 +654,17 @@ def _publish_followup_tasks(plan, confirmed_pairs, actor_openid):
                     "sales_identity_ids"
                 ],
                 "recipient_scopes": recipient_scopes,
+                # 首次确认配套时的不可变责任快照。后续负责人调整可以
+                # 更新 recipient_scopes 以保障当前任务收件，但退货、
+                # 三包和质量追溯必须读取本字段，不能反向改写历史链路。
+                "initial_responsible_sales_identity_ids": list(
+                    recipient_data["sales_identity_ids"]
+                ),
+                "initial_recipient_scopes": {
+                    openid: dict(scope)
+                    for openid, scope in recipient_scopes.items()
+                },
+                "responsibility_snapshot_version": 1,
                 "processed_actors": [],
                 "materials": materials,
             },
@@ -715,8 +741,8 @@ def confirm_order_plan_matching(*, user, plan_id, items):
         raise OrderPlanMatchingError("该订单计划已取消")
     if plan.status == OrderPlan.Status.MATCHING_COMPLETED:
         return _serialize_matching_plan(plan), False, {}
-    if not isinstance(items, list) or not items:
-        raise OrderPlanMatchingError("请提交全部产品型号的BOM清单")
+    if not isinstance(items, list):
+        raise OrderPlanMatchingError("请提交需要新生产型号的BOM清单")
 
     plan_items = list(
         OrderPlanItem.objects.select_for_update()
@@ -724,6 +750,9 @@ def confirm_order_plan_matching(*, user, plan_id, items):
         .filter(plan=plan)
         .order_by("id")
     )
+    matching_items = [item for item in plan_items if item.production_quantity > 0]
+    if not matching_items:
+        raise OrderPlanMatchingError("该订单没有需要新生产和配套的产品")
     raw_by_id = {}
     for raw in items:
         if not isinstance(raw, dict):
@@ -735,15 +764,15 @@ def confirm_order_plan_matching(*, user, plan_id, items):
         if item_id in raw_by_id:
             raise OrderPlanMatchingError("同一订单产品不能重复提交")
         raw_by_id[item_id] = raw
-    if set(raw_by_id) != {item.pk for item in plan_items}:
-        raise OrderPlanMatchingError("必须一次确认该订单的全部产品型号")
+    if set(raw_by_id) != {item.pk for item in matching_items}:
+        raise OrderPlanMatchingError("必须一次确认全部需要新生产型号的BOM")
     if OrderPlanItemBOMConfirmation.objects.filter(
         order_plan_item__plan=plan
     ).exists():
         raise OrderPlanMatchingError("订单配套数据状态异常，请联系管理员")
 
     normalized_items = []
-    for item in plan_items:
+    for item in matching_items:
         submitted_bom_id = raw_by_id[item.pk].get("source_bom_id")
         if submitted_bom_id in (None, ""):
             source_bom, _source_kind = _default_bom_for_item(item)
