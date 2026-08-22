@@ -25,6 +25,7 @@ from common.domain.device_ownership import (
     resolve_device_ownership,
 )
 from lifecycle.models import (
+    CustomerDeviceBinding,
     DeviceState,
     InstallationInvitation,
     InstallationRecord,
@@ -581,6 +582,144 @@ class ScanOwnershipAndInstallationTests(TestCase):
             devices_under_account(
                 self.direct_owner_user.organization_identity
             ),
+        )
+
+    def test_existing_customer_adds_second_device_from_another_merchant(self):
+        first_token = self._install_and_token()
+        first_payload = self._accept_payload()
+        first_payload.update(
+            customer_type="PERSONAL",
+            customer_name="",
+            vehicle_no="渝A10001",
+        )
+        first_accept = self.client.post(
+            "/pldp/api/lifecycle/scan/customer-invitations/"
+            f"{first_token}/accept/",
+            first_payload,
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(first_accept.status_code, 201)
+        original_identity = UserOrganization.objects.get(user=self.customer_user)
+        original_organization = original_identity.organization
+        first_binding = CustomerDeviceBinding.objects.get(device=self.device)
+        self.assertEqual(
+            first_binding.acceptance_mode,
+            CustomerDeviceBinding.AcceptanceMode.NEW_CUSTOMER,
+        )
+
+        second_merchant = Organization.objects.create(
+            name="重庆第二设备商家",
+            code="MERCHANT-SECOND",
+            organization_type=self.direct_merchant.organization_type,
+            region="重庆市江北区",
+        )
+        second_owner = self._user_identity(
+            "second_owner",
+            second_merchant,
+            self.merchant_owner_role,
+        )
+        self._create_distribution_relation(
+            inviter_user=self.factory_user,
+            inviter_role=self.factory_admin_role,
+            target_user=second_owner,
+            target_org=second_merchant,
+        )
+        second_device = LifecycleService.create_device(
+            product_model=self.device.product_model,
+            batch=self.device.batch,
+            organization=self.factory,
+            operator=self.factory_user,
+            sn="SN-TEST-SECOND-001",
+        )
+        OrganizationDevice.objects.filter(device=second_device).update(
+            organization=second_merchant,
+            status="IN_STOCK",
+        )
+        DeviceState.objects.filter(device=second_device).update(
+            current_organization=second_merchant,
+            status="IN_STOCK",
+            install_status="NOT_INSTALLED",
+            activation_status="NOT_ACTIVATED",
+        )
+        install = self.client.post(
+            self.install_endpoint,
+            {"device_id": second_device.id, "location": "重庆市江北区"},
+            **self.auth(second_owner),
+        )
+        self.assertEqual(install.status_code, 201)
+        second_token = install.json()["data"]["invitation"]["token"]
+        second_detail_url = (
+            "/pldp/api/lifecycle/scan/customer-invitations/"
+            f"{second_token}/"
+        )
+        second_detail = self.client.get(
+            second_detail_url,
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(second_detail.status_code, 200)
+        self.assertEqual(
+            second_detail.json()["data"]["acceptance_mode"],
+            "ADD_DEVICE",
+        )
+        self.assertEqual(
+            second_detail.json()["data"]["customer_profile"]["customer_type"],
+            "PERSONAL",
+        )
+
+        second_payload = self._accept_payload()
+        second_payload.update(
+            customer_type="FLEET",
+            customer_name="不应新建的车队",
+            vehicle_no="渝A20002",
+        )
+        second_accept = self.client.post(
+            f"{second_detail_url}accept/",
+            second_payload,
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(second_accept.status_code, 201)
+
+        identities = UserOrganization.objects.filter(user=self.customer_user)
+        self.assertEqual(identities.count(), 1)
+        self.assertEqual(identities.get().id, original_identity.id)
+        self.assertEqual(identities.get().organization_id, original_organization.id)
+        second_binding = CustomerDeviceBinding.objects.get(device=second_device)
+        self.assertEqual(
+            second_binding.acceptance_mode,
+            CustomerDeviceBinding.AcceptanceMode.EXISTING_CUSTOMER,
+        )
+        self.assertEqual(second_binding.customer_organization, original_organization)
+        self.assertEqual(second_binding.source_organization, second_merchant)
+        self.assertEqual(second_binding.customer_type, "PERSONAL")
+        self.assertEqual(second_binding.vehicle_no, "渝A20002")
+        self.assertTrue(
+            OrganizationRelation.objects.filter(
+                source_organization=second_merchant,
+                target_organization=original_organization,
+                relation_type=OrganizationRelationType.DISTRIBUTION,
+                is_active=True,
+            ).exists()
+        )
+
+        device_list = self.client.get(
+            "/pldp/api/lifecycle/customer/devices/",
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(device_list.status_code, 200)
+        self.assertEqual(device_list.json()["data"]["total"], 2)
+        second_result = self.client.get(
+            f"/pldp/api/lifecycle/customer/devices/{second_device.id}/",
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(second_result.status_code, 200)
+        result_data = second_result.json()["data"]
+        self.assertEqual(
+            result_data["asset"]["source_organization"],
+            second_merchant.name,
+        )
+        self.assertEqual(
+            result_data["customer"]["profile"]["vehicle_no"],
+            "渝A20002",
         )
 
     def test_existing_business_identity_cannot_accept_customer_invitation(self):

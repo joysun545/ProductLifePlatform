@@ -276,6 +276,12 @@ urlpatterns = [
     ),
 
     path(
+        "customer/devices/",
+        views.CustomerDeviceListAPI.as_view(),
+        name="customer_device_list",
+    ),
+
+    path(
         "customer/devices/<int:device_id>/",
         views.CustomerDeviceResultAPI.as_view(),
         name="customer_device_result",

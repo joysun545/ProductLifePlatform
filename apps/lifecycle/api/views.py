@@ -1221,6 +1221,27 @@ class AcceptInstallationInvitationAPI(APIView):
         )
 
 
+class CustomerDeviceListAPI(APIView):
+    """返回当前用户负责人名下的全部设备。"""
+
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request):
+        try:
+            user = authenticate_request(request)
+        except ApiAuthenticationError as exc:
+            return Response(
+                {"code": 401, "msg": str(exc), "data": {}},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+        try:
+            data = CustomerDeviceService.device_list(user=user)
+        except (CustomerFlowPermissionError, CustomerFlowStateError) as exc:
+            return _customer_flow_error_response(exc)
+        return Response({"code": 0, "msg": "success", "data": data})
+
+
 class CustomerDeviceResultAPI(APIView):
     """用户负责人专用设备结果数据。"""
 

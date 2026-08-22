@@ -14,6 +14,7 @@ from account.services.auth_service import get_active_identity
 from common.domain.device_ownership import resolve_device_ownership
 from lifecycle.models import (
     ActivationRecord,
+    CustomerDeviceBinding,
     Device,
     DeviceState,
     InstallationInvitation,
@@ -88,6 +89,17 @@ class CustomerDeviceService:
             blocked_reason = "当前微信已有其他业务岗位，请使用独立微信账号接受"
 
         customer_data = invitation.customer_data or {}
+        customer_profile = customer_data
+        if identity and identity.role.code == "customer_owner":
+            customer_profile = cls._customer_profile(identity=identity, user=user)
+        if accepted_by_me:
+            acceptance_mode = "ALREADY_BOUND"
+        elif blocked_reason:
+            acceptance_mode = "BLOCKED"
+        elif identity:
+            acceptance_mode = "ADD_DEVICE"
+        else:
+            acceptance_mode = "NEW_CUSTOMER"
         viewer = {
             "has_identity": bool(identity),
             "role": identity.role.code if identity else "tourist",
@@ -134,6 +146,44 @@ class CustomerDeviceService:
             },
             "viewer": viewer,
             "customer_data": customer_data,
+            "customer_profile": customer_profile,
+            "acceptance_mode": acceptance_mode,
+        }
+
+    @staticmethod
+    def _customer_profile(*, identity, user):
+        binding = (
+            CustomerDeviceBinding.objects.filter(
+                customer_organization=identity.organization,
+                status=CustomerDeviceBinding.Status.ACTIVE,
+            )
+            .select_related("invitation")
+            .order_by("-accepted_at", "-id")
+            .first()
+        )
+        invitation_data = (
+            dict(binding.invitation.customer_data or {})
+            if binding and binding.invitation
+            else {}
+        )
+        return {
+            "customer_type": (
+                binding.customer_type
+                if binding
+                else str(invitation_data.get("customer_type") or "PERSONAL").upper()
+            ),
+            "customer_name": identity.organization.name,
+            "contact_name": invitation_data.get("contact_name")
+            or user.wx_nickname
+            or user.username,
+            "phone": user.phone or invitation_data.get("phone") or "",
+            "region": identity.organization.region,
+            "address": identity.organization.address,
+            "vehicle_no": (
+                binding.vehicle_no
+                if binding
+                else invitation_data.get("vehicle_no") or ""
+            ),
         }
 
     @staticmethod
@@ -191,22 +241,8 @@ class CustomerDeviceService:
         return organization, identity
 
     @staticmethod
-    def _ensure_single_parent(*, source_organization, customer_organization):
-        conflicting = (
-            OrganizationRelation.objects.select_for_update()
-            .filter(
-                target_organization=customer_organization,
-                relation_type=OrganizationRelationType.DISTRIBUTION,
-                is_active=True,
-            )
-            .exclude(source_organization=source_organization)
-            .exists()
-        )
-        if conflicting:
-            raise CustomerFlowStateError(
-                "当前用户组织已经属于其他销售链路，不能通过本邀请加入"
-            )
-
+    def _ensure_sales_relation(*, source_organization, customer_organization):
+        """记录每台设备真实来源；终端用户可从多个商家购买设备。"""
         relation, _ = OrganizationRelation.objects.get_or_create(
             source_organization=source_organization,
             target_organization=customer_organization,
@@ -267,7 +303,21 @@ class CustomerDeviceService:
             raise CustomerFlowStateError("设备已经不属于邀请方组织")
 
         identity = get_active_identity(user)
+        existing_customer = bool(identity)
         profile_data = dict(customer_data)
+        if identity:
+            if not (
+                identity.organization.organization_type.code == "CUSTOMER"
+                and identity.role.code == "customer_owner"
+            ):
+                raise CustomerFlowPermissionError(
+                    "当前微信已有其他业务岗位，请使用独立微信账号接受"
+                )
+            existing_profile = cls._customer_profile(identity=identity, user=user)
+            # 已有用户再次扫码只是在同一用户档案下添加设备，不能借此改变
+            # 个人/车队类型或另建用户组织。车辆编号仍按设备单独保存。
+            profile_data["customer_type"] = existing_profile["customer_type"]
+            profile_data["customer_name"] = identity.organization.name
         profile_data["target_role"] = invitation.target_role
         profile_data["inviter"] = invitation.inviter
         customer_org, identity = cls._customer_organization(
@@ -275,7 +325,7 @@ class CustomerDeviceService:
             identity=identity,
             data=profile_data,
         )
-        cls._ensure_single_parent(
+        cls._ensure_sales_relation(
             source_organization=invitation.source_organization,
             customer_organization=customer_org,
         )
@@ -291,7 +341,7 @@ class CustomerDeviceService:
             data={
                 "purpose": "customer_acceptance",
                 "installation_invitation_id": invitation.id,
-                "vehicle_no": customer_data["vehicle_no"],
+                "vehicle_no": profile_data["vehicle_no"],
             },
         )
 
@@ -308,13 +358,13 @@ class CustomerDeviceService:
         state.save()
 
         stored_data = {
-            "customer_type": customer_data["customer_type"],
+            "customer_type": profile_data["customer_type"],
             "customer_name": customer_org.name,
-            "contact_name": customer_data["contact_name"],
-            "phone": customer_data["phone"],
-            "region": customer_data["region"],
-            "address": customer_data.get("address", ""),
-            "vehicle_no": customer_data["vehicle_no"],
+            "contact_name": profile_data["contact_name"],
+            "phone": profile_data["phone"],
+            "region": profile_data["region"],
+            "address": profile_data.get("address", ""),
+            "vehicle_no": profile_data["vehicle_no"],
         }
         invitation.invitee = user
         invitation.target_organization = customer_org
@@ -323,8 +373,27 @@ class CustomerDeviceService:
         invitation.accepted_at = now
         invitation.save()
 
-        if user.phone != customer_data["phone"]:
-            user.phone = customer_data["phone"]
+        CustomerDeviceBinding.objects.update_or_create(
+            device=device,
+            defaults={
+                "customer_organization": customer_org,
+                "source_organization": invitation.source_organization,
+                "invitation": invitation,
+                "accepted_by": user,
+                "acceptance_mode": (
+                    CustomerDeviceBinding.AcceptanceMode.EXISTING_CUSTOMER
+                    if existing_customer
+                    else CustomerDeviceBinding.AcceptanceMode.NEW_CUSTOMER
+                ),
+                "customer_type": stored_data["customer_type"],
+                "vehicle_no": stored_data["vehicle_no"],
+                "accepted_at": now,
+                "status": CustomerDeviceBinding.Status.ACTIVE,
+            },
+        )
+
+        if user.phone != profile_data["phone"]:
+            user.phone = profile_data["phone"]
             user.save(update_fields=("phone",))
 
         return invitation, identity
@@ -361,8 +430,10 @@ class CustomerDeviceService:
             Device.objects.select_related(
                 "product_model",
                 "product_model__category",
+                "product_model__brand",
                 "state",
                 "batch",
+                "batch__manufacturer",
                 "batch__bom",
             )
             .filter(pk=device_id)
@@ -384,8 +455,110 @@ class CustomerDeviceService:
         return identity, device, invitation
 
     @staticmethod
-    def _customer_type(invitation):
-        return str((invitation.customer_data if invitation else {}).get("customer_type") or "").upper()
+    def _customer_type(invitation, binding=None):
+        if binding:
+            return binding.customer_type
+        return str(
+            (invitation.customer_data if invitation else {}).get("customer_type")
+            or "PERSONAL"
+        ).upper()
+
+    @staticmethod
+    def _event_payload(event):
+        return {
+            "id": event.id,
+            "event_type": event.event_type,
+            "event_type_name": dict(LifecycleEvent.EVENT_TYPE_CHOICES).get(
+                event.event_type, event.event_type
+            ),
+            "created_at": event.created_at.isoformat(),
+            "operator": (
+                event.operator.wx_nickname or event.operator.username
+                if event.operator
+                else "系统"
+            ),
+            "organization": event.organization.name if event.organization else "",
+            "from_organization": (
+                event.from_organization.name if event.from_organization else ""
+            ),
+            "to_organization": (
+                event.to_organization.name if event.to_organization else ""
+            ),
+            "data": event.data or {},
+        }
+
+    @classmethod
+    def device_list(cls, *, user):
+        identity = cls._customer_identity(user)
+        records = list(
+            OrganizationDevice.objects.filter(
+                organization=identity.organization,
+            )
+            .select_related(
+                "device__product_model__category",
+                "device__product_model__brand",
+                "device__batch__manufacturer",
+                "device__batch__bom",
+                "device__state",
+            )
+            .order_by("-updated_at", "-id")
+        )
+        bindings = {
+            binding.device_id: binding
+            for binding in CustomerDeviceBinding.objects.filter(
+                customer_organization=identity.organization,
+                device_id__in=[record.device_id for record in records],
+                status=CustomerDeviceBinding.Status.ACTIVE,
+            ).select_related("source_organization")
+        }
+        devices = []
+        for record in records:
+            device = record.device
+            binding = bindings.get(device.id)
+            devices.append(
+                {
+                    "id": device.id,
+                    "sn": device.sn,
+                    "product_model": device.product_model.name,
+                    "product_model_code": device.product_model.code,
+                    "category": device.product_model.category.name,
+                    "brand": (
+                        device.product_model.brand.name
+                        if device.product_model.brand
+                        else ""
+                    ),
+                    "manufacturer": device.batch.manufacturer.name,
+                    "production_batch": device.batch.batch_no,
+                    "bom_version": device.batch.bom.version,
+                    "organization_status": record.status,
+                    "install_status": device.state.install_status,
+                    "activation_status": device.state.activation_status,
+                    "vehicle_no": binding.vehicle_no if binding else "",
+                    "source_organization": (
+                        binding.source_organization.name if binding else ""
+                    ),
+                    "accepted_at": (
+                        binding.accepted_at.isoformat() if binding else ""
+                    ),
+                }
+            )
+        return {
+            "customer": {
+                "organization_id": identity.organization_id,
+                "organization_name": identity.organization.name,
+                "region": identity.organization.region,
+                "role": identity.role.code,
+                "role_name": identity.role.name,
+            },
+            "total": len(devices),
+            "activated_count": sum(
+                item["activation_status"] == "ACTIVATED" for item in devices
+            ),
+            "pending_activation_count": sum(
+                item["activation_status"] != "ACTIVATED" for item in devices
+            ),
+            "devices": devices,
+        }
 
     @staticmethod
     def _ordered_documents(device):
@@ -420,7 +593,16 @@ class CustomerDeviceService:
         documents_complete = len(documents) == 3
         all_read = documents_complete and current_versions.issubset(read_versions)
         state = device.state
-        customer_type = cls._customer_type(invitation)
+        binding = (
+            CustomerDeviceBinding.objects.filter(
+                device=device,
+                accepted_by=user,
+                status=CustomerDeviceBinding.Status.ACTIVE,
+            )
+            .order_by("-accepted_at", "-id")
+            .first()
+        )
+        customer_type = cls._customer_type(invitation, binding)
         gate_required = (
             customer_type == "PERSONAL"
             and state.activation_status != "ACTIVATED"
@@ -552,17 +734,68 @@ class CustomerDeviceService:
             device_id=device_id,
             user=user,
         )
-        profile = invitation.customer_data if invitation else {}
+        binding = CustomerDeviceBinding.objects.filter(
+            device=device,
+            customer_organization=identity.organization,
+            status=CustomerDeviceBinding.Status.ACTIVE,
+        ).select_related("source_organization").first()
+        profile = cls._customer_profile(identity=identity, user=user)
+        if binding:
+            profile["vehicle_no"] = binding.vehicle_no
         is_activated = device.state.activation_status == "ACTIVATED"
+        product_model = device.product_model
+        batch = device.batch
+        events = list(
+            LifecycleEvent.objects.filter(device=device)
+            .select_related(
+                "operator",
+                "organization",
+                "from_organization",
+                "to_organization",
+            )
+            .order_by("-created_at", "-id")
+        )
         return {
             "scan_result": ScanService.resolve_device(device=device, user=user),
+            "asset": {
+                "device_id": device.id,
+                "sn": device.sn,
+                "product_model_id": product_model.id,
+                "product_model": product_model.name,
+                "product_model_code": product_model.code,
+                "category": product_model.category.name,
+                "brand": product_model.brand.name if product_model.brand else "",
+                "description": product_model.description,
+                "source_organization": (
+                    binding.source_organization.name if binding else ""
+                ),
+            },
+            "production": {
+                "batch_no": batch.batch_no,
+                "production_date": batch.production_date.isoformat(),
+                "manufacturer": batch.manufacturer.name,
+                "bom_id": batch.bom_id,
+                "bom_version": batch.bom.version,
+                "bom_remark": batch.bom.remark,
+            },
+            "parameters": [
+                {"label": "型号编码", "value": product_model.code},
+                {"label": "产品品类", "value": product_model.category.name},
+                {
+                    "label": "品牌",
+                    "value": product_model.brand.name if product_model.brand else "未设置",
+                },
+                {"label": "生产批次", "value": batch.batch_no},
+                {"label": "BOM版本", "value": batch.bom.version},
+            ],
+            "lifecycle": [cls._event_payload(event) for event in events],
             "customer": {
                 "organization_id": identity.organization_id,
                 "organization_name": identity.organization.name,
                 "region": identity.organization.region,
                 "role": identity.role.code,
                 "role_name": identity.role.name,
-                "customer_type": cls._customer_type(invitation),
+                "customer_type": cls._customer_type(invitation, binding),
                 "profile": profile,
             },
             "actions": {
@@ -639,5 +872,11 @@ class CustomerDeviceService:
             data["vehicle_no"] = vehicle_no
             invitation.customer_data = data
             invitation.save(update_fields=("customer_data", "updated_at"))
+
+        CustomerDeviceBinding.objects.filter(
+            device=device,
+            customer_organization=identity.organization,
+            status=CustomerDeviceBinding.Status.ACTIVE,
+        ).update(vehicle_no=vehicle_no, updated_at=now)
 
         return cls.device_result(device_id=device.id, user=user)

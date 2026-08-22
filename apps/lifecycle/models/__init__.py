@@ -17,6 +17,8 @@ from .installation import InstallationInvitation, InstallationRecord
 
 from .document_read import ProductDocumentRead
 
+from .customer_device import CustomerDeviceBinding
+
 from .goods_transfer import GoodsTransfer, GoodsTransferItem
 
 from .goods_transfer_settlement import (
@@ -63,6 +65,8 @@ __all__ = [
     "InstallationInvitation",
 
     "ProductDocumentRead",
+
+    "CustomerDeviceBinding",
 
     "GoodsTransfer",
 
