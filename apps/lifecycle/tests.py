@@ -3,6 +3,7 @@ import tempfile
 from unittest.mock import patch
 
 from django.core.files.base import ContentFile
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
@@ -25,8 +26,11 @@ from common.domain.device_ownership import (
     resolve_device_ownership,
 )
 from lifecycle.models import (
+    AfterSalesApplication,
     CustomerDeviceBinding,
     DeviceState,
+    DriverVehicleBinding,
+    VehicleDeviceAssignment,
     InstallationInvitation,
     InstallationRecord,
     LifecycleEvent,
@@ -43,6 +47,7 @@ from product.models import (
     ProductModel,
 )
 from supply_chain.models import Material, MaterialSpec
+from workflow.models import UserTask, WorkItem
 
 
 class ScanOwnershipAndInstallationTests(TestCase):
@@ -109,6 +114,11 @@ class ScanOwnershipAndInstallationTests(TestCase):
                 "is_owner_role": True,
                 "is_active": True,
             },
+        )
+        cls.driver_role, _ = OrganizationRole.objects.update_or_create(
+            organization_type=customer_type,
+            code="driver",
+            defaults={"name": "司机", "is_active": True},
         )
 
         cls.factory = Organization.objects.create(
@@ -776,6 +786,118 @@ class ScanOwnershipAndInstallationTests(TestCase):
         )
         self.assertEqual(duplicate.status_code, 409)
 
+    def test_driver_can_activate_only_devices_on_shared_vehicle(self):
+        token = self._install_and_token()
+        accept_response = self.client.post(
+            "/pldp/api/lifecycle/scan/customer-invitations/"
+            f"{token}/accept/",
+            self._accept_payload(),
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(accept_response.status_code, 201)
+
+        customer_identity = UserOrganization.objects.get(user=self.customer_user)
+        driver = self._user_identity(
+            "shared_vehicle_driver",
+            customer_identity.organization,
+            self.driver_role,
+        )
+        unrelated_driver = self._user_identity(
+            "unrelated_vehicle_driver",
+            customer_identity.organization,
+            self.driver_role,
+        )
+        binding = CustomerDeviceBinding.objects.select_related("vehicle").get(
+            device=self.device,
+            status=CustomerDeviceBinding.Status.ACTIVE,
+        )
+        self.assertIsNotNone(binding.vehicle_id)
+
+        result_url = f"/pldp/api/lifecycle/customer/devices/{self.device.id}/"
+        denied_result = self.client.get(
+            result_url,
+            **self.auth(unrelated_driver),
+        )
+        self.assertEqual(denied_result.status_code, 403)
+        denied_activate = self.client.post(
+            f"{result_url}activate/",
+            {"vehicle_no": "渝A12345"},
+            **self.auth(unrelated_driver),
+        )
+        self.assertEqual(denied_activate.status_code, 403)
+
+        DriverVehicleBinding.objects.create(
+            vehicle=binding.vehicle,
+            driver=driver,
+            is_active=True,
+        )
+        result = self.client.get(result_url, **self.auth(driver))
+        self.assertEqual(result.status_code, 200)
+        result_data = result.json()["data"]
+        self.assertIn(
+            "activate_device",
+            result_data["scan_result"]["capabilities"],
+        )
+        self.assertTrue(result_data["actions"]["can_activate"])
+
+        activate = self.client.post(
+            f"{result_url}activate/",
+            {"vehicle_no": "渝A12345", "location": "重庆市渝北区"},
+            **self.auth(driver),
+        )
+        self.assertEqual(activate.status_code, 200)
+        self.assertEqual(
+            DeviceState.objects.get(device=self.device).activation_status,
+            "ACTIVATED",
+        )
+
+    def test_owner_device_list_shows_all_shared_drivers_and_assignment_history(self):
+        token = self._install_and_token()
+        accept_response = self.client.post(
+            "/pldp/api/lifecycle/scan/customer-invitations/"
+            f"{token}/accept/",
+            self._accept_payload(),
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(accept_response.status_code, 201)
+        binding = CustomerDeviceBinding.objects.select_related("vehicle").get(
+            device=self.device,
+        )
+        self.assertTrue(VehicleDeviceAssignment.objects.filter(
+            device=self.device,
+            vehicle=binding.vehicle,
+            is_current=True,
+        ).exists())
+
+        first_driver = self._user_identity(
+            "first_shared_driver", binding.customer_organization, self.driver_role,
+        )
+        first_driver.wx_nickname = "司机甲"
+        first_driver.save(update_fields=("wx_nickname",))
+        second_driver = self._user_identity(
+            "second_shared_driver", binding.customer_organization, self.driver_role,
+        )
+        second_driver.wx_nickname = "司机乙"
+        second_driver.save(update_fields=("wx_nickname",))
+        DriverVehicleBinding.objects.create(
+            vehicle=binding.vehicle, driver=first_driver, is_active=True,
+        )
+        DriverVehicleBinding.objects.create(
+            vehicle=binding.vehicle, driver=second_driver, is_active=True,
+        )
+
+        response = self.client.get(
+            "/pldp/api/lifecycle/customer/devices/",
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(response.status_code, 200)
+        vehicle = response.json()["data"]["vehicles"][0]
+        self.assertEqual(vehicle["shared_driver_count"], 2)
+        self.assertEqual(vehicle["shared_driver_names"], ["司机甲", "司机乙"])
+        self.assertEqual(
+            vehicle["sharing_text"], "该车辆绑定设备已与司机甲、司机乙共享",
+        )
+
     def test_personal_customer_must_read_current_three_documents_before_activation(self):
         token = self._install_and_token()
         payload = self._accept_payload()
@@ -895,3 +1017,183 @@ class ScanOwnershipAndInstallationTests(TestCase):
         self.assertEqual(supported.status_code, 200)
         self.assertTrue(supported.json()["data"]["capable"])
         self.assertEqual(supported.json()["data"]["status"], "NOT_CONFIGURED")
+
+    def test_after_sales_application_submit_snapshots_and_publishes_tasks(self):
+        token = self._install_and_token()
+        accepted = self.client.post(
+            f"/pldp/api/lifecycle/scan/customer-invitations/{token}/accept/",
+            self._accept_payload(),
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(accepted.status_code, 201)
+
+        factory_sales_role, _ = OrganizationRole.objects.update_or_create(
+            organization_type=self.factory.organization_type,
+            code="factory_sales",
+            defaults={"name": "厂家销售经理", "is_active": True},
+        )
+        factory_sales = User.objects.create_user(
+            username="aftersales_factory_sales",
+            wx_openid="openid-aftersales-factory-sales",
+        )
+        UserOrganization.objects.create(
+            user=factory_sales,
+            organization=self.factory,
+            role=factory_sales_role,
+        )
+
+        context = self.client.get(
+            f"/pldp/api/lifecycle/customer/devices/{self.device.id}/after-sales/context/",
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(context.status_code, 200)
+        context_data = context.json()["data"]
+        self.assertEqual(context_data["device"]["id"], self.device.id)
+        self.assertIn("summary", context_data["warranty"])
+        self.assertIn("key_materials", context_data["bom"])
+
+        create = self.client.post(
+            f"/pldp/api/lifecycle/customer/devices/{self.device.id}/after-sales/applications/",
+            {
+                "device_id": self.device.id,
+                "fault_description": "发电机无法启动，已检查基本接线。",
+                "location_name": "重庆市渝北区",
+                "location_address": "测试服务区",
+                "location_latitude": "29.600000",
+                "location_longitude": "106.500000",
+                "location_confirmed": True,
+            },
+            content_type="application/json",
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(create.status_code, 201)
+        application_id = create.json()["data"]["id"]
+
+        with tempfile.TemporaryDirectory() as media_root, override_settings(MEDIA_ROOT=media_root):
+            upload = self.client.post(
+                f"/pldp/api/lifecycle/after-sales/applications/{application_id}/media/",
+                {
+                    "media_type": "IMAGE",
+                    "file": SimpleUploadedFile(
+                        "fault.jpg", b"\xff\xd8\xff\xe0test-image", content_type="image/jpeg"
+                    ),
+                },
+                **self.auth(self.customer_user),
+            )
+            self.assertEqual(upload.status_code, 201)
+            video_upload = self.client.post(
+                f"/pldp/api/lifecycle/after-sales/applications/{application_id}/media/",
+                {
+                    "media_type": "VIDEO",
+                    "duration_seconds": "3",
+                    "file": SimpleUploadedFile(
+                        "fault.mp4", b"\x00\x00\x00\x18ftypmp42test-video", content_type="video/mp4"
+                    ),
+                },
+                **self.auth(self.customer_user),
+            )
+            self.assertEqual(video_upload.status_code, 201, video_upload.json())
+            submitted = self.client.post(
+                f"/pldp/api/lifecycle/after-sales/applications/{application_id}/submit/",
+                {},
+                content_type="application/json",
+                **self.auth(self.customer_user),
+            )
+            self.assertEqual(submitted.status_code, 200)
+            detail = self.client.get(
+                f"/pldp/api/lifecycle/after-sales/applications/{application_id}/",
+                **self.auth(factory_sales),
+            )
+            self.assertEqual(detail.status_code, 200)
+            self.assertEqual(len(detail.json()["data"]["media"]), 2)
+
+        application = AfterSalesApplication.objects.get(pk=application_id)
+        self.assertEqual(application.status, AfterSalesApplication.Status.SUBMITTED)
+        self.assertEqual(application.device_snapshot["sn"], self.device.sn)
+        self.assertTrue(application.location_confirmed)
+        self.assertEqual(
+            set(application.events.values_list("event_type", flat=True)),
+            {"DRAFT_CREATED", "MEDIA_UPLOADED", "SUBMITTED"},
+        )
+        self.assertTrue(
+            WorkItem.objects.filter(type="AFTERSALES_APPLICATION_REVIEW", biz_id=str(application_id)).exists()
+        )
+        self.assertTrue(
+            UserTask.objects.filter(
+                workitem__type="AFTERSALES_APPLICATION_REVIEW",
+                to_openid=factory_sales.wx_openid,
+                need_action=True,
+            ).exists()
+        )
+        applicant_task = UserTask.objects.get(
+            workitem__uniq_key=(
+                f"aftersales:{application_id}:applicant-workorder"
+            ),
+            to_openid=self.customer_user.wx_openid,
+        )
+        self.assertEqual(
+            applicant_task.workitem.type,
+            "AFTERSALES_APPLICANT_WORKORDER",
+        )
+        self.assertFalse(applicant_task.need_action)
+
+        # Simulate the user-facing task produced by the previous release.  A
+        # later push must adopt this original row instead of adding another
+        # card for the same after-sales application.
+        applicant_task.workitem.uniq_key = (
+            f"aftersales:{application_id}:notice-submitted:v0"
+        )
+        applicant_task.workitem.type = "AFTERSALES_APPLICATION_SUBMITTED"
+        applicant_task.workitem.save(
+            update_fields=("uniq_key", "type", "updated_at")
+        )
+
+        duplicated = self.client.post(
+            f"/pldp/api/lifecycle/customer/devices/{self.device.id}/after-sales/applications/",
+            {"device_id": self.device.id, "fault_description": "重复申请", "location_confirmed": True},
+            content_type="application/json",
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(duplicated.status_code, 409)
+
+        remote = self.client.post(
+            f"/pldp/api/lifecycle/after-sales/applications/{application_id}/triage/",
+            {
+                "preliminary_fault_type": "INSTALLATION_OR_WIRING",
+                "diagnosis_note": "根据故障视频判断为接线端子松动。",
+                "repair_plan": "远程指导复紧接线端子后重新启动测试。",
+                "dispatch_route": "REMOTE",
+                "final_fault_type": "INSTALLATION_OR_WIRING",
+                "final_fault_materials": [],
+                "final_solution_type": "REMOTE_GUIDANCE",
+                "final_solution_note": "已远程指导完成复紧和启动测试，设备恢复正常。",
+            },
+            content_type="application/json",
+            **self.auth(factory_sales),
+        )
+        self.assertEqual(remote.status_code, 200, remote.json())
+        applicant_task.refresh_from_db()
+        self.assertEqual(
+            WorkItem.objects.get(pk=applicant_task.workitem_id).uniq_key,
+            f"aftersales:{application_id}:applicant-workorder",
+        )
+        self.assertEqual(
+            applicant_task.display_title_snapshot,
+            "厂家远程指导已完成并结案",
+        )
+        self.assertEqual(applicant_task.state, "NEW")
+        self.assertFalse(applicant_task.need_action)
+        self.assertEqual(
+            UserTask.objects.filter(
+                workitem__biz_ref=f"AfterSalesApplication:{application_id}",
+                to_openid=self.customer_user.wx_openid,
+            ).count(),
+            1,
+        )
+        application.refresh_from_db()
+        self.assertEqual(application.status, AfterSalesApplication.Status.CLOSED)
+        self.assertTrue(
+            application.events.filter(
+                event_type="REMOTE_RESOLVED_AND_CLOSED"
+            ).exists()
+        )

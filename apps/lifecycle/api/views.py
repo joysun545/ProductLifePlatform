@@ -101,6 +101,7 @@ from lifecycle.services.factory_return_service import (
     receive_supplier_warranty_dispatch,
     upload_factory_return_document,
 )
+from lifecycle.services.aftersales_service import AfterSalesError, AfterSalesService
 
 
 def _authenticated_flow_user(request):
@@ -1242,6 +1243,59 @@ class CustomerDeviceListAPI(APIView):
         return Response({"code": 0, "msg": "success", "data": data})
 
 
+class DriverVehicleInvitationCreateAPI(APIView):
+    """用户负责人按车辆生成司机分享邀请。"""
+
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, vehicle_id):
+        try:
+            user = authenticate_request(request)
+            data = CustomerDeviceService.create_driver_invitation(
+                vehicle_id=vehicle_id, user=user,
+            )
+        except ApiAuthenticationError as exc:
+            return Response({"code": 401, "msg": str(exc), "data": {}}, status=401)
+        except (CustomerFlowPermissionError, CustomerFlowStateError) as exc:
+            return _customer_flow_error_response(exc)
+        return Response({"code": 0, "msg": "success", "data": data}, status=201)
+
+
+class DriverVehicleInvitationDetailAPI(APIView):
+    """司机打开车辆分享链接时读取车辆及设备清单。"""
+
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request, token):
+        try:
+            user = authenticate_request(request)
+            data = CustomerDeviceService.driver_invitation_detail(token=token, user=user)
+        except ApiAuthenticationError as exc:
+            return Response({"code": 401, "msg": str(exc), "data": {}}, status=401)
+        except (CustomerFlowPermissionError, CustomerFlowStateError) as exc:
+            return _customer_flow_error_response(exc)
+        return Response({"code": 0, "msg": "success", "data": data})
+
+
+class AcceptDriverVehicleInvitationAPI(APIView):
+    """司机接受车辆级授权；车辆内全部设备随授权自动可见。"""
+
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, token):
+        try:
+            user = authenticate_request(request)
+            data = CustomerDeviceService.accept_driver_invitation(token=token, user=user)
+        except ApiAuthenticationError as exc:
+            return Response({"code": 401, "msg": str(exc), "data": {}}, status=401)
+        except (CustomerFlowPermissionError, CustomerFlowStateError) as exc:
+            return _customer_flow_error_response(exc)
+        return Response({"code": 0, "msg": "接受邀请成功", "data": data}, status=201)
+
+
 class CustomerDeviceResultAPI(APIView):
     """用户负责人专用设备结果数据。"""
 
@@ -1419,6 +1473,367 @@ class CustomerDeviceTelemetryAPI(APIView):
         except (CustomerFlowPermissionError, CustomerFlowStateError) as exc:
             return _customer_flow_error_response(exc)
         return Response({"code": 0, "msg": "success", "data": data})
+
+
+def _aftersales_error(exc, *, status_code=status.HTTP_409_CONFLICT):
+    return Response(
+        {"code": 1, "msg": str(exc), "data": {}},
+        status=status_code,
+    )
+
+
+class AfterSalesRequestContextAPI(APIView):
+    """Read the device, warranty and frozen-BOM source before draft creation."""
+
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request, device_id):
+        user, error = _authenticated_user(request)
+        if error:
+            return error
+        try:
+            data = AfterSalesService.context(device_id=device_id, user=user)
+        except (
+            AfterSalesError,
+            CustomerFlowPermissionError,
+            CustomerFlowStateError,
+        ) as exc:
+            return _aftersales_error(exc)
+        return Response({"code": 0, "msg": "success", "data": data})
+
+
+class AfterSalesApplicationListCreateAPI(APIView):
+    """List visible canonical applications or create/update the applicant draft."""
+
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request, device_id=None):
+        user, error = _authenticated_user(request)
+        if error:
+            return error
+        try:
+            data = AfterSalesService.list_applications(
+                user=user,
+                limit=request.GET.get("limit", 50),
+            )
+        except AfterSalesError as exc:
+            return _aftersales_error(exc)
+        return Response({"code": 0, "msg": "success", "data": data})
+
+    def post(self, request, device_id=None):
+        user, error = _authenticated_user(request)
+        if error:
+            return error
+        if not device_id:
+            return _aftersales_error(
+                AfterSalesError("请从具体设备发起售后申请"),
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            data, created = AfterSalesService.save_draft(
+                device_id=device_id,
+                user=user,
+                data=request.data,
+            )
+        except (
+            AfterSalesError,
+            CustomerFlowPermissionError,
+            CustomerFlowStateError,
+            ValueError,
+        ) as exc:
+            return _aftersales_error(exc)
+        return Response(
+            {
+                "code": 0,
+                "msg": "售后申请草稿已创建" if created else "售后申请草稿已更新",
+                "data": data,
+            },
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+class AfterSalesApplicationDetailAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request, application_id):
+        user, error = _authenticated_user(request)
+        if error:
+            return error
+        try:
+            data = AfterSalesService.detail(
+                application_id=application_id,
+                user=user,
+            )
+        except AfterSalesError as exc:
+            return _aftersales_error(exc)
+        return Response({"code": 0, "msg": "success", "data": data})
+
+
+class AfterSalesApplicationMediaAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, application_id):
+        user, error = _authenticated_user(request)
+        if error:
+            return error
+        try:
+            data = AfterSalesService.upload_media(
+                application_id=application_id,
+                user=user,
+                uploaded_file=request.FILES.get("file"),
+                media_type=request.data.get("media_type"),
+                purpose=request.data.get("purpose"),
+                duration_seconds=request.data.get("duration_seconds"),
+                caption=request.data.get("caption"),
+            )
+        except AfterSalesError as exc:
+            return _aftersales_error(exc)
+        return Response(
+            {"code": 0, "msg": "附件上传成功", "data": data},
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class AfterSalesMediaFileAPI(APIView):
+    """Serve a private after-sales file only after canonical viewer checks."""
+
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request, media_id):
+        user, error = _authenticated_user(request)
+        if error:
+            return error
+        try:
+            media = AfterSalesService.get_media_file(media_id=media_id, user=user)
+            response = FileResponse(
+                media.file.open("rb"),
+                as_attachment=False,
+                filename=media.original_name or media.file.name,
+                content_type=media.content_type or "application/octet-stream",
+            )
+        except AfterSalesError as exc:
+            return _aftersales_error(exc)
+        except (FileNotFoundError, OSError):
+            return Response(
+                {"code": 404, "msg": "售后附件文件不存在", "data": {}},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        response["Cache-Control"] = "private, no-store"
+        return response
+
+
+class AfterSalesSubmitAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, application_id):
+        user, error = _authenticated_user(request)
+        if error:
+            return error
+        try:
+            data = AfterSalesService.submit(application_id=application_id, user=user)
+        except (
+            AfterSalesError,
+            CustomerFlowPermissionError,
+            CustomerFlowStateError,
+        ) as exc:
+            return _aftersales_error(exc)
+        return Response({"code": 0, "msg": "售后申请已提交", "data": data})
+
+
+class AfterSalesTriageOptionsAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request, application_id):
+        user, error = _authenticated_user(request)
+        if error:
+            return error
+        try:
+            data = AfterSalesService.triage_options(
+                application_id=application_id,
+                user=user,
+            )
+        except AfterSalesError as exc:
+            return _aftersales_error(exc)
+        return Response({"code": 0, "msg": "success", "data": data})
+
+
+class AfterSalesTriageAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, application_id):
+        user, error = _authenticated_user(request)
+        if error:
+            return error
+        try:
+            data = AfterSalesService.triage(
+                application_id=application_id,
+                user=user,
+                data=request.data,
+            )
+        except AfterSalesError as exc:
+            return _aftersales_error(exc)
+        return Response({"code": 0, "msg": "售后判断及派单已完成", "data": data})
+
+
+class AfterSalesApplicantShipmentAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, application_id):
+        user, error = _authenticated_user(request)
+        if error:
+            return error
+        try:
+            data = AfterSalesService.applicant_shipment(
+                application_id=application_id, user=user, data=request.data
+            )
+        except AfterSalesError as exc:
+            return _aftersales_error(exc)
+        return Response({"code": 0, "msg": "寄送信息已确认", "data": data})
+
+
+class AfterSalesRepairReceiptAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, application_id):
+        user, error = _authenticated_user(request)
+        if error:
+            return error
+        try:
+            data = AfterSalesService.repair_receipt(
+                application_id=application_id, user=user, data=request.data
+            )
+        except AfterSalesError as exc:
+            return _aftersales_error(exc)
+        return Response({"code": 0, "msg": "已确认收到寄修设备", "data": data})
+
+
+class AfterSalesRepairCompleteAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, application_id):
+        user, error = _authenticated_user(request)
+        if error:
+            return error
+        try:
+            data = AfterSalesService.repair_complete(
+                application_id=application_id, user=user, data=request.data
+            )
+        except AfterSalesError as exc:
+            return _aftersales_error(exc)
+        return Response({"code": 0, "msg": "维修完成已记录", "data": data})
+
+
+class AfterSalesReturnShipmentAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, application_id):
+        user, error = _authenticated_user(request)
+        if error:
+            return error
+        try:
+            data = AfterSalesService.return_shipment(
+                application_id=application_id, user=user, data=request.data
+            )
+        except AfterSalesError as exc:
+            return _aftersales_error(exc)
+        return Response({"code": 0, "msg": "返件信息已确认", "data": data})
+
+
+class AfterSalesApplicantConfirmAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, application_id):
+        user, error = _authenticated_user(request)
+        if error:
+            return error
+        try:
+            data = AfterSalesService.applicant_confirm(
+                application_id=application_id, user=user, data=request.data
+            )
+        except AfterSalesError as exc:
+            return _aftersales_error(exc)
+        return Response({"code": 0, "msg": "售后结果已确认", "data": data})
+
+
+class AfterSalesThirdPartyMaterialShipmentAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, application_id):
+        user, error = _authenticated_user(request)
+        if error:
+            return error
+        try:
+            data = AfterSalesService.third_party_material_shipment(
+                application_id=application_id, user=user, data=request.data
+            )
+        except AfterSalesError as exc:
+            return _aftersales_error(exc)
+        return Response({"code": 0, "msg": "第三方备件寄送已记录", "data": data})
+
+
+class AfterSalesThirdPartyExpenseAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, application_id):
+        user, error = _authenticated_user(request)
+        if error:
+            return error
+        try:
+            data = AfterSalesService.third_party_expense(
+                application_id=application_id, user=user, data=request.data
+            )
+        except AfterSalesError as exc:
+            return _aftersales_error(exc)
+        return Response({"code": 0, "msg": "第三方维修费用已记录", "data": data})
+
+
+class AfterSalesThirdPartyFaultMaterialReturnAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, application_id):
+        user, error = _authenticated_user(request)
+        if error:
+            return error
+        try:
+            data = AfterSalesService.third_party_fault_material_return(
+                application_id=application_id, user=user, data=request.data
+            )
+        except AfterSalesError as exc:
+            return _aftersales_error(exc)
+        return Response({"code": 0, "msg": "故障物料返还已记录", "data": data})
+
+
+class AfterSalesFactoryCloseAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, application_id):
+        user, error = _authenticated_user(request)
+        if error:
+            return error
+        try:
+            data = AfterSalesService.factory_close(
+                application_id=application_id, user=user, data=request.data
+            )
+        except AfterSalesError as exc:
+            return _aftersales_error(exc)
+        return Response({"code": 0, "msg": "售后服务已结案", "data": data})
 
 
 

@@ -19,3 +19,19 @@ class GoodsTransferPrivateStorage(FileSystemStorage):
 
 
 goods_transfer_private_storage = GoodsTransferPrivateStorage()
+
+
+@deconstructible
+class AfterSalesPrivateStorage(FileSystemStorage):
+    """售后图片和视频私有存储，只允许经鉴权接口读取。"""
+
+    def __init__(self):
+        location = getattr(
+            settings,
+            "AFTERSALES_PRIVATE_ROOT",
+            Path(settings.BASE_DIR) / "private_after_sales",
+        )
+        super().__init__(location=location, base_url=None)
+
+
+after_sales_private_storage = AfterSalesPrivateStorage()

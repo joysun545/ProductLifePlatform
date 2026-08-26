@@ -1,4 +1,5 @@
 import uuid
+from datetime import timedelta
 
 from django.db import transaction
 from django.utils import timezone
@@ -8,6 +9,7 @@ from account.models import (
     OrganizationRelation,
     OrganizationRelationType,
     OrganizationType,
+    OrganizationRole,
     UserOrganization,
 )
 from account.services.auth_service import get_active_identity
@@ -15,12 +17,16 @@ from common.domain.device_ownership import resolve_device_ownership
 from lifecycle.models import (
     ActivationRecord,
     CustomerDeviceBinding,
+    CustomerVehicle,
+    DriverVehicleBinding,
+    DriverVehicleInvitation,
     Device,
     DeviceState,
     InstallationInvitation,
     LifecycleEvent,
     OrganizationDevice,
     ProductDocumentRead,
+    VehicleDeviceAssignment,
 )
 from lifecycle.services.scan_service import ScanService
 from integration.services.device_telemetry import DeviceTelemetryService
@@ -40,6 +46,40 @@ class CustomerFlowStateError(CustomerFlowError):
 
 
 class CustomerDeviceService:
+    @staticmethod
+    def _vehicle(*, organization, vehicle_no):
+        display = (vehicle_no or "").strip() or "未登记车辆"
+        normalized = "".join(display.upper().split())
+        vehicle, _ = CustomerVehicle.objects.get_or_create(
+            customer_organization=organization,
+            normalized_vehicle_no=normalized,
+            defaults={"vehicle_no": display},
+        )
+        return vehicle
+
+    @staticmethod
+    def _assign_device_vehicle(*, binding, vehicle, user, reason, at=None):
+        """切换当前车辆并保留上一段归属历史；重复调用保持幂等。"""
+        at = at or timezone.now()
+        current = VehicleDeviceAssignment.objects.select_for_update().filter(
+            device=binding.device, is_current=True,
+        ).first()
+        if current and current.vehicle_id == vehicle.id:
+            return current
+        if current:
+            current.is_current = False
+            current.ended_at = at
+            current.save(update_fields=("is_current", "ended_at", "updated_at"))
+        return VehicleDeviceAssignment.objects.create(
+            device=binding.device,
+            customer_organization=binding.customer_organization,
+            vehicle=vehicle,
+            source_binding=binding,
+            assigned_by=user,
+            reason=reason,
+            started_at=at,
+        )
+
     @staticmethod
     def _expire(invitation):
         if (
@@ -215,15 +255,8 @@ class CustomerDeviceService:
         if not customer_type:
             raise CustomerFlowStateError("系统尚未配置用户组织类型")
 
-        if data["customer_type"] == "FLEET":
-            organization_name = data["customer_name"].strip()
-            if not organization_name:
-                raise CustomerFlowStateError("企业或车队用户必须填写名称")
-        else:
-            base_name = data["contact_name"].strip() or (
-                user.wx_nickname or "个人用户"
-            )
-            organization_name = f"{base_name}的个人用户"
+        base_name = data["contact_name"].strip() or (user.wx_nickname or "用户")
+        organization_name = f"{base_name}的用户档案"
 
         organization = Organization.objects.create(
             name=organization_name,
@@ -329,6 +362,10 @@ class CustomerDeviceService:
             source_organization=invitation.source_organization,
             customer_organization=customer_org,
         )
+        vehicle = cls._vehicle(
+            organization=customer_org,
+            vehicle_no=profile_data["vehicle_no"],
+        )
 
         now = timezone.now()
         event = LifecycleEvent.objects.create(
@@ -373,7 +410,7 @@ class CustomerDeviceService:
         invitation.accepted_at = now
         invitation.save()
 
-        CustomerDeviceBinding.objects.update_or_create(
+        customer_binding, _ = CustomerDeviceBinding.objects.update_or_create(
             device=device,
             defaults={
                 "customer_organization": customer_org,
@@ -387,9 +424,17 @@ class CustomerDeviceService:
                 ),
                 "customer_type": stored_data["customer_type"],
                 "vehicle_no": stored_data["vehicle_no"],
+                "vehicle": vehicle,
                 "accepted_at": now,
                 "status": CustomerDeviceBinding.Status.ACTIVE,
             },
+        )
+        cls._assign_device_vehicle(
+            binding=customer_binding,
+            vehicle=vehicle,
+            user=user,
+            reason=VehicleDeviceAssignment.Reason.INITIAL_INSTALL,
+            at=now,
         )
 
         if user.phone != profile_data["phone"]:
@@ -405,23 +450,18 @@ class CustomerDeviceService:
             raise CustomerFlowPermissionError("当前账号还不是用户负责人")
         if not (
             identity.organization.organization_type.code == "CUSTOMER"
-            and identity.role.code == "customer_owner"
+            and identity.role.code in {"customer_owner", "driver"}
         ):
             raise CustomerFlowPermissionError("当前岗位不能访问用户设备页面")
         return identity
 
     @staticmethod
     def _accepted_invitation(*, device, user, identity):
-        return (
-            InstallationInvitation.objects.filter(
-                device=device,
-                invitee=user,
-                target_organization=identity.organization,
-                status=InstallationInvitation.Status.ACCEPTED,
-            )
-            .order_by("-accepted_at", "-id")
-            .first()
-        )
+        binding = CustomerDeviceBinding.objects.filter(
+            device=device, customer_organization=identity.organization,
+            status=CustomerDeviceBinding.Status.ACTIVE,
+        ).select_related("invitation").first()
+        return binding.invitation if binding else None
 
     @classmethod
     def _owned_device_context(cls, *, device_id, user):
@@ -447,6 +487,12 @@ class CustomerDeviceService:
         )
         if not ownership.is_direct_owner:
             raise CustomerFlowPermissionError("该设备不属于当前用户组织")
+        if identity.role.code == "driver" and not DriverVehicleBinding.objects.filter(
+            driver=user, is_active=True,
+            vehicle__device_bindings__device=device,
+            vehicle__device_bindings__status=CustomerDeviceBinding.Status.ACTIVE,
+        ).exists():
+            raise CustomerFlowPermissionError("该设备不属于当前司机获授权车辆")
         invitation = cls._accepted_invitation(
             device=device,
             user=user,
@@ -509,12 +555,21 @@ class CustomerDeviceService:
                 customer_organization=identity.organization,
                 device_id__in=[record.device_id for record in records],
                 status=CustomerDeviceBinding.Status.ACTIVE,
-            ).select_related("source_organization")
+            ).select_related("source_organization", "vehicle")
         }
+        allowed_vehicle_ids = None
+        if identity.role.code == "driver":
+            allowed_vehicle_ids = set(DriverVehicleBinding.objects.filter(
+                driver=user, is_active=True,
+            ).values_list("vehicle_id", flat=True))
         devices = []
         for record in records:
             device = record.device
             binding = bindings.get(device.id)
+            if allowed_vehicle_ids is not None and (
+                not binding or binding.vehicle_id not in allowed_vehicle_ids
+            ):
+                continue
             devices.append(
                 {
                     "id": device.id,
@@ -534,6 +589,7 @@ class CustomerDeviceService:
                     "install_status": device.state.install_status,
                     "activation_status": device.state.activation_status,
                     "vehicle_no": binding.vehicle_no if binding else "",
+                    "vehicle_id": binding.vehicle_id if binding else None,
                     "source_organization": (
                         binding.source_organization.name if binding else ""
                     ),
@@ -541,6 +597,46 @@ class CustomerDeviceService:
                         binding.accepted_at.isoformat() if binding else ""
                     ),
                 }
+            )
+        vehicle_groups = []
+        by_vehicle = {}
+        for item in devices:
+            key = item["vehicle_id"] or f"legacy-{item['vehicle_no']}"
+            group = by_vehicle.setdefault(key, {
+                "id": item["vehicle_id"],
+                "vehicle_no": item["vehicle_no"] or "未登记车辆",
+                "devices": [],
+            })
+            group["devices"].append(item)
+        for group in by_vehicle.values():
+            group["device_count"] = len(group["devices"])
+            group["can_share_driver"] = bool(
+                identity.role.code == "customer_owner" and group["id"]
+            )
+            vehicle_groups.append(group)
+        active_driver_bindings = DriverVehicleBinding.objects.filter(
+            vehicle_id__in=[group["id"] for group in vehicle_groups if group["id"]],
+            is_active=True,
+        ).select_related("driver").order_by("created_at", "id")
+        drivers_by_vehicle = {}
+        for driver_binding in active_driver_bindings:
+            drivers_by_vehicle.setdefault(driver_binding.vehicle_id, []).append({
+                "user_id": driver_binding.driver_id,
+                "nickname": (
+                    driver_binding.driver.get_full_name()
+                    or driver_binding.driver.wx_nickname
+                    or "司机"
+                ),
+                "shared_at": driver_binding.created_at.isoformat(),
+            })
+        for group in vehicle_groups:
+            shared_drivers = drivers_by_vehicle.get(group["id"], [])
+            names = [item["nickname"] for item in shared_drivers]
+            group["shared_drivers"] = shared_drivers
+            group["shared_driver_count"] = len(shared_drivers)
+            group["shared_driver_names"] = names
+            group["sharing_text"] = (
+                f"该车辆绑定设备已与{'、'.join(names)}共享" if names else ""
             )
         return {
             "customer": {
@@ -558,7 +654,129 @@ class CustomerDeviceService:
                 item["activation_status"] != "ACTIVATED" for item in devices
             ),
             "devices": devices,
+            "vehicles": vehicle_groups,
         }
+
+    @classmethod
+    def create_driver_invitation(cls, *, vehicle_id, user):
+        identity = cls._customer_identity(user)
+        if identity.role.code != "customer_owner":
+            raise CustomerFlowPermissionError("只有用户负责人可以分享车辆")
+        vehicle = CustomerVehicle.objects.filter(
+            id=vehicle_id, customer_organization=identity.organization,
+            status=CustomerVehicle.Status.ACTIVE,
+        ).first()
+        if not vehicle:
+            raise CustomerFlowStateError("车辆不存在")
+        now = timezone.now()
+        invitation = DriverVehicleInvitation.objects.filter(
+            vehicle=vehicle, inviter=user,
+            status=DriverVehicleInvitation.Status.PENDING,
+            expires_at__gt=now,
+        ).order_by("-id").first()
+        if not invitation:
+            invitation = DriverVehicleInvitation.objects.create(
+                vehicle=vehicle, inviter=user, expires_at=now + timedelta(days=7)
+            )
+        return cls._driver_invitation_payload(invitation, user=user)
+
+    @staticmethod
+    def _driver_invitation_payload(invitation, *, user):
+        devices = list(CustomerDeviceBinding.objects.filter(
+            vehicle=invitation.vehicle,
+            status=CustomerDeviceBinding.Status.ACTIVE,
+        ).select_related("device__product_model", "device__state"))
+        accepted_by_me = invitation.invitee_id == user.id
+        acceptance_allowed = (
+            invitation.status == DriverVehicleInvitation.Status.PENDING
+            and invitation.expires_at > timezone.now()
+            and invitation.inviter_id != user.id
+        )
+        blocked_reason = ""
+        if invitation.inviter_id == user.id:
+            blocked_reason = "分享人不能接受自己的司机邀请"
+        elif invitation.status == DriverVehicleInvitation.Status.ACCEPTED and not accepted_by_me:
+            blocked_reason = "该邀请已由其他账号接受"
+        elif invitation.status != DriverVehicleInvitation.Status.PENDING and not accepted_by_me:
+            blocked_reason = "司机邀请已失效"
+        elif invitation.expires_at <= timezone.now():
+            blocked_reason = "司机邀请已过期"
+        return {
+            "token": str(invitation.token), "status": invitation.status,
+            "expires_at": invitation.expires_at.isoformat(),
+            "vehicle": {"id": invitation.vehicle_id,
+                        "vehicle_no": invitation.vehicle.vehicle_no,
+                        "device_count": len(devices),
+                        "devices": [{"id": x.device_id, "sn": x.device.sn,
+                                     "product_model": x.device.product_model.name,
+                                     "activation_status": x.device.state.activation_status}
+                                    for x in devices]},
+            "owner": {
+                "organization_name": invitation.vehicle.customer_organization.name,
+                "nickname": invitation.inviter.wx_nickname or invitation.inviter.username,
+            },
+            "accepted_by_me": accepted_by_me,
+            "acceptance_allowed": acceptance_allowed,
+            "blocked_reason": blocked_reason,
+        }
+
+    @classmethod
+    def driver_invitation_detail(cls, *, token, user):
+        invitation = DriverVehicleInvitation.objects.select_related(
+            "vehicle__customer_organization", "inviter", "invitee"
+        ).filter(token=token).first()
+        if not invitation:
+            raise CustomerFlowStateError("司机邀请不存在")
+        if invitation.status == DriverVehicleInvitation.Status.PENDING and invitation.expires_at <= timezone.now():
+            invitation.status = DriverVehicleInvitation.Status.EXPIRED
+            invitation.save(update_fields=("status", "updated_at"))
+        if invitation.status == DriverVehicleInvitation.Status.ACCEPTED and invitation.invitee_id != user.id:
+            raise CustomerFlowStateError("该邀请已由其他账号接受")
+        if invitation.status not in {DriverVehicleInvitation.Status.PENDING,
+                                     DriverVehicleInvitation.Status.ACCEPTED}:
+            raise CustomerFlowStateError("司机邀请已失效")
+        return cls._driver_invitation_payload(invitation, user=user)
+
+    @classmethod
+    @transaction.atomic
+    def accept_driver_invitation(cls, *, token, user):
+        invitation = DriverVehicleInvitation.objects.select_for_update().select_related(
+            "vehicle__customer_organization", "inviter"
+        ).filter(token=token).first()
+        if not invitation:
+            raise CustomerFlowStateError("司机邀请不存在")
+        if invitation.inviter_id == user.id:
+            raise CustomerFlowPermissionError("分享人不能接受自己的司机邀请")
+        if invitation.status == DriverVehicleInvitation.Status.ACCEPTED:
+            if invitation.invitee_id == user.id:
+                return cls._driver_invitation_payload(invitation, user=user)
+            raise CustomerFlowStateError("该邀请已由其他账号接受")
+        if invitation.status != DriverVehicleInvitation.Status.PENDING or invitation.expires_at <= timezone.now():
+            raise CustomerFlowStateError("司机邀请已失效")
+        identity = get_active_identity(user)
+        if identity and not (
+            identity.organization_id == invitation.vehicle.customer_organization_id
+            and identity.role.code == "driver"
+        ):
+            raise CustomerFlowPermissionError("当前微信已有其他业务岗位")
+        if not identity:
+            role = OrganizationRole.objects.get(
+                organization_type=invitation.vehicle.customer_organization.organization_type,
+                code="driver", is_active=True,
+            )
+            identity = UserOrganization.objects.create(
+                user=user, organization=invitation.vehicle.customer_organization,
+                role=role, inviter=invitation.inviter,
+            )
+        DriverVehicleBinding.objects.update_or_create(
+            vehicle=invitation.vehicle, driver=user,
+            defaults={"invitation": invitation, "is_active": True},
+        )
+        invitation.invitee = user
+        invitation.status = DriverVehicleInvitation.Status.ACCEPTED
+        invitation.accepted_at = timezone.now()
+        invitation.save()
+        return cls._driver_invitation_payload(invitation, user=user)
 
     @staticmethod
     def _ordered_documents(device):
@@ -596,7 +814,7 @@ class CustomerDeviceService:
         binding = (
             CustomerDeviceBinding.objects.filter(
                 device=device,
-                accepted_by=user,
+                customer_organization=device.state.current_organization,
                 status=CustomerDeviceBinding.Status.ACTIVE,
             )
             .order_by("-accepted_at", "-id")
@@ -755,8 +973,16 @@ class CustomerDeviceService:
             )
             .order_by("-created_at", "-id")
         )
+        scan_result = ScanService.resolve_device(device=device, user=user)
+        capabilities = list(scan_result.get("capabilities") or [])
+        # 司机对已分享车辆中的设备与用户负责人具有相同的设备操作权限。
+        # ScanService 的通用角色能力不包含司机激活，因此在已经通过
+        # _owned_device_context 严格验证车辆分享关系后补充该能力。
+        if identity.role.code == "driver" and "activate_device" not in capabilities:
+            capabilities.append("activate_device")
+            scan_result["capabilities"] = capabilities
         return {
-            "scan_result": ScanService.resolve_device(device=device, user=user),
+            "scan_result": scan_result,
             "asset": {
                 "device_id": device.id,
                 "sn": device.sn,
@@ -807,7 +1033,12 @@ class CustomerDeviceService:
     @classmethod
     @transaction.atomic
     def activate(cls, *, device_id, user, vehicle_no, location=""):
-        identity = cls._customer_identity(user)
+        # 这里必须复用详情页的属主和司机车辆授权校验，避免同一用户组织中
+        # 未获得车辆分享的司机绕过页面直接调用激活接口。
+        identity, _, invitation = cls._owned_device_context(
+            device_id=device_id,
+            user=user,
+        )
         device = Device.objects.select_for_update().filter(pk=device_id).first()
         if not device:
             raise CustomerFlowStateError("设备不存在")
@@ -825,11 +1056,6 @@ class CustomerDeviceService:
         if ActivationRecord.objects.filter(device=device).exists():
             raise CustomerFlowStateError("设备已经存在激活记录")
 
-        invitation = cls._accepted_invitation(
-            device=device,
-            user=user,
-            identity=identity,
-        )
         document_gate = cls._document_gate(
             device=device,
             user=user,
@@ -873,10 +1099,24 @@ class CustomerDeviceService:
             invitation.customer_data = data
             invitation.save(update_fields=("customer_data", "updated_at"))
 
-        CustomerDeviceBinding.objects.filter(
+        binding = CustomerDeviceBinding.objects.select_for_update().filter(
             device=device,
             customer_organization=identity.organization,
             status=CustomerDeviceBinding.Status.ACTIVE,
-        ).update(vehicle_no=vehicle_no, updated_at=now)
+        ).first()
+        if binding:
+            vehicle = cls._vehicle(
+                organization=identity.organization, vehicle_no=vehicle_no,
+            )
+            binding.vehicle_no = vehicle_no
+            binding.vehicle = vehicle
+            binding.save(update_fields=("vehicle_no", "vehicle", "updated_at"))
+            cls._assign_device_vehicle(
+                binding=binding,
+                vehicle=vehicle,
+                user=user,
+                reason=VehicleDeviceAssignment.Reason.ACTIVATION_UPDATE,
+                at=now,
+            )
 
         return cls.device_result(device_id=device.id, user=user)

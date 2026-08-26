@@ -17,7 +17,13 @@ from .installation import InstallationInvitation, InstallationRecord
 
 from .document_read import ProductDocumentRead
 
-from .customer_device import CustomerDeviceBinding
+from .customer_device import (
+    CustomerDeviceBinding,
+    CustomerVehicle,
+    DriverVehicleBinding,
+    DriverVehicleInvitation,
+    VehicleDeviceAssignment,
+)
 
 from .goods_transfer import GoodsTransfer, GoodsTransferItem
 
@@ -44,6 +50,7 @@ from .factory_return import (
     FactoryReturnWarrantyDispatch,
     FactoryReturnWarrantyDispatchItem,
 )
+from .aftersales import AfterSalesApplication, AfterSalesEvent, AfterSalesMedia
 
 
 __all__ = [
@@ -67,6 +74,10 @@ __all__ = [
     "ProductDocumentRead",
 
     "CustomerDeviceBinding",
+    "CustomerVehicle",
+    "DriverVehicleBinding",
+    "DriverVehicleInvitation",
+    "VehicleDeviceAssignment",
 
     "GoodsTransfer",
 
@@ -87,6 +98,12 @@ __all__ = [
     "FactoryReturnProcess",
 
     "FactoryReturnInventoryItem",
+
+    "AfterSalesApplication",
+
+    "AfterSalesEvent",
+
+    "AfterSalesMedia",
 
     "FactoryReturnMaterialReturnRecord",
 

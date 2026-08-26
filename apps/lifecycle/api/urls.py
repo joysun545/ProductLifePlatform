@@ -10,6 +10,100 @@ app_name = "lifecycle"
 
 urlpatterns = [
 
+    # Canonical after-sales chain.  All task payloads and pages use
+    # AfterSalesApplication.application_id; the retired AfterSalesCase routes
+    # intentionally have no compatibility aliases.
+    path(
+        "customer/devices/<int:device_id>/after-sales/context/",
+        views.AfterSalesRequestContextAPI.as_view(),
+        name="after_sales_request_context",
+    ),
+    path(
+        "customer/devices/<int:device_id>/after-sales/applications/",
+        views.AfterSalesApplicationListCreateAPI.as_view(),
+        name="after_sales_application_create",
+    ),
+    path(
+        "after-sales/applications/",
+        views.AfterSalesApplicationListCreateAPI.as_view(),
+        name="after_sales_application_list",
+    ),
+    path(
+        "after-sales/applications/<int:application_id>/",
+        views.AfterSalesApplicationDetailAPI.as_view(),
+        name="after_sales_application_detail",
+    ),
+    path(
+        "after-sales/applications/<int:application_id>/media/",
+        views.AfterSalesApplicationMediaAPI.as_view(),
+        name="after_sales_application_media",
+    ),
+    path(
+        "after-sales/media/<int:media_id>/file/",
+        views.AfterSalesMediaFileAPI.as_view(),
+        name="after_sales_media_file",
+    ),
+    path(
+        "after-sales/applications/<int:application_id>/submit/",
+        views.AfterSalesSubmitAPI.as_view(),
+        name="after_sales_submit",
+    ),
+    path(
+        "after-sales/applications/<int:application_id>/triage-options/",
+        views.AfterSalesTriageOptionsAPI.as_view(),
+        name="after_sales_triage_options",
+    ),
+    path(
+        "after-sales/applications/<int:application_id>/triage/",
+        views.AfterSalesTriageAPI.as_view(),
+        name="after_sales_triage",
+    ),
+    path(
+        "after-sales/applications/<int:application_id>/applicant-shipment/",
+        views.AfterSalesApplicantShipmentAPI.as_view(),
+        name="after_sales_applicant_shipment",
+    ),
+    path(
+        "after-sales/applications/<int:application_id>/repair-receipt/",
+        views.AfterSalesRepairReceiptAPI.as_view(),
+        name="after_sales_repair_receipt",
+    ),
+    path(
+        "after-sales/applications/<int:application_id>/repair-complete/",
+        views.AfterSalesRepairCompleteAPI.as_view(),
+        name="after_sales_repair_complete",
+    ),
+    path(
+        "after-sales/applications/<int:application_id>/return-shipment/",
+        views.AfterSalesReturnShipmentAPI.as_view(),
+        name="after_sales_return_shipment",
+    ),
+    path(
+        "after-sales/applications/<int:application_id>/applicant-confirm/",
+        views.AfterSalesApplicantConfirmAPI.as_view(),
+        name="after_sales_applicant_confirm",
+    ),
+    path(
+        "after-sales/applications/<int:application_id>/third-party/material-shipment/",
+        views.AfterSalesThirdPartyMaterialShipmentAPI.as_view(),
+        name="after_sales_third_party_material_shipment",
+    ),
+    path(
+        "after-sales/applications/<int:application_id>/third-party/expense/",
+        views.AfterSalesThirdPartyExpenseAPI.as_view(),
+        name="after_sales_third_party_expense",
+    ),
+    path(
+        "after-sales/applications/<int:application_id>/third-party/fault-material-return/",
+        views.AfterSalesThirdPartyFaultMaterialReturnAPI.as_view(),
+        name="after_sales_third_party_fault_material_return",
+    ),
+    path(
+        "after-sales/applications/<int:application_id>/factory-close/",
+        views.AfterSalesFactoryCloseAPI.as_view(),
+        name="after_sales_factory_close",
+    ),
+
     path(
         "goods-transfers/options/",
         views.GoodsTransferOptionsAPI.as_view(),
@@ -279,6 +373,24 @@ urlpatterns = [
         "customer/devices/",
         views.CustomerDeviceListAPI.as_view(),
         name="customer_device_list",
+    ),
+
+    path(
+        "customer/vehicles/<int:vehicle_id>/driver-invitations/",
+        views.DriverVehicleInvitationCreateAPI.as_view(),
+        name="driver_vehicle_invitation_create",
+    ),
+
+    path(
+        "customer/driver-invitations/<uuid:token>/",
+        views.DriverVehicleInvitationDetailAPI.as_view(),
+        name="driver_vehicle_invitation_detail",
+    ),
+
+    path(
+        "customer/driver-invitations/<uuid:token>/accept/",
+        views.AcceptDriverVehicleInvitationAPI.as_view(),
+        name="driver_vehicle_invitation_accept",
     ),
 
     path(

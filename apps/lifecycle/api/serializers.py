@@ -32,7 +32,10 @@ class RefreshInstallationInvitationSerializer(serializers.Serializer):
 
 
 class AcceptInstallationInvitationSerializer(serializers.Serializer):
-    customer_type = serializers.ChoiceField(choices=("PERSONAL", "FLEET"))
+    # 历史接口保留该字段；新交互统一建立“用户负责人账号”。
+    customer_type = serializers.ChoiceField(
+        choices=("PERSONAL", "FLEET"), required=False, default="PERSONAL"
+    )
     customer_name = serializers.CharField(
         required=False,
         allow_blank=True,
@@ -51,12 +54,7 @@ class AcceptInstallationInvitationSerializer(serializers.Serializer):
     vehicle_no = serializers.CharField(max_length=64, trim_whitespace=True)
 
     def validate(self, attrs):
-        if attrs["customer_type"] == "FLEET" and not attrs.get(
-            "customer_name", ""
-        ):
-            raise serializers.ValidationError(
-                {"customer_name": "企业或车队用户必须填写名称"}
-            )
+        attrs["customer_type"] = "PERSONAL"
         return attrs
 
 
