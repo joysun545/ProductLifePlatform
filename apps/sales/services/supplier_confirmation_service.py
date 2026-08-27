@@ -1,8 +1,12 @@
+from datetime import date
+
 from django.db import transaction
 from django.utils import timezone
 
 from account.models import UserOrganization
-from sales.models import OrderPlan
+from product.models import BOMItem
+from sales.models import OrderPlan, OrderPlanItemMaterialBatch
+from supply_chain.models import SupplierMaterialBatch
 from workflow.models import UserTask, WorkItem
 from workflow.services.workflow_service import publish_workitem
 
@@ -57,6 +61,44 @@ def _scope_for(payload, openid):
     return scope if isinstance(scope, dict) else None
 
 
+def _rebind_unique_legacy_scopes(payload, tasks):
+    """Rebind role scopes after a test-account inbox slot shift.
+
+    Rebinding is deliberately limited to roles that have exactly one current
+    task and exactly one historical scope.  Multiple supplier-sales scopes are
+    ambiguous and must never be guessed.
+    """
+    scopes = payload.get("recipient_scopes", {})
+    if not isinstance(scopes, dict):
+        return False
+    changed = False
+    roles = {task.to_role_snapshot for task in tasks if task.to_role_snapshot}
+    for role_code in roles:
+        role_tasks = [
+            task for task in tasks if task.to_role_snapshot == role_code
+        ]
+        role_scopes = [
+            (openid, scope)
+            for openid, scope in scopes.items()
+            if isinstance(scope, dict) and scope.get("role") == role_code
+        ]
+        if len(role_tasks) != 1 or len(role_scopes) != 1:
+            continue
+        task = role_tasks[0]
+        current = scopes.get(task.to_openid)
+        if isinstance(current, dict) and current.get("role") == role_code:
+            continue
+        old_openid, scope = role_scopes[0]
+        if old_openid == task.to_openid:
+            continue
+        scopes.pop(old_openid, None)
+        scopes[task.to_openid] = scope
+        changed = True
+    if changed:
+        payload["recipient_scopes"] = scopes
+    return changed
+
+
 def _processed_actors(payload):
     value = payload.get("processed_actors", [])
     return value if isinstance(value, list) else []
@@ -88,6 +130,148 @@ def _all_materials_covered_by_sales(payload):
                     int(value) for value in scope.get("material_ids", [])
                 )
     return bool(all_material_ids) and all_material_ids <= sales_material_ids
+
+
+def _save_material_batches(*, plan, supplier, user, payload, scope, raw_rows):
+    if not payload.get("supplier_batch_capture_required") and not raw_rows:
+        return 0
+    if not isinstance(raw_rows, list):
+        raise SupplierConfirmationError("请为责任范围内的物料填写供应商生产批次。")
+    scope_material_ids = {int(value) for value in scope.get("material_ids", [])}
+    required = {}
+    for source in payload.get("materials", []):
+        if (
+            not isinstance(source, dict)
+            or not source.get("order_plan_item_id")
+            or not source.get("material_id")
+            or int(source["material_id"]) not in scope_material_ids
+        ):
+            continue
+        row = dict(source)
+        if not row.get("bom_item_id"):
+            order_item = plan.items.filter(pk=row["order_plan_item_id"]).first()
+            confirmation = (
+                getattr(order_item, "bom_confirmation", None)
+                if order_item else None
+            )
+            bom_item = (
+                BOMItem.objects.filter(
+                    bom_id=(
+                        confirmation.confirmed_bom_id
+                        if confirmation else None
+                    ),
+                    material_id=row.get("material_id"),
+                    material_spec_id=row.get("material_spec_id"),
+                    supplier_id=row.get("supplier_id") or supplier.pk,
+                ).first()
+            )
+            if not bom_item:
+                raise SupplierConfirmationError("历史订单BOM物料无法定位，请刷新后重试。")
+            row["bom_item_id"] = bom_item.pk
+            row["supplier_id"] = bom_item.supplier_id
+            row["material_id"] = bom_item.material_id
+            row["material_spec_id"] = bom_item.material_spec_id
+        required[(int(row["order_plan_item_id"]), int(row["bom_item_id"]))] = row
+    submitted = {}
+    for raw in raw_rows:
+        if not isinstance(raw, dict):
+            raise SupplierConfirmationError("供应商物料批次数据格式无效。")
+        key = (
+            _integer(raw.get("order_plan_item_id"), "订单产品批次"),
+            _integer(raw.get("bom_item_id"), "BOM物料行"),
+        )
+        if key in submitted:
+            raise SupplierConfirmationError("同一订单物料不能重复提交批次。")
+        submitted[key] = raw
+    if not set(required) <= set(submitted):
+        raise SupplierConfirmationError("责任物料批次未填写完整，请刷新后重新提交。")
+
+    bom_items = {
+        item.pk: item
+        for item in BOMItem.objects.select_related(
+            "bom", "material", "material_spec", "supplier",
+        ).filter(pk__in={key[1] for key in required})
+    }
+    saved = 0
+    for (order_item_id, bom_item_id), source in required.items():
+        bom_item = bom_items.get(bom_item_id)
+        if (
+            not bom_item
+            or int(source["supplier_id"]) != supplier.pk
+            or bom_item.supplier_id != supplier.pk
+            or bom_item.material_id != int(source["material_id"])
+            or bom_item.material_spec_id != int(source["material_spec_id"])
+        ):
+            raise SupplierConfirmationError("订单BOM物料已变化，请刷新后重试。")
+        order_item = plan.items.filter(pk=order_item_id).first()
+        confirmation = getattr(order_item, "bom_confirmation", None) if order_item else None
+        if not confirmation or confirmation.confirmed_bom_id != bom_item.bom_id:
+            raise SupplierConfirmationError("订单产品批次与最终BOM不匹配。")
+
+        raw = submitted[(order_item_id, bom_item_id)]
+        batch_code = str(raw.get("batch_code") or "").strip()
+        if not batch_code:
+            raise SupplierConfirmationError(f"请填写{bom_item.material.name}的供应商生产批次。")
+        production_date = raw.get("production_date") or None
+        if production_date:
+            try:
+                production_date = date.fromisoformat(str(production_date))
+            except ValueError as exc:
+                raise SupplierConfirmationError("供应商物料生产日期格式无效。") from exc
+        normalized = batch_code.upper()
+        batch = SupplierMaterialBatch.objects.filter(
+            supplier=supplier,
+            material_spec_id=bom_item.material_spec_id,
+            normalized_batch_code=normalized,
+        ).first()
+        if not batch:
+            batch = SupplierMaterialBatch(
+                supplier=supplier,
+                material_id=bom_item.material_id,
+                material_spec_id=bom_item.material_spec_id,
+                batch_code=batch_code,
+                normalized_batch_code=normalized,
+                production_date=production_date,
+                created_by=user,
+            )
+            batch.full_clean()
+            batch.save()
+        elif batch.material_id != bom_item.material_id:
+            raise SupplierConfirmationError("已有批次的物料信息与当前BOM不一致。")
+
+        usage, _ = OrderPlanItemMaterialBatch.objects.update_or_create(
+            order_plan_item=order_item,
+            bom_item=bom_item,
+            defaults={
+                "supplier_material_batch": batch,
+                "confirmed_by": user,
+                "confirmed_at": timezone.now(),
+            },
+        )
+        usage.full_clean()
+        usage.save()
+        saved += 1
+    return saved
+
+
+def _all_supplier_lines_have_batches(plan, supplier_id, payload):
+    required_keys = {
+        (int(row["order_plan_item_id"]), int(row["bom_item_id"]))
+        for row in payload.get("materials", [])
+        if isinstance(row, dict)
+        and int(row.get("supplier_id") or 0) == supplier_id
+        and row.get("order_plan_item_id")
+        and row.get("bom_item_id")
+    }
+    if not required_keys:
+        return False
+    actual_keys = set(
+        OrderPlanItemMaterialBatch.objects.filter(
+            order_plan_item__plan=plan,
+            supplier_material_batch__supplier_id=supplier_id,
+        ).values_list("order_plan_item_id", "bom_item_id")
+    )
+    return required_keys <= actual_keys
 
 
 def _matching_openids(plan):
@@ -206,6 +390,7 @@ def confirm_supplier_order_materials(
     plan_id,
     supplier_id=None,
     usertask_id=None,
+    material_batches=None,
 ):
     identity = _supplier_identity(user)
     plan_id = _integer(plan_id, "订单计划")
@@ -250,6 +435,7 @@ def confirm_supplier_order_materials(
         raise SupplierConfirmationError("任务与当前订单不匹配。")
 
     payload = workitem.payload if isinstance(workitem.payload, dict) else {}
+    _rebind_unique_legacy_scopes(payload, tasks)
     scope = _scope_for(payload, user.wx_openid)
     if not scope or scope.get("role") != identity.role.code:
         raise SupplierConfirmationError("责任范围已变化，请刷新任务后重试。")
@@ -257,6 +443,15 @@ def confirm_supplier_order_materials(
         return _result(workitem, task, payload, completed=True)
     if task.state == "DONE":
         return _result(workitem, task, payload, completed=False)
+
+    batch_count = _save_material_batches(
+        plan=plan,
+        supplier=identity.organization,
+        user=user,
+        payload=payload,
+        scope=scope,
+        raw_rows=material_batches,
+    )
 
     now = timezone.now()
     task.state = "DONE"
@@ -305,9 +500,14 @@ def confirm_supplier_order_materials(
         ]
         completed = not pending_sales and _all_materials_covered_by_sales(payload)
         payload["waiting_for_owner"] = not completed and not pending_sales
+    if completed and payload.get("supplier_batch_capture_required"):
+        completed = _all_supplier_lines_have_batches(plan, supplier_id, payload)
+        payload["waiting_for_batches"] = not completed
 
     receipt_count = 0
     if completed:
+        payload["waiting_for_owner"] = False
+        payload["waiting_for_batches"] = False
         for other_task in tasks:
             if other_task.pk == task.pk or other_task.state == "DONE":
                 continue
@@ -353,10 +553,12 @@ def confirm_supplier_order_materials(
             workitem,
             user,
         )
-    return _result(
+    result = _result(
         workitem,
         task,
         payload,
         completed=completed,
         receipt_count=receipt_count,
     )
+    result["saved_material_batches"] = batch_count
+    return result

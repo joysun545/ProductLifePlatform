@@ -1,12 +1,14 @@
-from django.db import transaction
+from django.db import models, transaction
 from django.utils import timezone
 
 from account.models import UserOrganization
 from lifecycle.services.lifecycle_service import LifecycleService
 from manufacturing.models import ProductionBatch
-from sales.models import OrderPlan, OrderPlanItem
+from product.models import BOMItem
+from sales.models import OrderPlan, OrderPlanItem, OrderPlanItemMaterialBatch
 from sales.services.order_plan_reissue_service import ensure_reissue_qrcodes
 from workflow.services.workflow_service import publish_workitem
+from workflow.models import WorkItem
 
 
 class OrderQRCodePrintError(Exception):
@@ -97,6 +99,45 @@ def _get_item(item_id, *, lock=False):
     if item.production_quantity > 0 and not hasattr(item, "bom_confirmation"):
         raise OrderQRCodePrintError("该产品型号尚未确认生产BOM。")
     return item
+
+
+def _validate_supplier_batch_coverage(item):
+    """Protect new production without changing historical order behavior."""
+    if item.production_quantity <= 0:
+        return
+    usages = OrderPlanItemMaterialBatch.objects.filter(order_plan_item=item)
+    supplier_tasks = WorkItem.objects.filter(
+        type="ORDER_PLAN_SUPPLIER_PREPARE",
+        uniq_key__startswith=(
+            f"sales:order-plan:{item.plan_id}:supplier:"
+        ),
+    )
+    capture_required = usages.exists()
+    capture_required = capture_required or any(
+        bool((workitem.payload or {}).get("supplier_batch_capture_required"))
+        for workitem in supplier_tasks
+    )
+    if not capture_required:
+        return
+
+    expected = set(
+        BOMItem.objects.filter(
+            bom_id=item.bom_confirmation.confirmed_bom_id,
+            supplier_id__isnull=False,
+        ).values_list("id", flat=True)
+    )
+    actual = set(usages.values_list("bom_item_id", flat=True))
+    if expected != actual:
+        raise OrderQRCodePrintError(
+            "供应商生产批次尚未覆盖最终BOM全部供应物料，不能生成二维码。"
+        )
+    invalid = usages.exclude(
+        supplier_material_batch__supplier_id=models.F("bom_item__supplier_id"),
+        supplier_material_batch__material_id=models.F("bom_item__material_id"),
+        supplier_material_batch__material_spec_id=models.F("bom_item__material_spec_id"),
+    ).exists()
+    if invalid:
+        raise OrderQRCodePrintError("供应商生产批次与最终BOM物料不一致。")
 
 
 def _factory_stock_openids(plan):
@@ -221,6 +262,7 @@ def generate_item_qrcodes(*, item_id):
     item = _get_item(item_id, lock=True)
     devices = []
     if item.production_quantity > 0:
+        _validate_supplier_batch_coverage(item)
         batch, created = ProductionBatch.objects.select_for_update().get_or_create(
             batch_no=item.order_batch_code,
             defaults={

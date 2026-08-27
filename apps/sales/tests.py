@@ -35,14 +35,17 @@ from manufacturing.models import ProductionBatch
 from product.models import BOM, BOMItem, Brand, ProductCategory, ProductModel
 from sales.services.order_qrcode_print_service import (
     OrderQRCodePrintError,
+    _validate_supplier_batch_coverage,
     confirm_item_printed,
     generate_item_qrcodes,
     get_print_center_data,
 )
+from sales.services.supplier_batch_trace_service import get_supplier_batch_trace
 from sales.models import (
     OrderPlan,
     OrderPlanItem,
     OrderPlanItemBOMConfirmation,
+    OrderPlanItemMaterialBatch,
     OrderPlanFinance,
     OrderPlanLogisticsDocument,
     OrderPlanPayment,
@@ -52,6 +55,7 @@ from supply_chain.models import (
     Material,
     MaterialSpec,
     MaterialSpecSupplier,
+    SupplierMaterialBatch,
     SupplierResponsibilityScope,
     SupplierSalesResponsibility,
 )
@@ -771,6 +775,25 @@ class OrderPlanApiTests(TestCase):
         }
         if usertask_id:
             payload["usertask_id"] = usertask_id
+        workitem = WorkItem.objects.filter(
+            uniq_key=(
+                f"sales:order-plan:{plan.pk}:supplier:"
+                f"{payload['supplier_id']}"
+            )
+        ).first()
+        collaboration = workitem.payload if workitem else {}
+        if collaboration.get("supplier_batch_capture_required"):
+            payload["material_batches"] = [
+                {
+                    "order_plan_item_id": row["order_plan_item_id"],
+                    "bom_item_id": row["bom_item_id"],
+                    "batch_code": (
+                        f"TEST-SUPPLIER-BATCH-"
+                        f"{row['material_spec_id']}"
+                    ),
+                }
+                for row in collaboration.get("materials", [])
+            ]
         return self.client.post(
             f"/pldp/api/sales/order-plans/{plan.pk}/supplier-confirm/",
             data=json.dumps(payload),
@@ -1715,6 +1738,24 @@ class OrderPlanApiTests(TestCase):
             workitem.user_tasks.exclude(state="DONE").exists()
         )
         self.assertEqual(
+            OrderPlanItemMaterialBatch.objects.filter(
+                order_plan_item__plan=plan,
+                supplier_material_batch__supplier=self.supplier,
+            ).count(),
+            len(workitem.payload["materials"]),
+        )
+        self.assertEqual(
+            SupplierMaterialBatch.objects.filter(
+                supplier=self.supplier,
+            ).count(),
+            len(
+                {
+                    row["material_spec_id"]
+                    for row in workitem.payload["materials"]
+                }
+            ),
+        )
+        self.assertEqual(
             WorkItem.objects.filter(
                 uniq_key=(
                     f"sales:order-plan:{plan.pk}:supplier:{self.supplier.pk}:"
@@ -1738,6 +1779,120 @@ class OrderPlanApiTests(TestCase):
             ).count(),
             1,
         )
+
+    def test_legacy_supplier_task_can_save_material_batches(self):
+        plan = self._create_plan("legacy-supplier-material-batch")
+        detail = self._matching_detail(plan)
+        self.assertEqual(
+            self._confirm(plan, self._confirmation_payload(detail)).json()["code"],
+            0,
+        )
+        workitem = WorkItem.objects.get(
+            uniq_key=f"sales:order-plan:{plan.pk}:supplier:{self.supplier.pk}"
+        )
+        payload = dict(workitem.payload)
+        payload.pop("supplier_batch_capture_required", None)
+        payload["materials"] = [
+            {
+                key: value
+                for key, value in row.items()
+                if key not in {"bom_item_id", "supplier_id"}
+            }
+            for row in payload["materials"]
+        ]
+        legacy_scopes = {}
+        for openid, scope in payload["recipient_scopes"].items():
+            legacy_scopes[
+                f"legacy-{scope['role']}-openid"
+            ] = scope
+        payload["recipient_scopes"] = legacy_scopes
+        workitem.payload = payload
+        workitem.save(update_fields=("payload", "updated_at"))
+
+        material_batches = []
+        for order_item in plan.items.select_related(
+            "bom_confirmation",
+            "bom_confirmation__confirmed_bom",
+        ):
+            confirmation = order_item.bom_confirmation
+            for bom_item in BOMItem.objects.filter(
+                bom_id=confirmation.confirmed_bom_id,
+                supplier=self.supplier,
+            ):
+                material_batches.append({
+                    "order_plan_item_id": order_item.pk,
+                    "bom_item_id": bom_item.pk,
+                    "batch_code": f"LEGACY-{bom_item.material_spec_id}",
+                })
+
+        owner_task = workitem.user_tasks.get(
+            to_openid=self.supplier_owner.wx_openid
+        )
+        response = self.client.post(
+            f"/pldp/api/sales/order-plans/{plan.pk}/supplier-confirm/",
+            data=json.dumps({
+                "supplier_id": self.supplier.pk,
+                "usertask_id": owner_task.pk,
+                "material_batches": material_batches,
+            }),
+            content_type="application/json",
+            HTTP_AUTHORIZATION=self.supplier_owner_authorization,
+        )
+
+        self.assertEqual(response.json()["code"], 0, response.json())
+        workitem.refresh_from_db()
+        rebound_scopes = workitem.payload["recipient_scopes"]
+        self.assertIn(self.supplier_owner.wx_openid, rebound_scopes)
+        self.assertIn(self.supplier_sales.wx_openid, rebound_scopes)
+        self.assertFalse(
+            any(openid.startswith("legacy-") for openid in rebound_scopes)
+        )
+        self.assertEqual(
+            OrderPlanItemMaterialBatch.objects.filter(
+                order_plan_item__plan=plan,
+                supplier_material_batch__supplier=self.supplier,
+            ).count(),
+            len(material_batches),
+        )
+        self.assertFalse(workitem.payload.get("waiting_for_owner"))
+        self.assertFalse(workitem.payload.get("waiting_for_batches"))
+
+        order_item = plan.items.order_by("id").first()
+        OrderPlanItem.objects.filter(pk=order_item.pk).update(
+            quantity=10,
+            production_quantity=3,
+            return_inventory_quantity=7,
+        )
+        order_item.refresh_from_db()
+        _validate_supplier_batch_coverage(order_item)
+
+        first_usage = OrderPlanItemMaterialBatch.objects.filter(
+            order_plan_item=order_item,
+        ).select_related("supplier_material_batch").first()
+        trace = get_supplier_batch_trace(
+            batch_id=first_usage.supplier_material_batch_id,
+        )
+        traced_order = next(
+            row
+            for row in trace["orders"]
+            if row["order_plan_item_id"] == order_item.pk
+        )
+        self.assertEqual(traced_order["affected_new_production_quantity"], 3)
+        self.assertEqual(traced_order["excluded_return_inventory_quantity"], 7)
+        self.assertEqual(traced_order["generated_device_count"], 0)
+        self.assertFalse(traced_order["device_trace_ready"])
+
+        workitem.payload = {
+            **workitem.payload,
+            "supplier_batch_capture_required": True,
+        }
+        workitem.save(update_fields=("payload", "updated_at"))
+        first_usage.delete()
+        with self.assertRaisesMessage(
+            OrderQRCodePrintError,
+            "供应商生产批次尚未覆盖最终BOM全部供应物料",
+        ):
+            _validate_supplier_batch_coverage(order_item)
 
     def test_all_responsible_supplier_sales_can_collectively_finish(self):
         second_sales = self._user_with_identity(

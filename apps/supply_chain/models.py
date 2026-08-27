@@ -69,7 +69,6 @@ class Material(models.Model):
         verbose_name="更新时间"
     )
 
-
     class Meta:
 
         verbose_name = "物料"
@@ -301,6 +300,80 @@ class MaterialSpecSupplier(models.Model):
             f"{self.material_spec}-"
             f"{self.supplier}"
         )
+
+
+class SupplierMaterialBatch(models.Model):
+    """Supplier's original production batch for one material specification.
+
+    This is not a factory receipt lot and intentionally carries no delivered,
+    remaining or total-production quantity.
+    """
+
+    supplier = models.ForeignKey(
+        "account.Organization",
+        on_delete=models.PROTECT,
+        related_name="material_batches",
+        verbose_name="供应商",
+    )
+    material = models.ForeignKey(
+        Material,
+        on_delete=models.PROTECT,
+        related_name="supplier_batches",
+        verbose_name="物料",
+    )
+    material_spec = models.ForeignKey(
+        MaterialSpec,
+        on_delete=models.PROTECT,
+        related_name="supplier_batches",
+        verbose_name="物料规格",
+    )
+    batch_code = models.CharField(max_length=128, verbose_name="供应商生产批次编码")
+    normalized_batch_code = models.CharField(max_length=128, editable=False)
+    production_date = models.DateField(null=True, blank=True, verbose_name="生产日期")
+    remark = models.TextField(blank=True, default="", verbose_name="备注")
+    created_by = models.ForeignKey(
+        "account.User",
+        on_delete=models.PROTECT,
+        related_name="created_supplier_material_batches",
+        verbose_name="首次录入账号",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("-production_date", "-id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("supplier", "material_spec", "normalized_batch_code"),
+                name="supply_unique_supplier_spec_batch_code",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=("supplier", "material", "material_spec"),
+                name="supply_batch_lookup",
+            )
+        ]
+
+    def clean(self):
+        super().clean()
+        errors = {}
+        if self.material_spec_id and self.material_spec.material_id != self.material_id:
+            errors["material_spec"] = "物料规格与物料不一致。"
+        if self.supplier_id and self.supplier.organization_type.code != "SUPPLIER":
+            errors["supplier"] = "物料批次必须属于供应商组织。"
+        if errors:
+            raise ValidationError(errors)
+
+    def save(self, *args, **kwargs):
+        self.batch_code = str(self.batch_code or "").strip()
+        self.normalized_batch_code = self.batch_code.upper()
+        if not self.normalized_batch_code:
+            raise ValidationError({"batch_code": "请填写供应商生产批次编码。"})
+        return super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.supplier.name}-{self.material_spec.name}-{self.batch_code}"
 
 
 class SupplierResponsibilityScope(models.TextChoices):

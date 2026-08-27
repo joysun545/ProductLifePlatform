@@ -256,6 +256,7 @@ def confirm_supplier_materials(request, plan_id):
             plan_id=plan_id,
             supplier_id=data.get("supplier_id"),
             usertask_id=data.get("usertask_id"),
+            material_batches=data.get("material_batches"),
         )
     except SupplierConfirmationError as exc:
         return JsonResponse(

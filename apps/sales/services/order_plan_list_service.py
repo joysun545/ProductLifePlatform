@@ -5,9 +5,11 @@ from product.models import BOMItem
 from sales.models import (
     OrderPlan,
     OrderPlanItem,
+    OrderPlanItemMaterialBatch,
     OrderPlanLogisticsDocument,
     OrderPlanPayment,
 )
+from supply_chain.models import SupplierMaterialBatch
 from sales.services.order_finance_service import serialize_finance_summary
 from sales.services.order_logistics_service import serialize_logistics_summary
 from supply_chain.services.supplier_responsibility_service import (
@@ -87,6 +89,43 @@ def _confirmation_data(order_item):
         "version_no": confirmation.confirmed_bom.version_no,
         "has_changes": confirmation.has_changes,
         "confirmed_at": confirmation.confirmed_at.isoformat(),
+    }
+
+
+def _supplier_batch_data(order_item, bom_item, supplier_id):
+    usage = (
+        OrderPlanItemMaterialBatch.objects.select_related(
+            "supplier_material_batch"
+        )
+        .filter(order_plan_item=order_item, bom_item=bom_item)
+        .first()
+    )
+    choices = SupplierMaterialBatch.objects.filter(
+        supplier_id=supplier_id,
+        material_id=bom_item.material_id,
+        material_spec_id=bom_item.material_spec_id,
+    ).order_by("-production_date", "-id")[:50]
+    return {
+        "selected": (
+            {
+                "id": usage.supplier_material_batch_id,
+                "batch_code": usage.supplier_material_batch.batch_code,
+                "production_date": (
+                    usage.supplier_material_batch.production_date.isoformat()
+                    if usage.supplier_material_batch.production_date else ""
+                ),
+            }
+            if usage else None
+        ),
+        "choices": [
+            {
+                "id": batch.id,
+                "batch_code": batch.batch_code,
+                "production_date": batch.production_date.isoformat()
+                if batch.production_date else "",
+            }
+            for batch in choices
+        ],
     }
 
 
@@ -595,6 +634,7 @@ def _serialize_supplier_plan(plan, identity, supplier_workitems):
                 "bom_confirmation": _confirmation_data(order_item),
                 "materials": [
                     {
+                        "bom_item_id": bom_item.id,
                         "material_id": bom_item.material_id,
                         "material_code": bom_item.material.code,
                         "material_name": bom_item.material.name,
@@ -625,6 +665,9 @@ def _serialize_supplier_plan(plan, identity, supplier_workitems):
                                 and confirmation_data["state"] == "PROCESSED"
                                 else "PENDING"
                             )
+                        ),
+                        "supplier_batch": _supplier_batch_data(
+                            order_item, bom_item, identity.organization_id
                         ),
                     }
                     for bom_item in supplier_bom_items

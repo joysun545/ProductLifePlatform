@@ -6,6 +6,7 @@ from .order_plan import (
     OrderPlan,
     OrderPlanItem,
     OrderPlanItemBOMConfirmation,
+    OrderPlanItemMaterialBatch,
     OrderPlanReturnInventoryAllocation,
 )
 from .order_finance import OrderPlanFinance, OrderPlanPayment
@@ -18,6 +19,7 @@ __all__ = (
     "OrderPlan",
     "OrderPlanItem",
     "OrderPlanItemBOMConfirmation",
+    "OrderPlanItemMaterialBatch",
     "OrderPlanReturnInventoryAllocation",
     "OrderPlanFinance",
     "OrderPlanPayment",

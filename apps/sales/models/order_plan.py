@@ -464,3 +464,66 @@ class OrderPlanItemBOMConfirmation(models.Model):
             errors["confirmed_bom"] = "确认BOM与订单产品型号不一致。"
         if errors:
             raise ValidationError(errors)
+
+
+class OrderPlanItemMaterialBatch(models.Model):
+    """One supplier production batch per order item and confirmed BOM line."""
+
+    order_plan_item = models.ForeignKey(
+        OrderPlanItem,
+        on_delete=models.PROTECT,
+        related_name="material_batch_usages",
+        verbose_name="订单计划明细",
+    )
+    bom_item = models.ForeignKey(
+        "product.BOMItem",
+        on_delete=models.PROTECT,
+        related_name="order_plan_batch_usages",
+        verbose_name="确认BOM物料行",
+    )
+    supplier_material_batch = models.ForeignKey(
+        "supply_chain.SupplierMaterialBatch",
+        on_delete=models.PROTECT,
+        related_name="order_plan_usages",
+        verbose_name="供应商生产批次",
+    )
+    confirmed_by = models.ForeignKey(
+        "account.User",
+        on_delete=models.PROTECT,
+        related_name="confirmed_order_material_batches",
+        verbose_name="确认账号",
+    )
+    confirmed_at = models.DateTimeField(default=timezone.now, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("order_plan_item_id", "bom_item_id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("order_plan_item", "bom_item"),
+                name="sales_one_supplier_batch_per_order_bom_item",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=("supplier_material_batch", "order_plan_item"),
+                name="sales_batch_order_lookup",
+            )
+        ]
+
+    def clean(self):
+        super().clean()
+        errors = {}
+        confirmation = getattr(self.order_plan_item, "bom_confirmation", None)
+        if confirmation and self.bom_item.bom_id != confirmation.confirmed_bom_id:
+            errors["bom_item"] = "物料行不属于订单最终确认BOM。"
+        batch = self.supplier_material_batch
+        if batch.material_id != self.bom_item.material_id:
+            errors["supplier_material_batch"] = "供应商批次物料与BOM物料不一致。"
+        if batch.material_spec_id != self.bom_item.material_spec_id:
+            errors["supplier_material_batch"] = "供应商批次规格与BOM规格不一致。"
+        if batch.supplier_id != self.bom_item.supplier_id:
+            errors["supplier_material_batch"] = "供应商批次组织与BOM供应商不一致。"
+        if errors:
+            raise ValidationError(errors)
