@@ -38,6 +38,7 @@ from lifecycle.models import (
     ProductDocumentRead,
 )
 from lifecycle.services.lifecycle_service import LifecycleService
+from lifecycle.services.aftersales_service import AfterSalesService
 from manufacturing.models import ProductionBatch
 from product.models import (
     BOM,
@@ -120,6 +121,16 @@ class ScanOwnershipAndInstallationTests(TestCase):
             code="driver",
             defaults={"name": "司机", "is_active": True},
         )
+        cls.supplier_owner_role, _ = OrganizationRole.objects.update_or_create(
+            organization_type=supplier_type,
+            code="supplier_owner",
+            defaults={"name": "供应商负责人账号", "is_owner_role": True, "is_active": True},
+        )
+        cls.supplier_sales_role, _ = OrganizationRole.objects.update_or_create(
+            organization_type=supplier_type,
+            code="supplier_sales",
+            defaults={"name": "供应商销售经理", "is_active": True},
+        )
 
         cls.factory = Organization.objects.create(
             name="测试厂家",
@@ -145,7 +156,7 @@ class ScanOwnershipAndInstallationTests(TestCase):
             organization_type=merchant_type,
             region="四川省",
         )
-        supplier = Organization.objects.create(
+        cls.supplier = Organization.objects.create(
             name="测试供应商",
             code="SUPPLIER-TEST",
             organization_type=supplier_type,
@@ -186,6 +197,12 @@ class ScanOwnershipAndInstallationTests(TestCase):
             wx_openid="openid-customer-new",
             wx_nickname="新用户负责人",
         )
+        cls.supplier_owner_user = cls._user_identity(
+            "supplier_owner", cls.supplier, cls.supplier_owner_role
+        )
+        cls.supplier_sales_user = cls._user_identity(
+            "supplier_sales", cls.supplier, cls.supplier_sales_role
+        )
 
         cls._create_distribution_relation(
             inviter_user=cls.factory_user,
@@ -219,21 +236,21 @@ class ScanOwnershipAndInstallationTests(TestCase):
             version="V1",
             created_by=cls.factory_user,
         )
-        material = Material.objects.create(
+        cls.material = Material.objects.create(
             code="GEN-CTRL",
             name="控制器",
             product_category=category,
         )
         spec = MaterialSpec.objects.create(
-            material=material,
+            material=cls.material,
             code="GEN-CTRL-01",
             name="标准版",
         )
-        BOMItem.objects.create(
+        cls.bom_item = BOMItem.objects.create(
             bom=bom,
-            material=material,
+            material=cls.material,
             material_spec=spec,
-            supplier=supplier,
+            supplier=cls.supplier,
         )
         batch = ProductionBatch.objects.create(
             batch_no="BATCH-20260808",
@@ -1105,7 +1122,28 @@ class ScanOwnershipAndInstallationTests(TestCase):
                 **self.auth(factory_sales),
             )
             self.assertEqual(detail.status_code, 200)
-            self.assertEqual(len(detail.json()["data"]["media"]), 2)
+            factory_detail = detail.json()["data"]
+            self.assertEqual(len(factory_detail["media"]), 2)
+            self.assertEqual(factory_detail["viewer_stage"]["mode"], "ACTION_REQUIRED")
+            self.assertEqual(
+                factory_detail["viewer_stage"]["badge"],
+                "待您认定并分派",
+            )
+            self.assertEqual(factory_detail["applicant_instruction"], {})
+
+            applicant_detail = self.client.get(
+                f"/pldp/api/lifecycle/after-sales/applications/{application_id}/",
+                **self.auth(self.customer_user),
+            )
+            self.assertEqual(applicant_detail.status_code, 200)
+            self.assertEqual(
+                applicant_detail.json()["data"]["viewer_stage"]["title"],
+                "等待厂家销售经理判断并指派",
+            )
+            self.assertEqual(
+                applicant_detail.json()["data"]["viewer_stage"]["badge"],
+                "等待厂家销售经理判断并指派",
+            )
 
         application = AfterSalesApplication.objects.get(pk=application_id)
         self.assertEqual(application.status, AfterSalesApplication.Status.SUBMITTED)
@@ -1116,11 +1154,11 @@ class ScanOwnershipAndInstallationTests(TestCase):
             {"DRAFT_CREATED", "MEDIA_UPLOADED", "SUBMITTED"},
         )
         self.assertTrue(
-            WorkItem.objects.filter(type="AFTERSALES_APPLICATION_REVIEW", biz_id=str(application_id)).exists()
+            WorkItem.objects.filter(type="AFTERSALES_FACTORY_WORKORDER", biz_id=str(application_id)).exists()
         )
         self.assertTrue(
             UserTask.objects.filter(
-                workitem__type="AFTERSALES_APPLICATION_REVIEW",
+                workitem__type="AFTERSALES_FACTORY_WORKORDER",
                 to_openid=factory_sales.wx_openid,
                 need_action=True,
             ).exists()
@@ -1136,6 +1174,65 @@ class ScanOwnershipAndInstallationTests(TestCase):
             "AFTERSALES_APPLICANT_WORKORDER",
         )
         self.assertFalse(applicant_task.need_action)
+
+        # The same stage is rendered differently for the actor who owns the
+        # current action and for the counterparty who is waiting.
+        application.dispatch_route = AfterSalesApplication.DispatchRoute.MERCHANT_ELECTRICIAN
+        application.execution_stage = (
+            AfterSalesApplication.ExecutionStage.AWAITING_APPLICANT_SHIPMENT
+        )
+        application.status = AfterSalesApplication.Status.ROUTING
+        application.assigned_user = self.direct_electrician_user
+        application.assigned_organization = self.direct_merchant
+        application.assignee_snapshot = {
+            "name": "测试商家电工",
+            "organization_name": self.direct_merchant.name,
+            "organization_address": "重庆测试维修地址",
+            "phone": "13900000002",
+        }
+        application.repair_plan = "寄送后检查控制器与线路。"
+        application.save()
+
+        applicant_shipping_detail = self.client.get(
+            f"/pldp/api/lifecycle/after-sales/applications/{application_id}/",
+            **self.auth(self.customer_user),
+        ).json()["data"]
+        self.assertEqual(
+            applicant_shipping_detail["viewer_stage"]["mode"],
+            "ACTION_REQUIRED",
+        )
+        self.assertEqual(
+            applicant_shipping_detail["viewer_stage"]["badge"],
+            "待您寄送设备",
+        )
+        self.assertTrue(applicant_shipping_detail["actions"]["can_applicant_shipment"])
+        self.assertEqual(
+            applicant_shipping_detail["applicant_instruction"]["type"],
+            "SHIP_TO_REPAIRER",
+        )
+
+        assignee_waiting_detail = self.client.get(
+            f"/pldp/api/lifecycle/after-sales/applications/{application_id}/",
+            **self.auth(self.direct_electrician_user),
+        ).json()["data"]
+        self.assertEqual(
+            assignee_waiting_detail["viewer_stage"]["title"],
+            "等待售后发起人寄送设备",
+        )
+        self.assertEqual(
+            assignee_waiting_detail["viewer_stage"]["badge"],
+            "等待售后发起人寄送设备",
+        )
+        self.assertEqual(assignee_waiting_detail["applicant_instruction"], {})
+
+        application.status = AfterSalesApplication.Status.SUBMITTED
+        application.execution_stage = AfterSalesApplication.ExecutionStage.NONE
+        application.dispatch_route = ""
+        application.assigned_user = None
+        application.assigned_organization = None
+        application.assignee_snapshot = {}
+        application.repair_plan = ""
+        application.save()
 
         # Simulate the user-facing task produced by the previous release.  A
         # later push must adopt this original row instead of adding another
@@ -1195,5 +1292,132 @@ class ScanOwnershipAndInstallationTests(TestCase):
         self.assertTrue(
             application.events.filter(
                 event_type="REMOTE_RESOLVED_AND_CLOSED"
+            ).exists()
+        )
+        closed_detail = self.client.get(
+            f"/pldp/api/lifecycle/after-sales/applications/{application_id}/",
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(closed_detail.status_code, 200)
+        self.assertEqual(
+            closed_detail.json()["data"]["viewer_stage"]["mode"],
+            "COMPLETED",
+        )
+        self.assertEqual(
+            closed_detail.json()["data"]["viewer_stage"]["badge"],
+            "售后服务已完成",
+        )
+
+    def test_supplier_quality_notice_is_one_task_and_sanitized(self):
+        material = {
+            "bom_item_id": self.bom_item.id,
+            "material_id": self.material.id,
+            "material_name": self.material.name,
+            "specification_id": self.bom_item.material_spec_id,
+            "specification_name": self.bom_item.material_spec.name,
+            "supplier_id": self.supplier.id,
+            "supplier_name": self.supplier.name,
+            "is_key_part": True,
+            "quantity": 1,
+        }
+        application = AfterSalesApplication.objects.create(
+            case_no="AS-SUPPLIER-QUALITY-001",
+            device=self.device,
+            customer_organization=self.direct_merchant,
+            factory_organization=self.factory,
+            applicant=self.direct_owner_user,
+            status=AfterSalesApplication.Status.CLOSED,
+            execution_stage=AfterSalesApplication.ExecutionStage.CLOSED,
+            fault_description="控制器故障测试",
+            location_name="不得泄露的位置",
+            location_address="不得泄露的详细地址",
+            device_snapshot={
+                "sn": self.device.sn,
+                "product_model": self.device.product_model.name,
+                "production_batch": self.device.batch.batch_no,
+            },
+            bom_snapshot={"version": "V1", "items": [material]},
+            repair_summary="更换控制器后运行正常",
+            repair_material_replaced=True,
+            repair_materials=[material],
+            final_fault_type=AfterSalesApplication.FaultType.COMPONENT_SUSPECTED,
+            final_fault_materials=[material],
+            final_solution_type=AfterSalesApplication.SolutionType.COMPONENT_REPLACEMENT,
+            final_solution_note="确认控制器故障并完成更换",
+            closed_by=self.factory_user,
+            closed_at=timezone.now(),
+        )
+
+        AfterSalesService._publish_supplier_quality_notices(
+            application, actor_openid=self.factory_user.wx_openid
+        )
+        AfterSalesService._publish_supplier_quality_notices(
+            application, actor_openid=self.factory_user.wx_openid
+        )
+        workitems = WorkItem.objects.filter(
+            uniq_key=f"aftersales:{application.id}:supplier-quality:{self.supplier.id}"
+        )
+        self.assertEqual(workitems.count(), 1)
+        workitem = workitems.get()
+        self.assertEqual(
+            set(workitem.user_tasks.values_list("to_openid", flat=True)),
+            {self.supplier_owner_user.wx_openid, self.supplier_sales_user.wx_openid},
+        )
+        self.assertTrue(
+            workitem.user_tasks.filter(need_action=False, state="NEW").exists()
+        )
+
+        url = (
+            f"/pldp/api/lifecycle/after-sales/applications/{application.id}/"
+            f"supplier-quality-notices/{self.supplier.id}/"
+        )
+        response = self.client.get(url, **self.auth(self.supplier_sales_user))
+        self.assertEqual(response.status_code, 200, response.json())
+        data = response.json()["data"]
+        self.assertEqual([item["material_id"] for item in data["materials"]], [self.material.id])
+        self.assertNotIn("applicant", data)
+        self.assertNotIn("location", data)
+        self.assertNotIn("media", data)
+        self.assertNotIn("phone", str(data).lower())
+
+        list_response = self.client.get(
+            "/pldp/api/lifecycle/after-sales/supplier-quality-notices/",
+            **self.auth(self.supplier_sales_user),
+        )
+        self.assertEqual(list_response.status_code, 200, list_response.json())
+        list_data = list_response.json()["data"]
+        self.assertEqual(list_data["count"], 1)
+        self.assertEqual(list_data["items"][0]["application_id"], application.id)
+        self.assertEqual(
+            list_data["items"][0]["material_names"], [self.material.name]
+        )
+        self.assertNotIn("location", str(list_data).lower())
+        self.assertNotIn("media", str(list_data).lower())
+
+        denied = self.client.get(url, **self.auth(self.direct_owner_user))
+        self.assertEqual(denied.status_code, 409)
+        denied_list = self.client.get(
+            "/pldp/api/lifecycle/after-sales/supplier-quality-notices/",
+            **self.auth(self.direct_owner_user),
+        )
+        self.assertEqual(denied_list.status_code, 409)
+
+        non_material_case = AfterSalesApplication.objects.create(
+            case_no="AS-NO-SUPPLIER-QUALITY-001",
+            device=self.device,
+            customer_organization=self.direct_merchant,
+            factory_organization=self.factory,
+            applicant=self.direct_owner_user,
+            status=AfterSalesApplication.Status.CLOSED,
+            execution_stage=AfterSalesApplication.ExecutionStage.CLOSED,
+            final_fault_type=AfterSalesApplication.FaultType.INSTALLATION_OR_WIRING,
+            final_solution_type=AfterSalesApplication.SolutionType.ON_SITE_ADJUSTMENT,
+            repair_material_replaced=False,
+            closed_at=timezone.now(),
+        )
+        AfterSalesService._publish_supplier_quality_notices(non_material_case)
+        self.assertFalse(
+            WorkItem.objects.filter(
+                uniq_key=f"aftersales:{non_material_case.id}:supplier-quality:{self.supplier.id}"
             ).exists()
         )

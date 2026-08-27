@@ -10,6 +10,48 @@ class TaskActionError(Exception):
     """任务不存在或当前账号无权操作。"""
 
 
+def _open_aftersales_group(task, now):
+    """Opening one after-sales card acknowledges all visible case updates.
+
+    Knowledge-only rows are completed by opening the service order. Action
+    rows only become READ; the domain operation remains responsible for
+    completing them.
+    """
+
+    payload = task.workitem.payload if isinstance(task.workitem.payload, dict) else {}
+    group_key = payload.get("inbox_group_key")
+    if not group_key or payload.get("inbox_group_kind") != "AFTERSALES":
+        return False
+
+    tasks = (
+        UserTask.objects.select_for_update()
+        .select_related("workitem")
+        .filter(
+            to_openid=task.to_openid,
+            workitem__domain="AFTERSALE",
+            workitem__payload__inbox_group_key=group_key,
+            state__in=("NEW", "READ"),
+        )
+    )
+    for grouped_task in tasks:
+        if grouped_task.state == "NEW":
+            grouped_task.read_at = now
+        if grouped_task.need_action:
+            grouped_task.state = "READ"
+        else:
+            grouped_task.state = "DONE"
+            grouped_task.done_at = now
+            grouped_task.done_reason = "GROUP_OPENED"
+        grouped_task.cursor_time = grouped_task.workitem.last_activity_at
+        grouped_task.save(
+            update_fields=[
+                "state", "read_at", "done_at", "done_reason",
+                "cursor_time", "updated_at",
+            ]
+        )
+    return True
+
+
 @transaction.atomic
 def open_task(openid, usertask_id):
     """
@@ -42,6 +84,10 @@ def open_task(openid, usertask_id):
 
 
     now = timezone.now()
+
+    if _open_aftersales_group(task, now):
+        task.refresh_from_db(fields=("state",))
+        return {"state": task.state}
 
 
     # 已读

@@ -1572,6 +1572,45 @@ class AfterSalesApplicationDetailAPI(APIView):
         return Response({"code": 0, "msg": "success", "data": data})
 
 
+class AfterSalesSupplierQualityNoticeAPI(APIView):
+    """Supplier-only sanitized view of a material-caused closed case."""
+
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request, application_id, supplier_id):
+        user, error = _authenticated_user(request)
+        if error:
+            return error
+        try:
+            data = AfterSalesService.supplier_quality_notice_detail(
+                application_id=application_id,
+                supplier_id=supplier_id,
+                user=user,
+            )
+        except AfterSalesError as exc:
+            return _aftersales_error(exc)
+        return Response({"code": 0, "msg": "success", "data": data})
+
+
+class AfterSalesSupplierQualityNoticeListAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request):
+        user, error = _authenticated_user(request)
+        if error:
+            return error
+        try:
+            data = AfterSalesService.list_supplier_quality_notices(
+                user=user,
+                limit=request.GET.get("limit", 100),
+            )
+        except AfterSalesError as exc:
+            return _aftersales_error(exc)
+        return Response({"code": 0, "msg": "success", "data": data})
+
+
 class AfterSalesApplicationMediaAPI(APIView):
     authentication_classes = []
     permission_classes = []

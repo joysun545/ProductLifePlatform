@@ -145,9 +145,9 @@ def _task_summary(task):
 def _serialize_task(task):
     """Serialize one real inbox row.
 
-    A grouped inbox card is only a query projection.  Child rows returned by
-    this function remain the actual auditable UserTask records and must still
-    be opened/acknowledged one at a time.
+    A grouped inbox card is only a query projection. Child rows remain the
+    actual auditable UserTask records. After-sales groups are acknowledged as
+    one service order when opened; other domains retain per-child behavior.
     """
 
     workitem = task.workitem
@@ -222,6 +222,32 @@ def _group_id(scope):
     return hashlib.sha256(scope.encode("utf-8")).hexdigest()[:24]
 
 
+def _group_metadata(scope, tasks):
+    """Return small display hints without changing any underlying UserTask."""
+
+    representative = tasks[0]
+    payload = (
+        representative.workitem.payload
+        if isinstance(representative.workitem.payload, dict)
+        else {}
+    )
+    is_aftersales = (
+        scope.startswith("explicit:aftersales:")
+        or payload.get("inbox_group_kind") == "AFTERSALES"
+    )
+    if is_aftersales:
+        return {
+            "group_kind": "AFTERSALES",
+            "group_label": "售后工单",
+            "is_workorder": True,
+        }
+    return {
+        "group_kind": payload.get("inbox_group_kind") or "",
+        "group_label": payload.get("inbox_group_label") or "同一业务任务",
+        "is_workorder": False,
+    }
+
+
 def _compose_group_title(tasks):
     unread = [task for task in tasks if task.state == "NEW"]
     pending_action = [
@@ -275,6 +301,7 @@ def _entry_task(tasks):
 def _serialize_group(scope, tasks, *, include_children=False):
     # Query order is newest first and is retained within every child list.
     representative = tasks[0]
+    metadata = _group_metadata(scope, tasks)
     entry_task = _entry_task(tasks)
     child_items = [_serialize_task(task) for task in tasks]
     entry_item = _serialize_task(entry_task)
@@ -305,16 +332,29 @@ def _serialize_group(scope, tasks, *, include_children=False):
         "completed_count": completed_count,
         "state": state,
         "need_action": bool(action_pending_count),
-        "title": _compose_group_title(tasks),
+        # An after-sales case is one service order, not a bundle of unrelated
+        # jobs.  Historical duplicate notifications therefore present the
+        # newest service status as one clean card while their child rows stay
+        # auditable in the group/detail view.
+        "title": (
+            _task_title(representative)
+            if metadata["is_workorder"]
+            else _compose_group_title(tasks)
+        ),
         "summary": (
-            f"共{len(tasks)}项任务｜{unread_count}项未读｜"
-            f"{action_pending_count}项待处理"
-            if len(tasks) > 1 else _task_summary(representative)
+            _task_summary(representative)
+            if metadata["is_workorder"]
+            else (
+                f"共{len(tasks)}项任务｜{unread_count}项未读｜"
+                f"{action_pending_count}项待处理"
+                if len(tasks) > 1 else _task_summary(representative)
+            )
         ),
         "latest_summary": _task_summary(representative),
-        # The projected parent opens exactly one real child, then goes straight
-        # to the business detail.  The detail page receives the group id only
-        # as display context; it must never bulk-acknowledge group children.
+        **metadata,
+        # The projected parent opens one real entry row. The open service uses
+        # its after-sales group payload to acknowledge all knowledge updates
+        # while leaving action rows pending until their domain operation.
         "link": (
             _append_query(
                 entry_link,

@@ -9,7 +9,7 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
-from account.models import OrganizationRelation, OrganizationRelationType, UserOrganization
+from account.models import Organization, OrganizationRelation, OrganizationRelationType, UserOrganization
 from account.services.auth_service import get_active_identity
 from lifecycle.models import (
     AfterSalesApplication,
@@ -20,6 +20,9 @@ from lifecycle.models import (
 )
 from lifecycle.services.customer_service import CustomerDeviceService
 from supply_chain.models import MaterialSpecSupplier
+from supply_chain.services.supplier_responsibility_service import (
+    get_supplier_task_recipients,
+)
 from workflow.models import UserTask, WorkItem
 from workflow.services.workflow_service import publish_workitem
 
@@ -80,6 +83,10 @@ class AfterSalesService:
     FINAL_COMPONENT_FAULT = AfterSalesApplication.FaultType.COMPONENT_SUSPECTED
     APPLICANT_WORKORDER_STEP = "applicant-workorder"
     APPLICANT_WORKORDER_TYPE = "AFTERSALES_APPLICANT_WORKORDER"
+    FACTORY_WORKORDER_STEP = "factory-workorder"
+    FACTORY_WORKORDER_TYPE = "AFTERSALES_FACTORY_WORKORDER"
+    ASSIGNEE_WORKORDER_STEP = "assignee-workorder"
+    ASSIGNEE_WORKORDER_TYPE = "AFTERSALES_ASSIGNEE_WORKORDER"
     # Versions before the stable applicant workorder used one WorkItem for
     # every notification/action.  These types are only used to adopt the
     # earliest historical applicant task for a case; immutable after-sales
@@ -90,6 +97,7 @@ class AfterSalesService:
         "AFTERSALES_APPLICANT_SHIPMENT",
         "AFTERSALES_APPLICANT_CONFIRM",
     )
+    SUPPLIER_QUALITY_NOTICE_TYPE = "AFTERSALES_SUPPLIER_QUALITY_NOTICE"
 
     @staticmethod
     def _identity(user):
@@ -878,18 +886,66 @@ class AfterSalesService:
 
     @classmethod
     def _publish_factory_sales_notice(cls, application, *, topic, title, summary, actor_openid=""):
-        return cls._publish_task(
+        return cls._publish_factory_workorder(
             application,
-            step=f"notice-factory-{topic}",
-            task_type="AFTERSALES_PROGRESS_NOTICE",
+            topic=topic,
             title=title,
             summary=summary,
-            recipients_openids=cls._factory_sales_openids(application),
             actor_openid=actor_openid,
             need_action=False,
+        )
+
+    @classmethod
+    def _publish_factory_workorder(
+        cls, application, *, topic, title, summary, actor_openid="", need_action=False,
+    ):
+        return publish_workitem(
+            domain="AFTERSALE",
+            type=cls.FACTORY_WORKORDER_TYPE,
+            biz_id=str(application.id),
+            biz_ref=f"AfterSalesApplication:{application.id}",
+            uniq_key=f"aftersales:{application.id}:{cls.FACTORY_WORKORDER_STEP}",
+            title=title,
+            summary=summary,
+            link=cls._link(application),
+            recipients_openids=cls._factory_sales_openids(application),
+            need_action=need_action,
             action_mode="ANYONE_DO",
-            mark_workitem_done_immediately=True,
-            payload={"notice_topic": topic},
+            payload=cls._task_payload(
+                application,
+                extra={"factory_workorder": True, "factory_update_topic": topic},
+            ),
+            actor_openid=actor_openid,
+            mark_workitem_done_immediately=not need_action,
+        )
+
+    @classmethod
+    def _publish_assignee_workorder(
+        cls, application, *, topic, title, summary, actor_openid="", need_action=False,
+    ):
+        if not application.assigned_user_id or not application.assigned_user.wx_openid:
+            return None
+        return publish_workitem(
+            domain="AFTERSALE",
+            type=cls.ASSIGNEE_WORKORDER_TYPE,
+            biz_id=str(application.id),
+            biz_ref=f"AfterSalesApplication:{application.id}",
+            uniq_key=(
+                f"aftersales:{application.id}:{cls.ASSIGNEE_WORKORDER_STEP}:"
+                f"{application.assigned_user_id}"
+            ),
+            title=title,
+            summary=summary,
+            link=cls._link(application),
+            recipients_openids=[application.assigned_user.wx_openid],
+            need_action=need_action,
+            action_mode="EACH_ACK",
+            payload=cls._task_payload(
+                application,
+                extra={"assignee_workorder": True, "assignee_update_topic": topic},
+            ),
+            actor_openid=actor_openid,
+            mark_workitem_done_immediately=not need_action,
         )
 
     @classmethod
@@ -963,6 +1019,25 @@ class AfterSalesService:
         cls._complete_workitems(keys=keys, actor_openid=actor_openid)
 
     @classmethod
+    def _complete_factory_workorder(cls, application, *, actor_openid=""):
+        cls._complete_workitems(
+            keys=[f"aftersales:{application.id}:{cls.FACTORY_WORKORDER_STEP}"],
+            actor_openid=actor_openid,
+        )
+
+    @classmethod
+    def _complete_assignee_workorder(cls, application, *, actor_openid=""):
+        if not application.assigned_user_id:
+            return
+        cls._complete_workitems(
+            keys=[
+                f"aftersales:{application.id}:{cls.ASSIGNEE_WORKORDER_STEP}:"
+                f"{application.assigned_user_id}"
+            ],
+            actor_openid=actor_openid,
+        )
+
+    @classmethod
     @transaction.atomic
     def submit(cls, *, application_id, user):
         identity = CustomerDeviceService._customer_identity(user)
@@ -1003,15 +1078,12 @@ class AfterSalesService:
                 "updated_at",
             )
         )
-        cls._publish_task(
+        cls._publish_factory_workorder(
             application,
-            step="review",
-            task_type="AFTERSALES_APPLICATION_REVIEW",
+            topic="review-required",
             title="收到新的售后申请，待判断并分派",
             summary=cls._summary(application),
-            recipients_openids=recipients,
             actor_openid=user.wx_openid or "",
-            action_mode="ANYONE_DO",
             need_action=True,
         )
         cls._publish_applicant_workorder(
@@ -1251,6 +1323,10 @@ class AfterSalesService:
             steps=["review"],
             actor_openid=user.wx_openid or "",
         )
+        cls._complete_factory_workorder(
+            application,
+            actor_openid=user.wx_openid or "",
+        )
         application.dispatch_version += 1
         cls._event(
             application,
@@ -1287,13 +1363,11 @@ class AfterSalesService:
                 AfterSalesApplication.ExecutionStage.CONTACT_INSTALLER
             )
             application.save()
-            cls._publish_task(
+            cls._publish_assignee_workorder(
                 application,
-                step="repair-execution",
-                task_type="AFTERSALES_REPAIR_EXECUTION",
+                topic="repair-required",
                 title="售后维修任务待处理",
                 summary=f"{cls._summary(application)}｜{repair_plan}",
-                recipients_openids=[application.assigned_user.wx_openid],
                 actor_openid=user.wx_openid or "",
                 need_action=True,
             )
@@ -1334,6 +1408,14 @@ class AfterSalesService:
                 actor_openid=user.wx_openid or "",
                 need_action=True,
             )
+            cls._publish_assignee_workorder(
+                application,
+                topic="awaiting-applicant-shipment",
+                title="已接受售后指派，等待发起人寄送设备",
+                summary=f"{cls._summary(application)}｜发起人尚未确认寄送",
+                actor_openid=user.wx_openid or "",
+                need_action=False,
+            )
             cls._event(
                 application,
                 "DISPATCHED",
@@ -1349,15 +1431,12 @@ class AfterSalesService:
         )
         application.save()
         recipients = cls._factory_sales_openids(application)
-        cls._publish_task(
+        cls._publish_factory_workorder(
             application,
-            step="third-party-material-shipment",
-            task_type="AFTERSALES_THIRD_PARTY_MATERIAL_SHIPMENT",
+            topic="third-party-material-shipment-required",
             title="第三方紧急维修：登记备件寄送",
             summary=cls._summary(application),
-            recipients_openids=recipients,
             actor_openid=user.wx_openid or "",
-            action_mode="ANYONE_DO",
             need_action=True,
         )
         cls._publish_applicant_notice(
@@ -1444,13 +1523,11 @@ class AfterSalesService:
             identity=identity,
             payload=logistics,
         )
-        cls._publish_task(
+        cls._publish_assignee_workorder(
             application,
-            step="repair-receipt",
-            task_type="AFTERSALES_REPAIR_RECEIPT",
+            topic="repair-receipt-required",
             title="售后寄修设备待确认收件",
             summary=f"{cls._summary(application)}｜{logistics['logistics_company']} {logistics['tracking_no']}",
-            recipients_openids=[application.assigned_user.wx_openid],
             actor_openid=user.wx_openid or "",
             need_action=True,
         )
@@ -1488,13 +1565,11 @@ class AfterSalesService:
             identity=identity,
             payload={"receipt_note": receipt_note},
         )
-        cls._publish_task(
+        cls._publish_assignee_workorder(
             application,
-            step="repair-execution",
-            task_type="AFTERSALES_REPAIR_EXECUTION",
+            topic="repair-required",
             title="售后维修任务待处理",
             summary=cls._summary(application),
-            recipients_openids=[user.wx_openid],
             actor_openid=user.wx_openid or "",
             need_action=True,
         )
@@ -1620,6 +1695,10 @@ class AfterSalesService:
             actor_openid=user.wx_openid or "",
         )
         if next_step == "applicant-confirm":
+            cls._complete_assignee_workorder(
+                application,
+                actor_openid=user.wx_openid or "",
+            )
             cls._publish_applicant_workorder(
                 application,
                 topic="applicant-confirm-required",
@@ -1632,13 +1711,11 @@ class AfterSalesService:
                 need_action=True,
             )
         else:
-            cls._publish_task(
+            cls._publish_assignee_workorder(
                 application,
-                step="repair-return-shipment",
-                task_type="AFTERSALES_REPAIR_RETURN_SHIPMENT",
+                topic="return-shipment-required",
                 title="请上传返件物流单据并确认寄回",
                 summary=cls._summary(application),
-                recipients_openids=[user.wx_openid],
                 actor_openid=user.wx_openid or "",
                 need_action=True,
             )
@@ -1672,6 +1749,10 @@ class AfterSalesService:
         )
         application.applicant_confirm_due_at = timezone.now() + timedelta(days=7)
         application.save()
+        cls._complete_assignee_workorder(
+            application,
+            actor_openid=user.wx_openid or "",
+        )
         cls._complete_tasks(
             application,
             steps=["repair-return-shipment"],
@@ -1704,15 +1785,12 @@ class AfterSalesService:
     @classmethod
     def _send_factory_close_task(cls, application, *, actor_openid="", title="售后待最终归因结案"):
         recipients = cls._factory_sales_openids(application)
-        cls._publish_task(
+        cls._publish_factory_workorder(
             application,
-            step="factory-close",
-            task_type="AFTERSALES_FACTORY_CLOSE",
+            topic="factory-close-required",
             title=title,
             summary=cls._summary(application),
-            recipients_openids=recipients,
             actor_openid=actor_openid,
-            action_mode="ANYONE_DO",
             need_action=True,
         )
 
@@ -1805,15 +1883,12 @@ class AfterSalesService:
             identity=identity,
             payload={**logistics, "materials": materials},
         )
-        cls._publish_task(
+        cls._publish_factory_workorder(
             application,
-            step="third-party-expense",
-            task_type="AFTERSALES_THIRD_PARTY_EXPENSE",
+            topic="third-party-expense-required",
             title="第三方紧急维修：登记费用凭证",
             summary=cls._summary(application),
-            recipients_openids=cls._factory_sales_openids(application),
             actor_openid=user.wx_openid or "",
-            action_mode="ANYONE_DO",
             need_action=True,
         )
         cls._publish_applicant_notice(
@@ -1869,15 +1944,12 @@ class AfterSalesService:
             identity=identity,
             payload={"amount": str(amount), "remark": str(data.get("remark") or "").strip()},
         )
-        cls._publish_task(
+        cls._publish_factory_workorder(
             application,
-            step="third-party-fault-material-return",
-            task_type="AFTERSALES_THIRD_PARTY_FAULT_MATERIAL_RETURN",
+            topic="third-party-fault-material-return-required",
             title="第三方紧急维修：登记故障物料返还",
             summary=cls._summary(application),
-            recipients_openids=cls._factory_sales_openids(application),
             actor_openid=user.wx_openid or "",
-            action_mode="ANYONE_DO",
             need_action=True,
         )
         return cls.serialize(application)
@@ -1971,6 +2043,10 @@ class AfterSalesService:
                 "final_solution_note": solution_note,
             },
         )
+        cls._publish_supplier_quality_notices(
+            application,
+            actor_openid=user.wx_openid or "",
+        )
         is_remote_guidance = event_type == "REMOTE_RESOLVED_AND_CLOSED"
         cls._publish_applicant_notice(
             application,
@@ -1987,6 +2063,287 @@ class AfterSalesService:
             ),
             actor_openid=user.wx_openid or "",
         )
+
+    @staticmethod
+    def _material_match_key(material):
+        bom_item_id = material.get("bom_item_id")
+        if bom_item_id not in (None, ""):
+            return ("bom_item", str(bom_item_id))
+        material_id = material.get("material_id")
+        return ("material", str(material_id)) if material_id not in (None, "") else None
+
+    @classmethod
+    def _supplier_fault_replacement_materials(cls, application):
+        """Return actual replaced materials confirmed as the final root cause."""
+        if (
+            application.final_fault_type != cls.FINAL_COMPONENT_FAULT
+            or application.final_solution_type
+            != AfterSalesApplication.SolutionType.COMPONENT_REPLACEMENT
+            or application.repair_material_replaced is not True
+        ):
+            return []
+        repaired_keys = {
+            key
+            for material in (application.repair_materials or [])
+            if (key := cls._material_match_key(material))
+        }
+        return [
+            material
+            for material in (application.final_fault_materials or [])
+            if cls._material_match_key(material) in repaired_keys
+            and material.get("supplier_id")
+        ]
+
+    @classmethod
+    def _supplier_notice_key(cls, application, supplier_id):
+        return f"aftersales:{application.id}:supplier-quality:{supplier_id}"
+
+    @classmethod
+    def _supplier_notice_key_for_id(cls, application_id, supplier_id):
+        return f"aftersales:{application_id}:supplier-quality:{supplier_id}"
+
+    @classmethod
+    def _supplier_notice_link(cls, application, supplier_id):
+        return (
+            "/pages/supply_chain/aftersale_quality_notice/"
+            "aftersale_quality_notice"
+            f"?application_id={application.id}&supplier_id={supplier_id}"
+        )
+
+    @classmethod
+    def _publish_supplier_quality_notices(cls, application, *, actor_openid=""):
+        grouped = {}
+        for material in cls._supplier_fault_replacement_materials(application):
+            grouped.setdefault(int(material["supplier_id"]), []).append(material)
+
+        for supplier_id, materials in grouped.items():
+            supplier = Organization.objects.filter(
+                pk=supplier_id,
+                organization_type__code="SUPPLIER",
+                is_active=True,
+            ).first()
+            if not supplier:
+                continue
+            material_ids = sorted({
+                int(item["material_id"])
+                for item in materials
+                if item.get("material_id") not in (None, "")
+            })
+            recipient_data = get_supplier_task_recipients(
+                supplier=supplier,
+                material_ids=material_ids,
+            )
+            recipient_scopes = dict(recipient_data.get("recipient_scopes") or {})
+            recipients = list(recipient_data.get("openids") or [])
+
+            # Old deployments may not yet have material/category responsibility
+            # assignments.  Supplier sales still need the quality notification;
+            # owners remain included by the shared recipient resolver.
+            if not recipient_data.get("sales_openids"):
+                fallback_sales = (
+                    UserOrganization.objects.select_related("user")
+                    .filter(
+                        organization=supplier,
+                        role__code="supplier_sales",
+                        role__is_active=True,
+                        user__is_active=True,
+                        is_active=True,
+                    )
+                    .exclude(user__wx_openid__isnull=True)
+                    .exclude(user__wx_openid="")
+                )
+                for identity in fallback_sales:
+                    openid = identity.user.wx_openid
+                    recipients.append(openid)
+                    recipient_scopes[openid] = {
+                        "role": "supplier_sales",
+                        "identity_id": identity.pk,
+                        "name": _user_name(identity.user),
+                        "material_ids": material_ids,
+                    }
+            recipients = list(dict.fromkeys(recipients))
+            if not recipients:
+                continue
+            material_names = "、".join(
+                dict.fromkeys(item.get("material_name") or "物料" for item in materials)
+            )
+            publish_workitem(
+                domain="AFTERSALE",
+                type=cls.SUPPLIER_QUALITY_NOTICE_TYPE,
+                biz_id=str(application.id),
+                biz_ref=f"AfterSalesApplication:{application.id}",
+                uniq_key=cls._supplier_notice_key(application, supplier_id),
+                title="产品售后确认物料故障并完成更换",
+                summary=f"{cls._summary(application)}｜涉及：{material_names}",
+                link=cls._supplier_notice_link(application, supplier_id),
+                recipients_openids=recipients,
+                need_action=False,
+                action_mode="EACH_ACK",
+                payload={
+                    "application_id": application.id,
+                    "case_no": application.case_no,
+                    "supplier_id": supplier_id,
+                    "supplier_name": supplier.name,
+                    "material_ids": material_ids,
+                    "materials": materials,
+                    "recipient_scopes": recipient_scopes,
+                    "notice_kind": "SUPPLIER_QUALITY",
+                },
+                actor_openid=actor_openid,
+                mark_workitem_done_immediately=True,
+            )
+
+    @classmethod
+    def supplier_quality_notice_detail(
+        cls, *, application_id, supplier_id, user
+    ):
+        identity = cls._identity(user)
+        if (
+            not identity
+            or identity.organization_id != supplier_id
+            or identity.role.code not in {"supplier_owner", "supplier_sales"}
+        ):
+            raise AfterSalesError("无权查看该供应商质量通知")
+        workitem = WorkItem.objects.filter(
+            uniq_key=cls._supplier_notice_key_for_id(application_id, supplier_id),
+            type=cls.SUPPLIER_QUALITY_NOTICE_TYPE,
+            user_tasks__to_openid=user.wx_openid or "",
+        ).distinct().first()
+        if not workitem:
+            raise AfterSalesError("供应商质量通知不存在或未向当前账号送达")
+        application = (
+            AfterSalesApplication.objects.select_related(
+                "factory_organization", "device", "device__product_model"
+            )
+            .filter(pk=application_id, status=AfterSalesApplication.Status.CLOSED)
+            .first()
+        )
+        if not application:
+            raise AfterSalesError("对应售后结案记录不存在")
+        scope = (workitem.payload.get("recipient_scopes") or {}).get(
+            user.wx_openid or "", {}
+        )
+        allowed_material_ids = {str(item) for item in scope.get("material_ids") or []}
+        materials = list(workitem.payload.get("materials") or [])
+        if identity.role.code == "supplier_sales":
+            materials = [
+                item for item in materials
+                if str(item.get("material_id")) in allowed_material_ids
+            ]
+        device = application.device_snapshot or {}
+        bom = application.bom_snapshot or {}
+        return {
+            "notice_type": "SUPPLIER_QUALITY",
+            "notice_title": "售后物料质量知晓通知",
+            "case_no": application.case_no,
+            "factory_name": application.factory_organization.name,
+            "supplier": {"id": supplier_id, "name": identity.organization.name},
+            "device": {
+                "sn": device.get("sn") or application.device.sn,
+                "product_model": device.get("product_model")
+                or application.device.product_model.name,
+                "production_batch": device.get("production_batch")
+                or device.get("batch_no")
+                or "",
+                "bom_version": bom.get("version") or bom.get("version_no") or "",
+            },
+            "materials": materials,
+            "final": {
+                "fault_type": application.final_fault_type,
+                "fault_type_name": application.get_final_fault_type_display(),
+                "solution_type": application.final_solution_type,
+                "solution_type_name": application.get_final_solution_type_display(),
+                "solution_note": application.final_solution_note,
+            },
+            "repair": {
+                "summary": application.repair_summary,
+                "material_replaced": application.repair_material_replaced is True,
+            },
+            "closed_at": application.closed_at.isoformat() if application.closed_at else "",
+            "viewer": {"role_code": identity.role.code, "role_name": identity.role.name},
+            "privacy_note": "本通知已隐藏售后发起人、联系方式、地址、定位及现场附件。",
+        }
+
+    @classmethod
+    def list_supplier_quality_notices(cls, *, user, limit=100):
+        identity = cls._identity(user)
+        if (
+            not identity
+            or identity.role.code not in {"supplier_owner", "supplier_sales"}
+            or identity.organization.organization_type.code != "SUPPLIER"
+        ):
+            raise AfterSalesError("当前账号没有供应商质量通知列表权限")
+        try:
+            limit = max(1, min(int(limit), 200))
+        except (TypeError, ValueError):
+            limit = 100
+
+        # UserTask is the authorization source.  A supplier cannot discover a
+        # case merely by guessing its application id.
+        candidate_tasks = list(
+            UserTask.objects.select_related("workitem")
+            .filter(
+                to_openid=user.wx_openid or "",
+                workitem__type=cls.SUPPLIER_QUALITY_NOTICE_TYPE,
+            )
+            .order_by("-cursor_time", "-id")[:400]
+        )
+        supplier_id = identity.organization_id
+        tasks = [
+            task for task in candidate_tasks
+            if int((task.workitem.payload or {}).get("supplier_id") or 0)
+            == supplier_id
+        ][:limit]
+        application_ids = {
+            int((task.workitem.payload or {}).get("application_id") or 0)
+            for task in tasks
+        }
+        applications = {
+            item.id: item
+            for item in AfterSalesApplication.objects.select_related(
+                "factory_organization", "device", "device__product_model"
+            ).filter(id__in=application_ids, status=AfterSalesApplication.Status.CLOSED)
+        }
+        rows = []
+        for task in tasks:
+            payload = task.workitem.payload or {}
+            application_id = int(payload.get("application_id") or 0)
+            application = applications.get(application_id)
+            if not application:
+                continue
+            scope = (payload.get("recipient_scopes") or {}).get(
+                user.wx_openid or "", {}
+            )
+            allowed_ids = {str(value) for value in scope.get("material_ids") or []}
+            materials = list(payload.get("materials") or [])
+            if identity.role.code == "supplier_sales":
+                materials = [
+                    item for item in materials
+                    if str(item.get("material_id")) in allowed_ids
+                ]
+            device = application.device_snapshot or {}
+            rows.append({
+                "task_id": task.id,
+                "application_id": application.id,
+                "supplier_id": supplier_id,
+                "case_no": application.case_no,
+                "title": task.display_title_snapshot or task.workitem.title,
+                "summary": task.display_subtitle_snapshot or task.workitem.summary,
+                "state": task.state,
+                "is_unread": task.state == "NEW",
+                "factory_name": application.factory_organization.name,
+                "product_model": device.get("product_model")
+                or application.device.product_model.name,
+                "sn": device.get("sn") or application.device.sn,
+                "materials": materials,
+                "material_names": list(dict.fromkeys(
+                    item.get("material_name") or "物料" for item in materials
+                )),
+                "closed_at": application.closed_at.isoformat()
+                if application.closed_at else "",
+                "detail_link": cls._supplier_notice_link(application, supplier_id),
+            })
+        return {"items": rows, "count": len(rows)}
 
     @classmethod
     @transaction.atomic
@@ -2030,6 +2387,10 @@ class AfterSalesService:
         cls._complete_tasks(
             application,
             steps=["factory-close"],
+            actor_openid=user.wx_openid or "",
+        )
+        cls._complete_factory_workorder(
+            application,
             actor_openid=user.wx_openid or "",
         )
         cls._close_application(application, user=user, identity=identity, data=data)
@@ -2182,6 +2543,103 @@ class AfterSalesService:
         return actions
 
     @classmethod
+    def _viewer_stage(cls, application, *, applicant, assignee, factory_sales, actions):
+        """Describe the current node from this viewer's perspective."""
+
+        stage = application.execution_stage
+        action_titles = (
+            ("can_triage", "待您认定并分派", "请完成故障认定并选择处理路径"),
+            ("can_applicant_shipment", "待您寄送设备", "请寄送设备并上传物流单据"),
+            ("can_repair_receipt", "待您确认收件", "请确认已收到寄修设备"),
+            ("can_repair_complete", "待您完成维修", "请完成维修并上传处理记录"),
+            ("can_return_shipment", "待您寄回设备", "请寄回设备并上传物流单据"),
+            ("can_applicant_confirm", "待您确认处理结果", "请确认本次售后处理结果"),
+            ("can_factory_close", "待您完成最终归因", "请完成最终故障归因并结案"),
+            (
+                "can_third_party_material_shipment",
+                "待您登记备件寄送",
+                "请登记第三方维修备件寄送",
+            ),
+            ("can_third_party_expense", "待您登记维修费用", "请登记第三方维修费用凭证"),
+            (
+                "can_third_party_fault_material_return",
+                "待您登记故障物料返还",
+                "请登记故障物料返还",
+            ),
+        )
+        for key, badge, title in action_titles:
+            if actions.get(key):
+                return {
+                    "mode": "ACTION_REQUIRED",
+                    "badge": badge,
+                    "title": title,
+                    "message": "当前步骤正在由您完成，请在下方提交相应操作。",
+                }
+
+        if stage == AfterSalesApplication.ExecutionStage.CLOSED:
+            return {
+                "mode": "COMPLETED",
+                "badge": "售后服务已完成",
+                "title": "本次售后服务已完成",
+                "message": application.final_solution_note or "可查看完整处理记录与结案结果。",
+            }
+
+        waiting = {
+            AfterSalesApplication.ExecutionStage.NONE: (
+                "等待厂家销售经理判断并指派", "厂家尚未完成故障认定。"
+            ),
+            AfterSalesApplication.ExecutionStage.AWAITING_APPLICANT_SHIPMENT: (
+                "等待售后发起人寄送设备", "发起人尚未上传物流单据并确认寄送。"
+            ),
+            AfterSalesApplication.ExecutionStage.AWAITING_REPAIR_RECEIPT: (
+                "等待维修人确认收件", "设备已寄出，等待维修执行人确认收到。"
+            ),
+            AfterSalesApplication.ExecutionStage.REPAIRING: (
+                "等待维修人完成维修", "维修执行人正在处理故障。"
+            ),
+            AfterSalesApplication.ExecutionStage.AWAITING_RETURN_SHIPMENT: (
+                "等待维修人寄回设备", "维修已经完成，等待维修人登记返件物流。"
+            ),
+            AfterSalesApplication.ExecutionStage.AWAITING_APPLICANT_CONFIRM: (
+                "等待售后发起人确认结果", "设备处理结果等待发起人确认。"
+            ),
+            AfterSalesApplication.ExecutionStage.FINAL_DIAGNOSIS: (
+                "等待厂家完成最终归因", "厂家销售经理将确认故障物料、类型和解决方案。"
+            ),
+        }
+        title, message = waiting.get(stage, ("售后处理中", "请查看最新处理记录。"))
+
+        # The original installer route gives the applicant a contact plan,
+        # while the assignee performs the repair. It is progress information,
+        # not a false "waiting for yourself" prompt.
+        if (
+            stage == AfterSalesApplication.ExecutionStage.CONTACT_INSTALLER
+            and applicant
+        ):
+            return {
+                "mode": "PROGRESS",
+                "badge": "厂家已安排处理",
+                "title": "厂家已安排原装车操作人员处理",
+                "message": application.repair_plan,
+            }
+
+        # A viewer who is involved but has no current action sees the actual
+        # counterparty that owns this node.
+        if applicant or assignee or factory_sales:
+            return {
+                "mode": "WAITING",
+                "badge": title,
+                "title": title,
+                "message": message,
+            }
+        return {
+            "mode": "PROGRESS",
+            "badge": "售后处理中",
+            "title": "售后处理中",
+            "message": "",
+        }
+
+    @classmethod
     def detail(cls, *, application_id, user):
         application = (
             AfterSalesApplication.objects.select_related(
@@ -2205,13 +2663,25 @@ class AfterSalesService:
             raise AfterSalesError("无权查看该售后申请")
         identity = cls._identity(user)
         data = cls.serialize(application, detail=True)
+        is_applicant = cls._is_applicant(application, user)
+        is_assignee = cls._is_assignee(application, user)
+        is_factory_sales = cls._is_factory_sales(application, user, identity)
         data["viewer"] = {
-            "is_applicant": cls._is_applicant(application, user),
-            "is_assignee": cls._is_assignee(application, user),
-            "is_factory_sales": cls._is_factory_sales(application, user, identity),
+            "is_applicant": is_applicant,
+            "is_assignee": is_assignee,
+            "is_factory_sales": is_factory_sales,
         }
         data["actions"] = cls._viewer_actions(application, user, identity)
-        data["applicant_instruction"] = cls._applicant_instruction(application)
+        data["viewer_stage"] = cls._viewer_stage(
+            application,
+            applicant=is_applicant,
+            assignee=is_assignee,
+            factory_sales=is_factory_sales,
+            actions=data["actions"],
+        )
+        data["applicant_instruction"] = (
+            cls._applicant_instruction(application) if is_applicant else {}
+        )
         data["preliminary_fault_types"] = cls._option_rows(
             AfterSalesApplication.FaultType.choices
         )

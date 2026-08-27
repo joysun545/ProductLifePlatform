@@ -29,9 +29,19 @@ urlpatterns = [
         name="after_sales_application_list",
     ),
     path(
+        "after-sales/supplier-quality-notices/",
+        views.AfterSalesSupplierQualityNoticeListAPI.as_view(),
+        name="after_sales_supplier_quality_notice_list",
+    ),
+    path(
         "after-sales/applications/<int:application_id>/",
         views.AfterSalesApplicationDetailAPI.as_view(),
         name="after_sales_application_detail",
+    ),
+    path(
+        "after-sales/applications/<int:application_id>/supplier-quality-notices/<int:supplier_id>/",
+        views.AfterSalesSupplierQualityNoticeAPI.as_view(),
+        name="after_sales_supplier_quality_notice",
     ),
     path(
         "after-sales/applications/<int:application_id>/media/",

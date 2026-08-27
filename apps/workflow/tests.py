@@ -95,6 +95,47 @@ class WorkflowTaskAuthenticationTests(TestCase):
         self.task.refresh_from_db()
         self.assertEqual(self.task.state, "NEW")
 
+    def test_opening_after_sales_card_acknowledges_notices_but_not_actions(self):
+        group_key = "aftersales:AS-TEST-001"
+        tasks = []
+        for index, need_action in enumerate((False, False, True), start=1):
+            workitem = WorkItem.objects.create(
+                domain="AFTERSALE",
+                type=f"AFTERSALES_TEST_{index}",
+                biz_id="91",
+                biz_ref="AfterSalesApplication:91",
+                title=f"售后更新{index}",
+                action_mode="EACH_ACK",
+                uniq_key=f"aftersales-test-{index}",
+                payload={
+                    "inbox_group_key": group_key,
+                    "inbox_group_kind": "AFTERSALES",
+                },
+            )
+            tasks.append(UserTask.objects.create(
+                workitem=workitem,
+                to_openid=self.user.wx_openid,
+                state="NEW",
+                need_action=need_action,
+            ))
+
+        response = self.client.post(
+            self.open_url,
+            {"usertask_id": tasks[0].id},
+            HTTP_AUTHORIZATION=self.authorization,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        states = list(
+            UserTask.objects.filter(pk__in=[item.pk for item in tasks])
+            .order_by("pk")
+            .values_list("state", "done_reason")
+        )
+        self.assertEqual(
+            states,
+            [("DONE", "GROUP_OPENED"), ("DONE", "GROUP_OPENED"), ("READ", "")],
+        )
+
     def test_summary_attention_count_is_union_without_double_count(self):
         cases = (
             ("new-action", "NEW", True),
