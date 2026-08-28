@@ -5,6 +5,7 @@ from account.models import UserOrganization
 from lifecycle.services.lifecycle_service import LifecycleService
 from manufacturing.models import ProductionBatch
 from product.models import BOMItem
+from quality_trace.services import enforce_device_operation, quality_gate_atomic
 from sales.models import OrderPlan, OrderPlanItem, OrderPlanItemMaterialBatch
 from sales.services.order_plan_reissue_service import ensure_reissue_qrcodes
 from workflow.services.workflow_service import publish_workitem
@@ -334,7 +335,7 @@ def generate_item_qrcodes(*, item_id):
     }
 
 
-@transaction.atomic
+@quality_gate_atomic(OrderQRCodePrintError)
 def confirm_item_printed(*, item_id):
     candidate = _get_item(item_id)
     plan = OrderPlan.objects.select_for_update().select_related(
@@ -375,6 +376,25 @@ def confirm_item_printed(*, item_id):
         or production_count + reissue_count != item.quantity
     ):
         raise OrderQRCodePrintError("二维码数量尚未达到订单总需求数量。")
+    print_devices = []
+    if item.production_quantity > 0:
+        print_devices.extend(batch.devices.order_by("id"))
+    print_devices.extend(
+        allocation.source_device
+        for allocation in item.return_inventory_allocations.select_related(
+            "source_device",
+        ).order_by("id")
+    )
+    for device in print_devices:
+        enforce_device_operation(
+            device_id=device.pk,
+            operation="QRCODE_PRINT",
+            context={
+                "source": "ORDER_QRCODE_PRINT_CONFIRM",
+                "order_plan_id": plan.pk,
+                "order_plan_item_id": item.pk,
+            },
+        )
     item.qrcode_printed_at = timezone.now()
     item.save(update_fields=("qrcode_printed_at", "updated_at"))
     remaining = plan.items.filter(qrcode_printed_at__isnull=True).count()

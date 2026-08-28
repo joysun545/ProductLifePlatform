@@ -33,6 +33,12 @@ from lifecycle.models import (
 )
 from manufacturing.models import ProductionBatch
 from product.models import BOM, BOMItem, Brand, ProductCategory, ProductModel
+from quality_trace.models import (
+    BatchQualityAffectedDevice,
+    BatchQualityCase,
+    QualityGateDecision,
+)
+from quality_trace.services import place_temporary_hold, revoke_temporary_hold
 from sales.services.order_qrcode_print_service import (
     OrderQRCodePrintError,
     _validate_supplier_batch_coverage,
@@ -1055,6 +1061,61 @@ class OrderPlanApiTests(TestCase):
             )
             generated = generate_item_qrcodes(item_id=item.pk)
             self.assertEqual(len(generated["qrcodes"]), item.quantity)
+            if item.pk == first_item.pk:
+                batch = ProductionBatch.objects.get(
+                    batch_no=item.order_batch_code,
+                )
+                gated_device = batch.devices.order_by("id").first()
+                quality_case = BatchQualityCase.objects.create(
+                    case_no="QT-R135-QRCODE-PRINT-GATE",
+                    factory_organization=self.factory,
+                    scope_type="DEVICE",
+                    scope_key=f"device:{gated_device.pk}",
+                    scope_snapshot={"device_id": gated_device.pk},
+                    reason="验证二维码确认打印质量门禁",
+                    opened_by=self.factory_manager,
+                )
+                BatchQualityAffectedDevice.objects.create(
+                    quality_case=quality_case,
+                    device=gated_device,
+                    sn_snapshot=gated_device.sn,
+                    production_batch_snapshot=batch.batch_no,
+                    product_model_snapshot={
+                        "id": gated_device.product_model_id,
+                        "code": gated_device.product_model.code,
+                        "name": gated_device.product_model.name,
+                    },
+                    location_snapshot={},
+                    trace_evidence_snapshot={"is_fault": True},
+                )
+                action = place_temporary_hold(
+                    user=self.factory_manager,
+                    case_id=quality_case.pk,
+                    reason="阻断二维码确认打印",
+                    duration_hours=1,
+                )
+                with self.assertRaisesMessage(
+                    OrderQRCodePrintError,
+                    quality_case.case_no,
+                ):
+                    confirm_item_printed(item_id=item.pk)
+                item.refresh_from_db()
+                self.assertIsNone(item.qrcode_printed_at)
+                decision = QualityGateDecision.objects.get(
+                    device=gated_device,
+                    operation="QRCODE_PRINT",
+                    allowed=False,
+                )
+                self.assertEqual(decision.control_action_id, action.pk)
+                self.assertEqual(
+                    decision.context_snapshot["source"],
+                    "ORDER_QRCODE_PRINT_CONFIRM",
+                )
+                revoke_temporary_hold(
+                    user=self.factory_manager,
+                    action_id=action.pk,
+                    reason="测试完成后恢复二维码打印",
+                )
             printed = confirm_item_printed(item_id=item.pk)
 
         self.assertTrue(printed["order_printed"])
@@ -1067,6 +1128,52 @@ class OrderPlanApiTests(TestCase):
         self.assertEqual(
             stock_workitem.actor_openid,
             self.sales_user.wx_openid,
+        )
+
+        outbound_hold = place_temporary_hold(
+            user=self.factory_manager,
+            case_id=quality_case.pk,
+            reason="阻断厂家库存出库",
+            duration_hours=1,
+        )
+        blocked_outbound = self.client.post(
+            f"/pldp/api/sales/order-plans/{plan.pk}/stock-outbound/",
+            HTTP_AUTHORIZATION=self.stock_authorization,
+        )
+        self.assertEqual(
+            blocked_outbound.json()["code"],
+            1,
+            blocked_outbound.json(),
+        )
+        self.assertIn(quality_case.case_no, blocked_outbound.json()["msg"])
+        plan.refresh_from_db()
+        stock_workitem.refresh_from_db()
+        self.assertEqual(plan.status, OrderPlan.Status.PRODUCTION_COMPLETED)
+        self.assertEqual(stock_workitem.status, "OPEN")
+        self.assertFalse(
+            LifecycleEvent.objects.filter(
+                device=gated_device,
+                event_type="SHIP",
+                data__order_plan_id=plan.pk,
+            ).exists()
+        )
+        outbound_decision = QualityGateDecision.objects.get(
+            device=gated_device,
+            operation="STOCK_OUTBOUND",
+            allowed=False,
+        )
+        self.assertEqual(
+            outbound_decision.control_action_id,
+            outbound_hold.pk,
+        )
+        self.assertEqual(
+            outbound_decision.context_snapshot["source"],
+            "ORDER_PLAN_STOCK_OUTBOUND",
+        )
+        revoke_temporary_hold(
+            user=self.factory_manager,
+            action_id=outbound_hold.pk,
+            reason="测试完成后恢复厂家出库",
         )
 
         outbound_response = self.client.post(

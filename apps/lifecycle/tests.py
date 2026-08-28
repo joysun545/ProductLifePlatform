@@ -34,11 +34,19 @@ from lifecycle.models import (
     InstallationInvitation,
     InstallationRecord,
     LifecycleEvent,
+    GoodsTransfer,
+    GoodsTransferItem,
     OrganizationDevice,
     ProductDocumentRead,
 )
 from lifecycle.services.lifecycle_service import LifecycleService
 from lifecycle.services.aftersales_service import AfterSalesService
+from lifecycle.services.goods_transfer_service import (
+    GoodsTransferError,
+    create_goods_transfer,
+    scan_goods_transfer_device,
+    submit_goods_transfer,
+)
 from manufacturing.models import ProductionBatch
 from product.models import (
     BOM,
@@ -47,6 +55,12 @@ from product.models import (
     ProductDocument,
     ProductModel,
 )
+from quality_trace.models import (
+    BatchQualityAffectedDevice,
+    BatchQualityCase,
+    QualityGateDecision,
+)
+from quality_trace.services import place_temporary_hold, revoke_temporary_hold
 from supply_chain.models import Material, MaterialSpec
 from workflow.models import UserTask, WorkItem
 
@@ -332,6 +346,96 @@ class ScanOwnershipAndInstallationTests(TestCase):
     def auth(self, user):
         return {"HTTP_AUTHORIZATION": f"Bearer {issue_access_token(user)}"}
 
+    def _create_transfer_target(self, suffix):
+        organization = Organization.objects.create(
+            code=f"MERCHANT-{suffix}",
+            name=f"调拨目标商家-{suffix}",
+            organization_type=self.direct_merchant.organization_type,
+        )
+        owner = self._user_identity(
+            f"transfer_target_{suffix}",
+            organization,
+            self.merchant_owner_role,
+        )
+        self._create_distribution_relation(
+            inviter_user=self.regional_sales_user,
+            inviter_role=self.merchant_sales_role,
+            target_user=owner,
+            target_org=organization,
+        )
+        return organization, owner
+
+    def _create_device_quality_hold(self, suffix):
+        quality_case = BatchQualityCase.objects.create(
+            case_no=f"QT-R1356-{suffix}",
+            factory_organization=self.factory,
+            scope_type="DEVICE",
+            scope_key=f"device:{self.device.pk}",
+            scope_snapshot={"device_id": self.device.pk},
+            reason="验证商品流转真实入口质量门禁",
+            opened_by=self.factory_user,
+        )
+        BatchQualityAffectedDevice.objects.create(
+            quality_case=quality_case,
+            device=self.device,
+            sn_snapshot=self.device.sn,
+            production_batch_snapshot=self.device.batch.batch_no,
+            product_model_snapshot={
+                "id": self.device.product_model_id,
+                "code": self.device.product_model.code,
+                "name": self.device.product_model.name,
+            },
+            location_snapshot={},
+            trace_evidence_snapshot={"is_fault": True},
+        )
+        action = place_temporary_hold(
+            user=self.factory_user,
+            case_id=quality_case.pk,
+            reason="验证商品流转拦截和事务外审计",
+            duration_hours=1,
+        )
+        return quality_case, action
+
+    def _create_direct_merchant_transfer(self, suffix):
+        _target_org, target_owner = self._create_transfer_target(suffix)
+        result, created = create_goods_transfer(
+            user=self.regional_owner_user,
+            flow_type=GoodsTransfer.FlowType.TRANSFER,
+            client_request_id=f"r1356-transfer-{suffix}",
+            source_account_id=self.direct_owner_user.pk,
+            target_account_id=target_owner.pk,
+            remark="R13.5.6质量门禁回归",
+        )
+        self.assertTrue(created)
+        return GoodsTransfer.objects.get(pk=result["id"])
+
+    def _create_direct_merchant_shipment(self, suffix):
+        organization = Organization.objects.create(
+            code=f"SHIPMENT-MERCHANT-{suffix}",
+            name=f"发货目标商家-{suffix}",
+            organization_type=self.direct_merchant.organization_type,
+        )
+        target_owner = self._user_identity(
+            f"shipment_target_{suffix}",
+            organization,
+            self.merchant_owner_role,
+        )
+        self._create_distribution_relation(
+            inviter_user=self.direct_sales_user,
+            inviter_role=self.merchant_sales_role,
+            target_user=target_owner,
+            target_org=organization,
+        )
+        result, created = create_goods_transfer(
+            user=self.direct_owner_user,
+            flow_type=GoodsTransfer.FlowType.SHIPMENT,
+            client_request_id=f"r1357-shipment-{suffix}",
+            target_account_id=target_owner.pk,
+            remark="R13.5.7发货质量门禁回归",
+        )
+        self.assertTrue(created)
+        return GoodsTransfer.objects.get(pk=result["id"])
+
     def resolve(self, user):
         return self.client.post(
             self.resolve_endpoint,
@@ -547,6 +651,20 @@ class ScanOwnershipAndInstallationTests(TestCase):
             "address": "测试地址",
             "vehicle_no": "渝A12345",
         }
+
+    def _mark_required_documents_read(self, user):
+        documents = ProductDocument.objects.filter(
+            product_model=self.device.product_model,
+            is_active=True,
+        )
+        self.assertEqual(documents.count(), 3)
+        for document in documents:
+            ProductDocumentRead.objects.get_or_create(
+                user=user,
+                device=self.device,
+                document=document,
+                document_version=document.version,
+            )
 
     def test_customer_invitation_detail_and_accept_build_complete_chain(self):
         token = self._install_and_token()
@@ -780,6 +898,7 @@ class ScanOwnershipAndInstallationTests(TestCase):
             "activate_device",
             result.json()["data"]["scan_result"]["capabilities"],
         )
+        self._mark_required_documents_read(self.customer_user)
 
         activate = self.client.post(
             f"{result_url}activate/",
@@ -802,6 +921,253 @@ class ScanOwnershipAndInstallationTests(TestCase):
             **self.auth(self.customer_user),
         )
         self.assertEqual(duplicate.status_code, 409)
+
+    def test_quality_hold_blocks_real_activation_and_preserves_audit(self):
+        token = self._install_and_token()
+        accept_response = self.client.post(
+            "/pldp/api/lifecycle/scan/customer-invitations/"
+            f"{token}/accept/",
+            self._accept_payload(),
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(accept_response.status_code, 201)
+        self._mark_required_documents_read(self.customer_user)
+
+        quality_case = BatchQualityCase.objects.create(
+            case_no="QT-R135-ACTIVATION-GATE",
+            factory_organization=self.factory,
+            scope_type="DEVICE",
+            scope_key=f"device:{self.device.pk}",
+            scope_snapshot={"device_id": self.device.pk},
+            reason="验证真实激活入口质量门禁",
+            opened_by=self.factory_user,
+        )
+        BatchQualityAffectedDevice.objects.create(
+            quality_case=quality_case,
+            device=self.device,
+            sn_snapshot=self.device.sn,
+            production_batch_snapshot=self.device.batch.batch_no,
+            product_model_snapshot={
+                "id": self.device.product_model_id,
+                "code": self.device.product_model.code,
+                "name": self.device.product_model.name,
+            },
+            location_snapshot={},
+            trace_evidence_snapshot={"is_fault": True},
+        )
+        action = place_temporary_hold(
+            user=self.factory_user,
+            case_id=quality_case.pk,
+            reason="验证激活入口阻断和事务外审计",
+            duration_hours=1,
+        )
+
+        result_url = f"/pldp/api/lifecycle/customer/devices/{self.device.id}/"
+        activate = self.client.post(
+            f"{result_url}activate/",
+            {"vehicle_no": "渝A12345", "location": "重庆市渝北区"},
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(activate.status_code, 409, activate.json())
+        self.assertIn(quality_case.case_no, activate.json()["msg"])
+        self.assertIn("门禁审计", activate.json()["msg"])
+
+        state = DeviceState.objects.get(device=self.device)
+        self.assertEqual(state.activation_status, "NOT_ACTIVATED")
+        self.assertFalse(
+            LifecycleEvent.objects.filter(
+                device=self.device,
+                event_type="ACTIVATE",
+            ).exists()
+        )
+        decision = QualityGateDecision.objects.get(
+            device=self.device,
+            operation="ACTIVATION",
+            allowed=False,
+        )
+        self.assertEqual(decision.quality_case_id, quality_case.pk)
+        self.assertEqual(decision.control_action_id, action.pk)
+        self.assertEqual(
+            decision.context_snapshot["source"],
+            "CUSTOMER_DEVICE_ACTIVATION",
+        )
+
+    def test_quality_hold_blocks_goods_transfer_scan_and_preserves_audit(self):
+        transfer = self._create_direct_merchant_transfer("scan")
+        quality_case, action = self._create_device_quality_hold("SCAN")
+
+        with self.assertRaisesMessage(GoodsTransferError, quality_case.case_no):
+            scan_goods_transfer_device(
+                user=self.regional_owner_user,
+                transfer_id=transfer.pk,
+                qr_text=self.device.qrcode.code,
+            )
+
+        self.assertFalse(GoodsTransferItem.objects.filter(transfer=transfer).exists())
+        self.assertEqual(
+            OrganizationDevice.objects.get(device=self.device).organization_id,
+            self.direct_merchant.pk,
+        )
+        decision = QualityGateDecision.objects.get(
+            device=self.device,
+            operation="TRANSFER",
+            allowed=False,
+        )
+        self.assertEqual(decision.quality_case_id, quality_case.pk)
+        self.assertEqual(decision.control_action_id, action.pk)
+        self.assertEqual(decision.context_snapshot["source"], "GOODS_TRANSFER_SCAN")
+
+    def test_quality_hold_rechecks_goods_transfer_submit_and_rolls_back(self):
+        transfer = self._create_direct_merchant_transfer("submit")
+        scan_goods_transfer_device(
+            user=self.regional_owner_user,
+            transfer_id=transfer.pk,
+            qr_text=self.device.qrcode.code,
+        )
+        quality_case, action = self._create_device_quality_hold("SUBMIT")
+
+        with self.assertRaisesMessage(GoodsTransferError, quality_case.case_no):
+            submit_goods_transfer(
+                user=self.regional_owner_user,
+                transfer_id=transfer.pk,
+            )
+
+        transfer.refresh_from_db()
+        item = transfer.items.get(device=self.device)
+        self.assertEqual(transfer.status, GoodsTransfer.Status.SCANNING)
+        self.assertEqual(item.status, GoodsTransferItem.Status.SCANNED)
+        self.assertIsNone(item.lifecycle_event_id)
+        self.assertEqual(
+            OrganizationDevice.objects.get(device=self.device).organization_id,
+            self.direct_merchant.pk,
+        )
+        decision = QualityGateDecision.objects.get(
+            device=self.device,
+            operation="TRANSFER",
+            allowed=False,
+        )
+        self.assertEqual(decision.control_action_id, action.pk)
+        self.assertEqual(decision.context_snapshot["source"], "GOODS_TRANSFER_SUBMIT")
+
+        revoke_temporary_hold(
+            user=self.factory_user,
+            action_id=action.pk,
+            reason="提交二次门禁回归完成",
+        )
+        result, changed = submit_goods_transfer(
+            user=self.regional_owner_user,
+            transfer_id=transfer.pk,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(result["status"], GoodsTransfer.Status.COMPLETED)
+        self.assertEqual(
+            OrganizationDevice.objects.get(device=self.device).organization_id,
+            transfer.to_organization_id,
+        )
+
+    def test_quality_hold_allows_return_goods_transfer_to_recall_device(self):
+        quality_case, action = self._create_device_quality_hold("RETURN")
+        result, created = create_goods_transfer(
+            user=self.direct_owner_user,
+            flow_type=GoodsTransfer.FlowType.RETURN,
+            client_request_id="r1356-return-bypass",
+            target_account_id=self.regional_sales_user.pk,
+            remark="质量召回设备向上级退回",
+        )
+        self.assertTrue(created)
+        transfer = GoodsTransfer.objects.get(pk=result["id"])
+
+        scan_result = scan_goods_transfer_device(
+            user=self.direct_owner_user,
+            transfer_id=transfer.pk,
+            qr_text=self.device.qrcode.code,
+        )
+        self.assertEqual(scan_result["item_count"], 1)
+        self.assertFalse(
+            QualityGateDecision.objects.filter(
+                device=self.device,
+                operation="TRANSFER",
+            ).exists()
+        )
+        action.refresh_from_db()
+        quality_case.refresh_from_db()
+        self.assertEqual(action.status, "ACTIVE")
+        self.assertEqual(quality_case.status, "HELD")
+
+    def test_quality_hold_blocks_goods_shipment_scan(self):
+        transfer = self._create_direct_merchant_shipment("scan")
+        quality_case, action = self._create_device_quality_hold("SHIPMENT-SCAN")
+
+        with self.assertRaisesMessage(GoodsTransferError, quality_case.case_no):
+            scan_goods_transfer_device(
+                user=self.direct_owner_user,
+                transfer_id=transfer.pk,
+                qr_text=self.device.qrcode.code,
+            )
+
+        self.assertFalse(transfer.items.exists())
+        decision = QualityGateDecision.objects.get(
+            device=self.device,
+            operation="SHIPMENT",
+            allowed=False,
+        )
+        self.assertEqual(decision.control_action_id, action.pk)
+        self.assertEqual(decision.context_snapshot["source"], "GOODS_TRANSFER_SCAN")
+        self.assertEqual(
+            OrganizationDevice.objects.get(device=self.device).organization_id,
+            self.direct_merchant.pk,
+        )
+
+    def test_quality_hold_rechecks_goods_shipment_submit_then_resumes(self):
+        transfer = self._create_direct_merchant_shipment("submit")
+        scan_goods_transfer_device(
+            user=self.direct_owner_user,
+            transfer_id=transfer.pk,
+            qr_text=self.device.qrcode.code,
+        )
+        quality_case, action = self._create_device_quality_hold("SHIPMENT-SUBMIT")
+
+        with self.assertRaisesMessage(GoodsTransferError, quality_case.case_no):
+            submit_goods_transfer(
+                user=self.direct_owner_user,
+                transfer_id=transfer.pk,
+            )
+
+        transfer.refresh_from_db()
+        item = transfer.items.get(device=self.device)
+        state = DeviceState.objects.get(device=self.device)
+        self.assertEqual(transfer.status, GoodsTransfer.Status.SCANNING)
+        self.assertEqual(item.status, GoodsTransferItem.Status.SCANNED)
+        self.assertIsNone(item.lifecycle_event_id)
+        self.assertEqual(state.status, "IN_STOCK")
+        decision = QualityGateDecision.objects.get(
+            device=self.device,
+            operation="SHIPMENT",
+            allowed=False,
+        )
+        self.assertEqual(decision.control_action_id, action.pk)
+        self.assertEqual(decision.context_snapshot["source"], "GOODS_TRANSFER_SUBMIT")
+
+        revoke_temporary_hold(
+            user=self.factory_user,
+            action_id=action.pk,
+            reason="发货提交二次门禁回归完成",
+        )
+        result, changed = submit_goods_transfer(
+            user=self.direct_owner_user,
+            transfer_id=transfer.pk,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(result["status"], GoodsTransfer.Status.PENDING_RECEIPT)
+        transfer.refresh_from_db()
+        item.refresh_from_db()
+        state.refresh_from_db()
+        self.assertEqual(item.status, GoodsTransferItem.Status.PENDING_RECEIPT)
+        self.assertEqual(state.status, "SHIPPED")
+        self.assertEqual(
+            OrganizationDevice.objects.get(device=self.device).organization_id,
+            self.direct_merchant.pk,
+        )
 
     def test_driver_can_activate_only_devices_on_shared_vehicle(self):
         token = self._install_and_token()
@@ -856,6 +1222,7 @@ class ScanOwnershipAndInstallationTests(TestCase):
             result_data["scan_result"]["capabilities"],
         )
         self.assertTrue(result_data["actions"]["can_activate"])
+        self._mark_required_documents_read(driver)
 
         activate = self.client.post(
             f"{result_url}activate/",

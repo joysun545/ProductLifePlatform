@@ -22,6 +22,7 @@ from lifecycle.models import (
     QRCode,
 )
 from lifecycle.services.scan_service import QRCodeResolveError, ScanService
+from quality_trace.services import enforce_device_operation, quality_gate_atomic
 from workflow.models import WorkItem
 from workflow.services.workflow_service import publish_workitem
 
@@ -49,6 +50,31 @@ NOTICE_WORK_TYPE = "GOODS_TRANSFER_NOTICE"
 
 class GoodsTransferError(Exception):
     pass
+
+
+def _quality_gate_operation(transfer):
+    if transfer.flow_type == GoodsTransfer.FlowType.SHIPMENT:
+        return "SHIPMENT"
+    if transfer.flow_type == GoodsTransfer.FlowType.TRANSFER:
+        return "TRANSFER"
+    return ""
+
+
+def _enforce_transfer_quality_gate(*, transfer, device, user, source):
+    operation = _quality_gate_operation(transfer)
+    if not operation:
+        return
+    enforce_device_operation(
+        device_id=device.pk,
+        operation=operation,
+        user=user,
+        context={
+            "source": source,
+            "goods_transfer_id": transfer.pk,
+            "flow_no": transfer.flow_no,
+            "flow_type": transfer.flow_type,
+        },
+    )
 
 
 def _related(instance, name):
@@ -332,7 +358,7 @@ def _locked_device_for_transfer(transfer, code):
     return device, ownership, state
 
 
-@transaction.atomic
+@quality_gate_atomic(GoodsTransferError)
 def scan_goods_transfer_device(*, user, transfer_id, qr_text):
     identity = _identity(user, MERCHANT_FLOW_ROLES)
     transfer = GoodsTransfer.objects.select_for_update().filter(
@@ -349,6 +375,12 @@ def scan_goods_transfer_device(*, user, transfer_id, qr_text):
     except QRCodeResolveError as exc:
         raise GoodsTransferError(str(exc)) from exc
     device, _ownership, _state = _locked_device_for_transfer(transfer, code)
+    _enforce_transfer_quality_gate(
+        transfer=transfer,
+        device=device,
+        user=user,
+        source="GOODS_TRANSFER_SCAN",
+    )
     if GoodsTransferItem.objects.filter(transfer=transfer, device=device).exists():
         raise GoodsTransferError("该设备已经加入本次商品流转。")
     if GoodsTransferItem.objects.filter(
@@ -528,7 +560,7 @@ def _lock_and_validate_items(transfer):
     return items
 
 
-@transaction.atomic
+@quality_gate_atomic(GoodsTransferError)
 def submit_goods_transfer(
     *,
     user,
@@ -559,6 +591,13 @@ def submit_goods_transfer(
         return serialize_goods_transfer(transfer, identity), False
 
     items = _lock_and_validate_items(transfer)
+    for item in items:
+        _enforce_transfer_quality_gate(
+            transfer=transfer,
+            device=item.device,
+            user=user,
+            source="GOODS_TRANSFER_SUBMIT",
+        )
     now = timezone.now()
     if transfer.receipt_required:
         factory_return = bool(

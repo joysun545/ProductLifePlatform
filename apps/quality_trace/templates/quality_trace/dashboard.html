@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>质量追溯与召回</title>
+</head>
+<body>
+  <main>
+    <h1>质量追溯与召回</h1>
+    <p>{{ identity.organization.name }} · {{ identity.role.name }}</p>
+    <p>R13.0 已建立独立数据底座；自动预警和拦截将在后续版本启用。</p>
+    <h2>预警</h2>
+    <ul>{% for item in alerts %}<li>{{ item.target_key }} · {{ item.get_status_display }}</li>{% empty %}<li>暂无预警</li>{% endfor %}</ul>
+    <h2>质量案件</h2>
+    <ul>{% for item in cases %}<li>{{ item.case_no }} · {{ item.get_status_display }}</li>{% empty %}<li>暂无案件</li>{% endfor %}</ul>
+  </main>
+</body>
+</html>

@@ -8,8 +8,9 @@ from sales.models import OrderPlan, OrderPlanItem
 from workflow.models import WorkItem
 from workflow.services.workflow_service import publish_workitem
 from sales.services.order_plan_receipt_service import (
-    mark_devices_shipped, role_openids, display_name,
+    _devices, mark_devices_shipped, role_openids, display_name,
 )
+from quality_trace.services import enforce_device_operation, quality_gate_atomic
 from sales.services.order_plan_shipment_authorization_service import (
     OrderPlanShipmentAuthorizationError,
     publish_shipment_authorization_task,
@@ -152,7 +153,7 @@ def get_stock_outbound_detail(*, user, plan_id):
     }
 
 
-@transaction.atomic
+@quality_gate_atomic(OrderPlanProductionError)
 def confirm_stock_outbound(*, user, plan_id):
     identity = _identity(user, "factory_stock")
     plan = _plan(identity, plan_id, lock=True)
@@ -203,6 +204,19 @@ def confirm_stock_outbound(*, user, plan_id):
         raise OrderPlanProductionError(
             "接收商家尚未配置负责人、高级经理、销售经理或库管，"
             "无法创建入库任务。"
+        )
+
+    outbound_devices = _devices(plan)
+    for device in outbound_devices:
+        enforce_device_operation(
+            device_id=device.pk,
+            operation="STOCK_OUTBOUND",
+            user=user,
+            context={
+                "source": "ORDER_PLAN_STOCK_OUTBOUND",
+                "order_plan_id": plan.pk,
+                "plan_code": plan.plan_code,
+            },
         )
 
     now = timezone.now()

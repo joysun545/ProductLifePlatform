@@ -64,4 +64,12 @@ urlpatterns = [
         )
     ),
 
+    path(
+        "quality-trace/",
+        include(
+            ("quality_trace.api.urls", "quality_trace"),
+            namespace="quality_trace"
+        )
+    ),
+
 ]

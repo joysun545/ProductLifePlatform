@@ -31,6 +31,7 @@ from lifecycle.models import (
 from lifecycle.services.scan_service import ScanService
 from integration.services.device_telemetry import DeviceTelemetryService
 from product.models import ProductDocument
+from quality_trace.services import enforce_device_operation, quality_gate_atomic
 
 
 class CustomerFlowError(Exception):
@@ -1031,7 +1032,7 @@ class CustomerDeviceService:
         }
 
     @classmethod
-    @transaction.atomic
+    @quality_gate_atomic(CustomerFlowStateError)
     def activate(cls, *, device_id, user, vehicle_no, location=""):
         # 这里必须复用详情页的属主和司机车辆授权校验，避免同一用户组织中
         # 未获得车辆分享的司机绕过页面直接调用激活接口。
@@ -1063,6 +1064,17 @@ class CustomerDeviceService:
         )
         if document_gate["gate_required"] and not document_gate["activation_allowed"]:
             raise CustomerFlowStateError(document_gate["message"])
+
+        enforce_device_operation(
+            device_id=device.pk,
+            operation="ACTIVATION",
+            user=user,
+            context={
+                "source": "CUSTOMER_DEVICE_ACTIVATION",
+                "customer_organization_id": identity.organization_id,
+                "vehicle_no": vehicle_no,
+            },
+        )
 
         now = timezone.now()
         event = LifecycleEvent.objects.create(

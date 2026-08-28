@@ -69,6 +69,7 @@ INSTALLED_APPS = [
     'sales',
     'workflow',
     'inventory',
+    'quality_trace',
 ]
 
 MIDDLEWARE = [
