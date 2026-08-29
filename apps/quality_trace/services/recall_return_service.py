@@ -18,6 +18,7 @@ from quality_trace.models import (
 from workflow.models import UserTask, WorkItem
 
 from .recall_service import QualityRecallError
+from .recall_task_service import complete_recall_scope_tasks_if_ready
 
 
 def _authorized_recipient(row, user):
@@ -136,6 +137,11 @@ def bind_recall_return_transfer(*, user, recall_device_id, transfer_id):
     row.status_updated_at = now
     row.save(update_fields=("status", "status_updated_at"))
     _complete_current_recall_tasks(row, user)
+    complete_recall_scope_tasks_if_ready(
+        recall_device=row,
+        user=user,
+        audience_type="MERCHANT",
+    )
     QualityRecallDeviceEvent.objects.create(
         campaign=row.campaign,
         recall_device=row,

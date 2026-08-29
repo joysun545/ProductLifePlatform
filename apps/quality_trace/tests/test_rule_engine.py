@@ -1,5 +1,7 @@
 from datetime import date, timedelta
 from decimal import Decimal
+import io
+import json
 from pathlib import Path
 import tempfile
 
@@ -22,8 +24,10 @@ from lifecycle.models import (
     ActivationRecord,
     AfterSalesApplication,
     CustomerDeviceBinding,
+    CustomerVehicle,
     Device,
     DeviceState,
+    DriverVehicleBinding,
     FactoryReturnInventoryItem,
     FactoryReturnProcess,
     GoodsTransfer,
@@ -42,6 +46,7 @@ from quality_trace.models import (
     QualityTraceEvent,
     QualityGateDecision,
     QualityRecallCampaign,
+    QualityRecallCampaignCaseLink,
     QualityRecallDevice,
     QualityRecallReturnLeg,
     QualityRecallCustomerHandover,
@@ -75,8 +80,12 @@ from quality_trace.services.rule_service import publish_rule_version
 from quality_trace.services.recall_service import (
     QualityRecallError,
     create_recall_campaign,
+    ensure_recall_campaign,
     launch_recall_campaign,
     transition_recall_device,
+)
+from quality_trace.services.recall_consolidation_service import (
+    consolidate_recall_campaigns,
 )
 from quality_trace.services.recall_task_service import publish_recall_tasks
 from quality_trace.services.recall_return_service import (
@@ -84,11 +93,16 @@ from quality_trace.services.recall_return_service import (
     synchronize_recall_return_leg,
 )
 from quality_trace.services.recall_handover_service import (
+    accept_factory_pickup_request,
+    accept_merchant_handover_by_token,
     acknowledge_customer_recall,
     add_handover_evidence,
     confirm_merchant_handover_receipt,
     initialize_customer_handover,
     schedule_customer_pickup,
+    select_customer_delivery_method,
+    submit_customer_direct_shipment,
+    submit_customer_pickup_shipment,
 )
 from quality_trace.services.recall_transport_service import (
     create_next_recall_transport_leg,
@@ -522,9 +536,25 @@ class QualityRuleEngineTests(TestCase):
         quality_case.refresh_from_db()
         self.assertEqual(action.status, QualityControlAction.Status.COMPLETED)
         self.assertEqual(quality_case.status, BatchQualityCase.Status.REMEDIATING)
-        self.assertFalse(check_device_operation(
+        remediation_decision = check_device_operation(
             device_id=self.devices[0].pk, operation="ACTIVATION",
-        )["allowed"])
+        )
+        self.assertFalse(remediation_decision["allowed"])
+        self.assertEqual(
+            remediation_decision["control_action_type"],
+            "REMEDIATION_ISOLATION",
+        )
+        self.assertIsNone(remediation_decision["control_action_id"])
+        self.assertEqual(remediation_decision["quality_case_id"], quality_case.pk)
+        remediation_audit = QualityGateDecision.objects.get(
+            pk=remediation_decision["decision_id"],
+        )
+        self.assertEqual(remediation_audit.quality_case_id, quality_case.pk)
+        self.assertIsNone(remediation_audit.control_action_id)
+        self.assertEqual(
+            remediation_audit.context_snapshot["quality_gate_basis"],
+            "REMEDIATION_ISOLATION",
+        )
         self.assertFalse(quality_case.control_actions.filter(
             status=QualityControlAction.Status.ACTIVE,
         ).exists())
@@ -640,6 +670,85 @@ class QualityRuleEngineTests(TestCase):
             device_ids=device_ids,
         )
 
+    def _overlap_case(self, suffix, device_ids):
+        quality_case = BatchQualityCase.objects.create(
+            case_no=f"QT-R13831-{suffix}",
+            factory_organization=self.factory,
+            source_alert=None,
+            scope_type="R13831_OVERLAP",
+            scope_key=f"R13831-{suffix}",
+            scope_snapshot={"source": "R13.8.3.1_TEST"},
+            reason="验证重叠召回主批次接管",
+            status=BatchQualityCase.Status.OPEN,
+            opened_by=self.manager,
+        )
+        by_id = {device.pk: device for device in self.devices}
+        for device_id in device_ids:
+            device = by_id[device_id]
+            BatchQualityAffectedDevice.objects.create(
+                quality_case=quality_case,
+                device=device,
+                sn_snapshot=device.sn,
+                production_batch_snapshot=device.batch.batch_no,
+                product_model_snapshot={
+                    "id": self.product_model.pk,
+                    "name": self.product_model.name,
+                },
+                location_snapshot={},
+                trace_evidence_snapshot={"source": "R13.8.3.1_TEST"},
+            )
+        return quality_case
+
+    def _historical_active_campaign(self, quality_case, suffix):
+        action = start_recall(
+            user=self.manager,
+            case_id=quality_case.pk,
+            reason="模拟升级前已经存在的重叠召回",
+        )
+        memberships = list(
+            quality_case.affected_devices.select_related("device").order_by("device_id")
+        )
+        now = timezone.now()
+        campaign = QualityRecallCampaign.objects.create(
+            recall_no=f"RC-R13831-{suffix}",
+            quality_case=quality_case,
+            factory_organization=self.factory,
+            control_action=action,
+            title="R13.8.3.1历史重叠召回",
+            reason="模拟历史版本产生的重叠批次",
+            deadline=timezone.localdate() + timedelta(days=10),
+            status=QualityRecallCampaign.Status.ACTIVE,
+            scope_snapshot={"source": "R13.8.3.1_TEST"},
+            device_count=len(memberships),
+            created_by=self.manager,
+            launched_by=self.manager,
+            launched_at=now,
+        )
+        QualityRecallCampaignCaseLink.objects.create(
+            campaign=campaign,
+            quality_case=quality_case,
+            link_type=QualityRecallCampaignCaseLink.LinkType.PRIMARY,
+            linked_by=self.manager,
+            reason="模拟历史批次主案件关系",
+        )
+        QualityRecallDevice.objects.bulk_create([
+            QualityRecallDevice(
+                campaign=campaign,
+                case_membership=membership,
+                device=membership.device,
+                sn_snapshot=membership.sn_snapshot,
+                product_model_snapshot=membership.product_model_snapshot,
+                production_batch_snapshot=membership.production_batch_snapshot,
+                location_snapshot=membership.location_snapshot,
+                responsibility_snapshot={},
+                trace_evidence_snapshot=membership.trace_evidence_snapshot,
+                status_updated_at=now,
+            )
+            for membership in memberships
+        ])
+        publish_recall_tasks(user=self.manager, campaign_id=campaign.pk)
+        return campaign
+
     def test_recall_campaign_freezes_selected_case_device_scope(self):
         quality_case = self._recall_case()
         selected = quality_case.affected_devices.order_by("device_id").first()
@@ -663,6 +772,136 @@ class QualityRuleEngineTests(TestCase):
         campaign.refresh_from_db()
         self.assertEqual(campaign.device_count, 1)
         self.assertEqual(campaign.devices.count(), 1)
+
+    def test_recall_campaign_creates_primary_case_link(self):
+        quality_case = self._recall_case()
+        campaign = self._recall_campaign(quality_case)
+
+        link = campaign.case_links.get()
+        self.assertEqual(link.quality_case_id, quality_case.pk)
+        self.assertEqual(
+            link.link_type,
+            QualityRecallCampaignCaseLink.LinkType.PRIMARY,
+        )
+
+    def test_fully_covered_case_reuses_live_campaign_without_duplicate_task(self):
+        primary_case = self._recall_case()
+        campaign = self._recall_campaign(primary_case)
+        launch_recall_campaign(user=self.manager, campaign_id=campaign.pk)
+        selected_id = primary_case.affected_devices.order_by("device_id").first().device_id
+        contributing_case = self._overlap_case("REUSE", [selected_id])
+        original_workitem_ids = set(WorkItem.objects.values_list("pk", flat=True))
+
+        reused = ensure_recall_campaign(
+            user=self.manager,
+            case_id=contributing_case.pk,
+            reason="同一设备复用现有召回执行",
+        )
+
+        contributing_case.refresh_from_db()
+        self.assertEqual(reused.pk, campaign.pk)
+        self.assertEqual(contributing_case.status, BatchQualityCase.Status.RECALLING)
+        self.assertTrue(QualityRecallCampaignCaseLink.objects.filter(
+            campaign=campaign,
+            quality_case=contributing_case,
+            link_type=QualityRecallCampaignCaseLink.LinkType.CONTRIBUTING,
+        ).exists())
+        self.assertEqual(
+            set(WorkItem.objects.values_list("pk", flat=True)),
+            original_workitem_ids,
+        )
+        self.assertEqual(QualityRecallCampaign.objects.filter(
+            status__in=("DRAFT", "ACTIVE"),
+        ).count(), 1)
+
+    def test_partial_overlap_is_blocked_until_campaigns_are_consolidated(self):
+        primary_case = self._recall_case()
+        memberships = list(primary_case.affected_devices.order_by("device_id"))
+        campaign = self._recall_campaign(primary_case, [memberships[0].device_id])
+        launch_recall_campaign(user=self.manager, campaign_id=campaign.pk)
+        overlapping_case = self._overlap_case(
+            "PARTIAL",
+            [memberships[0].device_id, memberships[1].device_id],
+        )
+
+        with self.assertRaisesMessage(QualityRecallError, "范围重叠"):
+            ensure_recall_campaign(
+                user=self.manager,
+                case_id=overlapping_case.pk,
+                reason="部分重叠不得直接复用",
+            )
+
+        self.assertFalse(overlapping_case.recall_campaign_links.exists())
+        self.assertEqual(QualityRecallCampaign.objects.count(), 1)
+
+    def test_historical_subset_campaign_is_superseded_and_tasks_are_closed(self):
+        primary_case = self._recall_case()
+        canonical = self._recall_campaign(primary_case)
+        launch_recall_campaign(user=self.manager, campaign_id=canonical.pk)
+        selected_id = primary_case.affected_devices.order_by("device_id").first().device_id
+        redundant_case = self._overlap_case("HISTORY", [selected_id])
+        redundant = self._historical_active_campaign(redundant_case, "HISTORY")
+        redundant_action_id = redundant.control_action_id
+        redundant_workitems = list(WorkItem.objects.filter(
+            uniq_key__startswith=f"quality-recall:{redundant.pk}:",
+        ))
+        self.assertTrue(redundant_workitems)
+        preview_output = io.StringIO()
+        call_command("consolidate_overlapping_recalls", stdout=preview_output)
+        preview = json.loads(preview_output.getvalue())
+        self.assertEqual(preview["mode"], "DRY_RUN")
+        self.assertEqual(preview["overlap_group_count"], 1)
+        self.assertEqual(
+            preview["results"][0]["canonical_campaign_id"],
+            canonical.pk,
+        )
+
+        result = consolidate_recall_campaigns(
+            user=self.manager,
+            canonical_campaign_id=canonical.pk,
+            redundant_campaign_ids=[redundant.pk],
+            reason="同一设备只保留一个活动召回执行",
+        )
+
+        redundant.refresh_from_db()
+        redundant_case.refresh_from_db()
+        self.assertEqual(redundant.status, QualityRecallCampaign.Status.SUPERSEDED)
+        self.assertEqual(redundant.superseded_by_id, canonical.pk)
+        self.assertEqual(redundant.devices.count(), 1)
+        self.assertEqual(redundant_case.status, BatchQualityCase.Status.RECALLING)
+        self.assertEqual(
+            QualityControlAction.objects.get(pk=redundant_action_id).status,
+            QualityControlAction.Status.COMPLETED,
+        )
+        self.assertFalse(WorkItem.objects.filter(
+            pk__in=[item.pk for item in redundant_workitems],
+            status="OPEN",
+        ).exists())
+        self.assertFalse(UserTask.objects.filter(
+            workitem_id__in=[item.pk for item in redundant_workitems],
+        ).exclude(state="DONE").exists())
+        self.assertTrue(QualityRecallCampaignCaseLink.objects.filter(
+            campaign=canonical,
+            quality_case=redundant_case,
+            source_campaign=redundant,
+        ).exists())
+        self.assertEqual(
+            result["superseded_campaigns"][0]["campaign_id"],
+            redundant.pk,
+        )
+        self.assertTrue(QualityTraceEvent.objects.filter(
+            quality_case=redundant_case,
+            event_type="RECALL_CAMPAIGN_SUPERSEDED",
+        ).exists())
+        case_detail = self.client.get(
+            f"/pldp/api/quality-trace/cases/{redundant_case.pk}/",
+            HTTP_AUTHORIZATION=f"Bearer {issue_access_token(self.manager)}",
+        )
+        self.assertEqual(case_detail.status_code, 200, case_detail.json())
+        self.assertEqual(
+            case_detail.json()["data"]["recall_campaign"]["id"],
+            canonical.pk,
+        )
 
     def test_recall_device_membership_keys_are_immutable(self):
         quality_case = self._recall_case()
@@ -688,6 +927,164 @@ class QualityRuleEngineTests(TestCase):
         self.assertEqual(quality_case.status, BatchQualityCase.Status.RECALLING)
         self.assertEqual(launched.devices.count(), launched.device_count)
 
+    def test_case_recall_endpoint_automatically_creates_and_binds_campaign(self):
+        quality_case = self._recall_case()
+        auth = {"HTTP_AUTHORIZATION": f"Bearer {issue_access_token(self.manager)}"}
+
+        response = self.client.post(
+            f"/pldp/api/quality-trace/cases/{quality_case.pk}/recall/",
+            {"reason": "重复故障达到召回条件，立即启动召回"},
+            content_type="application/json",
+            **auth,
+        )
+
+        self.assertEqual(response.status_code, 200, response.json())
+        self.assertEqual(response.json()["code"], 0)
+        campaign = QualityRecallCampaign.objects.get(pk=response.json()["data"]["id"])
+        self.assertEqual(campaign.status, QualityRecallCampaign.Status.ACTIVE)
+        self.assertEqual(campaign.risk_level, "")
+        self.assertEqual(campaign.remedy_type, "")
+        self.assertIsNotNone(campaign.control_action_id)
+        self.assertEqual(QualityControlAction.objects.filter(
+            quality_case=quality_case,
+            action_type=QualityControlAction.ActionType.RECALL,
+        ).count(), 1)
+
+        repeated = self.client.post(
+            f"/pldp/api/quality-trace/cases/{quality_case.pk}/recall/",
+            {"reason": "重复提交不应新建数据"},
+            content_type="application/json",
+            **auth,
+        )
+        self.assertEqual(repeated.status_code, 200, repeated.json())
+        self.assertEqual(repeated.json()["data"]["id"], campaign.pk)
+        self.assertEqual(QualityRecallCampaign.objects.filter(
+            quality_case=quality_case,
+        ).count(), 1)
+
+    def test_case_detail_exposes_three_progressive_control_levels(self):
+        quality_case = self._recall_case()
+        auth = {"HTTP_AUTHORIZATION": f"Bearer {issue_access_token(self.manager)}"}
+        detail_url = f"/pldp/api/quality-trace/cases/{quality_case.pk}/"
+
+        initial = self.client.get(detail_url, **auth).json()["data"]
+        self.assertTrue(initial["available_actions"]["temporary_hold"])
+        self.assertTrue(initial["available_actions"]["formal_hold"])
+        self.assertTrue(initial["available_actions"]["start_recall"])
+
+        place_temporary_hold(
+            user=self.manager,
+            case_id=quality_case.pk,
+            reason="先执行临时拦截",
+            duration_hours=24,
+        )
+        after_temporary = self.client.get(detail_url, **auth).json()["data"]
+        self.assertFalse(after_temporary["available_actions"]["temporary_hold"])
+        self.assertTrue(after_temporary["available_actions"]["formal_hold"])
+        self.assertTrue(after_temporary["available_actions"]["start_recall"])
+
+        place_formal_hold(
+            user=self.manager,
+            case_id=quality_case.pk,
+            reason="升级到正式拦截",
+        )
+        after_formal = self.client.get(detail_url, **auth).json()["data"]
+        self.assertFalse(after_formal["available_actions"]["temporary_hold"])
+        self.assertFalse(after_formal["available_actions"]["formal_hold"])
+        self.assertTrue(after_formal["available_actions"]["start_recall"])
+
+        started = self.client.post(
+            f"/pldp/api/quality-trace/cases/{quality_case.pk}/recall/",
+            {"reason": "升级到召回处置"},
+            content_type="application/json",
+            **auth,
+        )
+        self.assertEqual(started.status_code, 200, started.json())
+        self.assertEqual(started.json()["code"], 0)
+        after_recall = self.client.get(detail_url, **auth).json()["data"]
+        self.assertFalse(after_recall["available_actions"]["temporary_hold"])
+        self.assertFalse(after_recall["available_actions"]["formal_hold"])
+        self.assertFalse(after_recall["available_actions"]["start_recall"])
+        self.assertTrue(after_recall["available_actions"]["open_recall_detail"])
+        self.assertIsNotNone(after_recall["recall_campaign"])
+        self.assertFalse(check_device_operation(
+            device_id=self.devices[0].pk,
+            operation="SHIPMENT",
+        )["allowed"])
+
+    def test_case_detail_returns_current_recall_campaign_navigation(self):
+        quality_case = self._recall_case()
+        campaign = self._recall_campaign(quality_case)
+        auth = {"HTTP_AUTHORIZATION": f"Bearer {issue_access_token(self.manager)}"}
+
+        response = self.client.get(
+            f"/pldp/api/quality-trace/cases/{quality_case.pk}/",
+            **auth,
+        )
+
+        self.assertEqual(response.status_code, 200, response.json())
+        data = response.json()["data"]
+        self.assertEqual(data["recall_campaign"]["id"], campaign.pk)
+        self.assertEqual(data["recall_campaign"]["status"], "DRAFT")
+        self.assertTrue(data["recall_binding"]["is_consistent"])
+        self.assertFalse(data["available_actions"]["create_recall_campaign"])
+        self.assertTrue(data["available_actions"]["open_recall_detail"])
+        self.assertEqual(
+            data["available_actions"]["continue_recall_campaign_id"],
+            campaign.pk,
+        )
+
+    def test_case_recall_endpoint_silently_backfills_legacy_action(self):
+        quality_case = self._recall_case()
+        orphan = start_recall(
+            user=self.manager,
+            case_id=quality_case.pk,
+            reason="历史召回控制动作",
+        )
+        auth = {"HTTP_AUTHORIZATION": f"Bearer {issue_access_token(self.manager)}"}
+
+        response = self.client.post(
+            f"/pldp/api/quality-trace/cases/{quality_case.pk}/recall/",
+            {},
+            content_type="application/json",
+            **auth,
+        )
+
+        self.assertEqual(response.status_code, 200, response.json())
+        self.assertEqual(response.json()["code"], 0)
+        campaign = QualityRecallCampaign.objects.get(pk=response.json()["data"]["id"])
+        self.assertEqual(campaign.status, QualityRecallCampaign.Status.ACTIVE)
+        self.assertEqual(campaign.control_action_id, orphan.pk)
+        self.assertEqual(QualityControlAction.objects.filter(
+            quality_case=quality_case,
+            action_type=QualityControlAction.ActionType.RECALL,
+        ).count(), 1)
+
+    def test_creating_campaign_backfills_legacy_orphan_recall_action(self):
+        quality_case = self._recall_case()
+        orphan = start_recall(
+            user=self.manager,
+            case_id=quality_case.pk,
+            reason="历史版本直接创建的孤立召回控制动作",
+        )
+
+        campaign = self._recall_campaign(quality_case)
+
+        campaign.refresh_from_db()
+        self.assertEqual(campaign.status, QualityRecallCampaign.Status.ACTIVE)
+        self.assertEqual(campaign.control_action_id, orphan.pk)
+        self.assertEqual(campaign.launched_at, orphan.effective_at)
+        self.assertTrue(QualityTraceEvent.objects.filter(
+            quality_case=quality_case,
+            event_type="RECALL_CAMPAIGN_BACKFILLED",
+            payload__control_action_id=orphan.pk,
+        ).exists())
+        self.assertEqual(QualityControlAction.objects.filter(
+            quality_case=quality_case,
+            action_type=QualityControlAction.ActionType.RECALL,
+            status=QualityControlAction.Status.ACTIVE,
+        ).count(), 1)
+
     def test_recall_device_status_uses_explicit_transition_graph(self):
         quality_case = self._recall_case()
         campaign = self._recall_campaign(quality_case)
@@ -700,12 +1097,8 @@ class QualityRuleEngineTests(TestCase):
                 recall_device_id=row.pk,
                 to_status="RECEIVED",
             )
-        transition_recall_device(
-            user=self.manager,
-            recall_device_id=row.pk,
-            to_status="NOTIFIED",
-            reason="已向当前责任人发送召回通知",
-        )
+        row.refresh_from_db()
+        self.assertEqual(row.status, QualityRecallDevice.Status.NOTIFIED)
         transition_recall_device(
             user=self.manager,
             recall_device_id=row.pk,
@@ -735,6 +1128,11 @@ class QualityRuleEngineTests(TestCase):
         campaign = self._recall_campaign(quality_case, [membership.device_id])
         launch_recall_campaign(user=self.manager, campaign_id=campaign.pk)
 
+        self.assertEqual(WorkItem.objects.filter(
+            type="QUALITY_RECALL_MERCHANT_SCOPE",
+            biz_id=str(campaign.pk),
+        ).count(), 1)
+
         first = publish_recall_tasks(user=self.manager, campaign_id=campaign.pk)
         second = publish_recall_tasks(user=self.manager, campaign_id=campaign.pk)
 
@@ -744,11 +1142,11 @@ class QualityRuleEngineTests(TestCase):
         self.assertEqual(second[0]["mode"], "MERCHANT_INVENTORY")
         self.assertEqual(row.status, QualityRecallDevice.Status.NOTIFIED)
         self.assertEqual(WorkItem.objects.filter(
-            type="QUALITY_RECALL_MERCHANT_RETURN",
+            type="QUALITY_RECALL_MERCHANT_SCOPE",
             biz_id=str(campaign.pk),
         ).count(), 1)
         self.assertTrue(UserTask.objects.filter(
-            workitem__type="QUALITY_RECALL_MERCHANT_RETURN",
+            workitem__type="QUALITY_RECALL_MERCHANT_SCOPE",
             to_openid=self.applicant.wx_openid,
             need_action=True,
         ).exists())
@@ -769,10 +1167,178 @@ class QualityRuleEngineTests(TestCase):
             "MANUAL_TRACE",
         )
         self.assertTrue(UserTask.objects.filter(
-            workitem__type="QUALITY_RECALL_MANUAL_TRACE",
+            workitem__type="QUALITY_RECALL_FACTORY_COORDINATION",
             to_openid=self.manager.wx_openid,
             need_action=True,
         ).exists())
+
+    def test_automatic_recall_tasks_are_partitioned_by_distribution_branch(self):
+        merchant_type = OrganizationType.objects.get(code="MERCHANT")
+        customer_type, _ = OrganizationType.objects.update_or_create(
+            code="CUSTOMER", defaults={"name": "用户", "is_active": True},
+        )
+        merchant_role = OrganizationRole.objects.get(
+            organization_type=merchant_type, code="merchant_owner",
+        )
+        customer_role, _ = OrganizationRole.objects.update_or_create(
+            organization_type=customer_type,
+            code="customer_owner",
+            defaults={"name": "用户负责人账号", "is_owner_role": True, "is_active": True},
+        )
+        child = Organization.objects.create(
+            name="R1382下级甲", code="R1382-CHILD-A", organization_type=merchant_type,
+        )
+        sibling = Organization.objects.create(
+            name="R1382下级乙", code="R1382-CHILD-B", organization_type=merchant_type,
+        )
+        customer_org = Organization.objects.create(
+            name="R1382终端用户", code="R1382-CUSTOMER", organization_type=customer_type,
+        )
+        child_user = User.objects.create_user(
+            username="r1382-child", wx_openid="r1382-child-openid",
+        )
+        sibling_user = User.objects.create_user(
+            username="r1382-sibling", wx_openid="r1382-sibling-openid",
+        )
+        customer_user = User.objects.create_user(
+            username="r1382-customer", wx_openid="r1382-customer-openid",
+        )
+        UserOrganization.objects.create(
+            user=child_user, organization=child, role=merchant_role,
+        )
+        UserOrganization.objects.create(
+            user=sibling_user, organization=sibling, role=merchant_role,
+        )
+        UserOrganization.objects.create(
+            user=customer_user, organization=customer_org, role=customer_role,
+        )
+        OrganizationRelation.objects.create(
+            source_organization=self.factory,
+            target_organization=self.merchant,
+            relation_type=OrganizationRelationType.DISTRIBUTION,
+        )
+        OrganizationRelation.objects.create(
+            source_organization=self.merchant,
+            target_organization=child,
+            relation_type=OrganizationRelationType.DISTRIBUTION,
+        )
+        OrganizationRelation.objects.create(
+            source_organization=self.merchant,
+            target_organization=sibling,
+            relation_type=OrganizationRelationType.DISTRIBUTION,
+        )
+
+        quality_case = self._recall_case()
+        memberships = list(quality_case.affected_devices.order_by("device_id"))
+        OrganizationDevice.objects.update_or_create(
+            device_id=memberships[0].device_id,
+            defaults={"organization": child, "status": "IN_STOCK"},
+        )
+        CustomerDeviceBinding.objects.create(
+            device_id=memberships[1].device_id,
+            customer_organization=customer_org,
+            source_organization=sibling,
+            accepted_by=customer_user,
+            acceptance_mode=CustomerDeviceBinding.AcceptanceMode.NEW_CUSTOMER,
+            customer_type=CustomerDeviceBinding.CustomerType.PERSONAL,
+        )
+        campaign = self._recall_campaign(quality_case)
+        launch_recall_campaign(user=self.manager, campaign_id=campaign.pk)
+
+        def task_scope(organization):
+            item = WorkItem.objects.get(
+                uniq_key=f"quality-recall:{campaign.pk}:org:{organization.pk}",
+            )
+            return item.payload["scope"]
+
+        parent_scope = task_scope(self.merchant)
+        child_scope = task_scope(child)
+        sibling_scope = task_scope(sibling)
+        customer_scope = task_scope(customer_org)
+
+        self.assertEqual(parent_scope["device_count"], 2)
+        self.assertEqual(parent_scope["downstream_inventory_count"], 1)
+        self.assertEqual(parent_scope["activated_user_device_count"], 1)
+        self.assertEqual(
+            {row["device_id"] for row in child_scope["devices"]},
+            {memberships[0].device_id},
+        )
+        self.assertEqual(
+            {row["device_id"] for row in sibling_scope["devices"]},
+            {memberships[1].device_id},
+        )
+        self.assertEqual(
+            {row["device_id"] for row in customer_scope["devices"]},
+            {memberships[1].device_id},
+        )
+        self.assertNotIn(
+            memberships[0].device_id,
+            {row["device_id"] for row in sibling_scope["devices"]},
+        )
+
+        response = self.client.get(
+            f"/pldp/api/quality-trace/recalls/{campaign.pk}/task-scope/",
+            HTTP_AUTHORIZATION=f"Bearer {issue_access_token(child_user)}",
+        )
+        self.assertEqual(response.status_code, 200, response.json())
+        self.assertEqual(response.json()["code"], 0)
+        self.assertEqual(
+            {row["device_id"] for row in response.json()["data"]["scope"]["devices"]},
+            {memberships[0].device_id},
+        )
+
+    def test_customer_campaign_api_reports_only_visible_device_count(self):
+        customer_type, _ = OrganizationType.objects.update_or_create(
+            code="CUSTOMER", defaults={"name": "用户", "is_active": True},
+        )
+        customer_role, _ = OrganizationRole.objects.update_or_create(
+            organization_type=customer_type,
+            code="customer_owner",
+            defaults={"name": "用户负责人账号", "is_owner_role": True, "is_active": True},
+        )
+        customer_org = Organization.objects.create(
+            name="R13831用户范围", code="R13831-CUSTOMER", organization_type=customer_type,
+        )
+        customer = User.objects.create_user(
+            username="r13831-customer", wx_openid="r13831-customer-openid",
+        )
+        UserOrganization.objects.create(
+            user=customer, organization=customer_org, role=customer_role,
+        )
+        quality_case = self._recall_case()
+        memberships = list(quality_case.affected_devices.order_by("device_id"))
+        CustomerDeviceBinding.objects.create(
+            device_id=memberships[0].device_id,
+            customer_organization=customer_org,
+            source_organization=self.merchant,
+            accepted_by=customer,
+            acceptance_mode=CustomerDeviceBinding.AcceptanceMode.NEW_CUSTOMER,
+            customer_type=CustomerDeviceBinding.CustomerType.PERSONAL,
+        )
+        campaign = self._recall_campaign(quality_case)
+        launch_recall_campaign(user=self.manager, campaign_id=campaign.pk)
+        auth = {"HTTP_AUTHORIZATION": f"Bearer {issue_access_token(customer)}"}
+
+        detail = self.client.get(
+            f"/pldp/api/quality-trace/recalls/{campaign.pk}/",
+            **auth,
+        )
+        listing = self.client.get(
+            "/pldp/api/quality-trace/recalls/",
+            **auth,
+        )
+
+        self.assertEqual(detail.status_code, 200, detail.json())
+        self.assertEqual(detail.json()["code"], 0)
+        self.assertEqual(detail.json()["data"]["device_count"], 1)
+        self.assertEqual(detail.json()["data"]["scope_label"], "本账号相关设备")
+        self.assertEqual(len(detail.json()["data"]["devices"]), 1)
+        self.assertEqual(listing.status_code, 200, listing.json())
+        self.assertEqual(listing.json()["data"]["items"][0]["device_count"], 1)
+        self.assertEqual(
+            listing.json()["data"]["items"][0]["scope_label"],
+            "本账号相关设备",
+        )
 
     def _merchant_inventory_recall(self):
         quality_case = self._recall_case()
@@ -900,6 +1466,363 @@ class QualityRuleEngineTests(TestCase):
             inventory.pk,
         )
 
+    def test_activated_recall_auto_handover_shared_driver_and_method_lock(self):
+        customer_type, _ = OrganizationType.objects.update_or_create(
+            code="CUSTOMER", defaults={"name": "用户", "is_active": True},
+        )
+        owner_role, _ = OrganizationRole.objects.update_or_create(
+            organization_type=customer_type, code="customer_owner",
+            defaults={"name": "用户负责人账号", "is_owner_role": True, "is_active": True},
+        )
+        driver_role, _ = OrganizationRole.objects.update_or_create(
+            organization_type=customer_type, code="driver",
+            defaults={"name": "共享司机", "is_owner_role": False, "is_active": True},
+        )
+        customer_org = Organization.objects.create(
+            name="R1384协同用户", code="R1384-CUSTOMER", organization_type=customer_type,
+        )
+        owner = User.objects.create_user(
+            username="r1384-owner", wx_openid="r1384-owner-openid",
+        )
+        driver = User.objects.create_user(
+            username="r1384-driver", wx_openid="r1384-driver-openid",
+        )
+        unrelated_driver = User.objects.create_user(
+            username="r1384-unrelated-driver", wx_openid="r1384-unrelated-driver-openid",
+        )
+        for user, role in ((owner, owner_role), (driver, driver_role), (unrelated_driver, driver_role)):
+            UserOrganization.objects.create(user=user, organization=customer_org, role=role)
+        vehicle = CustomerVehicle.objects.create(
+            customer_organization=customer_org, vehicle_no="R1384-TEST-VEHICLE",
+        )
+        DriverVehicleBinding.objects.create(vehicle=vehicle, driver=driver)
+
+        quality_case = self._recall_case()
+        membership = quality_case.affected_devices.order_by("device_id").first()
+        CustomerDeviceBinding.objects.create(
+            device_id=membership.device_id,
+            customer_organization=customer_org,
+            source_organization=self.merchant,
+            accepted_by=owner,
+            acceptance_mode=CustomerDeviceBinding.AcceptanceMode.NEW_CUSTOMER,
+            customer_type=CustomerDeviceBinding.CustomerType.PERSONAL,
+            vehicle=vehicle,
+        )
+        campaign = self._recall_campaign(quality_case, [membership.device_id])
+        launch_recall_campaign(user=self.manager, campaign_id=campaign.pk)
+        row = campaign.devices.get()
+        handover = QualityRecallCustomerHandover.objects.get(recall_device=row)
+        self.assertEqual(
+            handover.status,
+            QualityRecallCustomerHandover.Status.PENDING_CUSTOMER_CHOICE,
+        )
+        customer_task = WorkItem.objects.get(
+            uniq_key=f"quality-recall:{campaign.pk}:org:{customer_org.pk}",
+        )
+        self.assertEqual(
+            set(customer_task.user_tasks.values_list("to_openid", flat=True)),
+            {owner.wx_openid, driver.wx_openid},
+        )
+        self.assertFalse(customer_task.user_tasks.filter(
+            to_openid=unrelated_driver.wx_openid,
+        ).exists())
+
+        select_customer_delivery_method(
+            user=driver,
+            handover_id=handover.pk,
+            delivery_method=QualityRecallCustomerHandover.DeliveryMethod.MERCHANT_HANDOVER,
+            payload={"note": "司机与用户负责人协商后选择来源商家"},
+        )
+        handover.refresh_from_db()
+        customer_task.refresh_from_db()
+        self.assertEqual(handover.method_selected_by_id, driver.pk)
+        self.assertEqual(handover.method_selected_role, "driver")
+        self.assertTrue(handover.merchant_transfer_token)
+        self.assertEqual(customer_task.status, "DONE")
+        self.assertFalse(customer_task.user_tasks.exclude(state="DONE").exists())
+
+        # Before physical handover starts, either collaborator may change the
+        # method.  Once the merchant scans and accepts, all changes are blocked.
+        select_customer_delivery_method(
+            user=owner,
+            handover_id=handover.pk,
+            delivery_method=QualityRecallCustomerHandover.DeliveryMethod.CUSTOMER_DIRECT_SHIP,
+        )
+        handover.refresh_from_db()
+        self.assertFalse(handover.method_locked_at)
+        select_customer_delivery_method(
+            user=owner,
+            handover_id=handover.pk,
+            delivery_method=QualityRecallCustomerHandover.DeliveryMethod.MERCHANT_HANDOVER,
+        )
+        handover.refresh_from_db()
+        accept_merchant_handover_by_token(
+            user=self.applicant,
+            token=handover.merchant_transfer_token,
+            receipt_note="已按SN核对并接管召回设备",
+        )
+        handover.refresh_from_db()
+        self.assertIsNotNone(handover.method_locked_at)
+        self.assertTrue(WorkItem.objects.filter(
+            uniq_key=(
+                f"quality-recall-merchant-return:{handover.recall_device_id}:"
+                f"org:{self.merchant.pk}"
+            ),
+            status="OPEN",
+        ).exists())
+        self.assertTrue(WorkItem.objects.filter(
+            uniq_key=f"quality-recall-device-progress:{handover.recall_device_id}",
+            status="OPEN",
+            payload__stage="SOURCE_MERCHANT_ACCEPTED",
+        ).exists())
+        with self.assertRaisesMessage(QualityRecallError, "不能再更换"):
+            select_customer_delivery_method(
+                user=owner,
+                handover_id=handover.pk,
+                delivery_method=QualityRecallCustomerHandover.DeliveryMethod.CUSTOMER_DIRECT_SHIP,
+            )
+        OrganizationRelation.objects.create(
+            source_organization=self.factory,
+            target_organization=self.merchant,
+            relation_type=OrganizationRelationType.DISTRIBUTION,
+        )
+        leg = create_next_recall_transport_leg(
+            user=self.applicant,
+            recall_device_id=handover.recall_device_id,
+        )
+        merchant_return = WorkItem.objects.get(
+            uniq_key=(
+                f"quality-recall-merchant-return:{handover.recall_device_id}:"
+                f"org:{self.merchant.pk}"
+            ),
+        )
+        progress = WorkItem.objects.get(
+            uniq_key=f"quality-recall-device-progress:{handover.recall_device_id}",
+        )
+        self.assertEqual(merchant_return.status, "DONE")
+        self.assertEqual(progress.payload["stage"], "RETURN_LEG_CREATED")
+        dispatch_recall_transport_leg(
+            user=self.applicant,
+            leg_id=leg.pk,
+            logistics_provider="召回专线",
+            tracking_no="R1385-MERCHANT-001",
+            evidence={"storage_key": "recall/r1385-merchant-dispatch.jpg"},
+        )
+        progress.refresh_from_db()
+        self.assertEqual(progress.payload["stage"], "RETURN_IN_TRANSIT")
+        receive_recall_transport_leg(
+            user=self.manager,
+            leg_id=leg.pk,
+            evidence={"storage_key": "recall/r1385-factory-receipt.jpg"},
+        )
+        progress.refresh_from_db()
+        self.assertEqual(progress.payload["stage"], "FACTORY_RECEIVED_PENDING_ISOLATION")
+        isolate_recalled_device(
+            user=self.manager,
+            leg_id=leg.pk,
+            disposition=QualityRecallIsolationReceipt.Disposition.PENDING_INSPECTION,
+            isolation_location="R1385召回隔离区",
+            evidence={"storage_key": "recall/r1385-isolation.jpg"},
+        )
+        progress.refresh_from_db()
+        self.assertEqual(progress.status, "DONE")
+
+    def test_customer_direct_ship_creates_factory_recall_transport(self):
+        customer_type, _ = OrganizationType.objects.update_or_create(
+            code="CUSTOMER", defaults={"name": "用户", "is_active": True},
+        )
+        customer_role, _ = OrganizationRole.objects.update_or_create(
+            organization_type=customer_type, code="customer_owner",
+            defaults={"name": "用户负责人账号", "is_owner_role": True, "is_active": True},
+        )
+        customer_org = Organization.objects.create(
+            name="R1384直寄用户", code="R1384-DIRECT", organization_type=customer_type,
+        )
+        customer = User.objects.create_user(
+            username="r1384-direct", wx_openid="r1384-direct-openid",
+        )
+        UserOrganization.objects.create(
+            user=customer, organization=customer_org, role=customer_role,
+        )
+        owner_type = OrganizationType.objects.get(code="OWNER")
+        sales = User.objects.create_user(
+            username="r1385-direct-sales", wx_openid="r1385-direct-sales-openid",
+        )
+        logistics = User.objects.create_user(
+            username="r1385-direct-logistics", wx_openid="r1385-direct-logistics-openid",
+        )
+        UserOrganization.objects.create(
+            user=sales,
+            organization=self.factory,
+            role=OrganizationRole.objects.get(
+                organization_type=owner_type, code="factory_sales",
+            ),
+        )
+        UserOrganization.objects.create(
+            user=logistics,
+            organization=self.factory,
+            role=OrganizationRole.objects.get(
+                organization_type=owner_type, code="factory_logistics",
+            ),
+        )
+        quality_case = self._recall_case()
+        membership = quality_case.affected_devices.order_by("device_id").first()
+        CustomerDeviceBinding.objects.create(
+            device_id=membership.device_id,
+            customer_organization=customer_org,
+            source_organization=self.merchant,
+            accepted_by=customer,
+            acceptance_mode=CustomerDeviceBinding.AcceptanceMode.NEW_CUSTOMER,
+            customer_type=CustomerDeviceBinding.CustomerType.PERSONAL,
+        )
+        campaign = self._recall_campaign(quality_case, [membership.device_id])
+        launch_recall_campaign(user=self.manager, campaign_id=campaign.pk)
+        handover = campaign.customer_handovers.get()
+        select_customer_delivery_method(
+            user=customer,
+            handover_id=handover.pk,
+            delivery_method=QualityRecallCustomerHandover.DeliveryMethod.CUSTOMER_DIRECT_SHIP,
+        )
+        handover, leg = submit_customer_direct_shipment(
+            user=customer,
+            handover_id=handover.pk,
+            logistics_provider="测试快递",
+            tracking_no="R1384-DIRECT-001",
+            evidence={"storage_key": "recall/r1384-direct.jpg"},
+        )
+        handover.refresh_from_db()
+        self.assertEqual(handover.status, QualityRecallCustomerHandover.Status.DIRECT_SHIPPED)
+        self.assertIsNotNone(handover.method_locked_at)
+        self.assertEqual(leg.from_organization_id, customer_org.pk)
+        self.assertEqual(leg.to_organization_id, self.factory.pk)
+        self.assertEqual(leg.status, QualityRecallTransportLeg.Status.IN_TRANSIT)
+        self.assertTrue(leg.is_factory_destination)
+        self.assertTrue(UserTask.objects.filter(
+            workitem__uniq_key=f"quality-recall-transport:{leg.pk}:receive",
+            to_openid=self.viewer.wx_openid,
+        ).exists())
+        receipt = WorkItem.objects.get(
+            uniq_key=f"quality-recall-transport:{leg.pk}:receive",
+        )
+        self.assertEqual(
+            set(receipt.user_tasks.values_list("to_openid", flat=True)),
+            {
+                self.manager.wx_openid,
+                self.viewer.wx_openid,
+                sales.wx_openid,
+                logistics.wx_openid,
+            },
+        )
+        self.assertIn(customer_org.name, receipt.title)
+        self.assertIn("待收货", receipt.title)
+        self.assertTrue(CustomerDeviceBinding.objects.filter(
+            device_id=membership.device_id,
+            status=CustomerDeviceBinding.Status.ACTIVE,
+        ).exists())
+
+    def test_factory_pickup_request_publishes_task_and_locks_on_acceptance(self):
+        customer_type, _ = OrganizationType.objects.update_or_create(
+            code="CUSTOMER", defaults={"name": "用户", "is_active": True},
+        )
+        customer_role, _ = OrganizationRole.objects.update_or_create(
+            organization_type=customer_type, code="customer_owner",
+            defaults={"name": "用户负责人账号", "is_owner_role": True, "is_active": True},
+        )
+        customer_org = Organization.objects.create(
+            name="R1384取件用户", code="R1384-PICKUP", organization_type=customer_type,
+        )
+        customer = User.objects.create_user(
+            username="r1384-pickup", wx_openid="r1384-pickup-openid",
+        )
+        UserOrganization.objects.create(user=customer, organization=customer_org, role=customer_role)
+        owner_type = OrganizationType.objects.get(code="OWNER")
+        logistics = User.objects.create_user(
+            username="r1385-pickup-logistics", wx_openid="r1385-pickup-logistics-openid",
+        )
+        UserOrganization.objects.create(
+            user=logistics,
+            organization=self.factory,
+            role=OrganizationRole.objects.get(
+                organization_type=owner_type, code="factory_logistics",
+            ),
+        )
+        quality_case = self._recall_case()
+        membership = quality_case.affected_devices.order_by("device_id").first()
+        CustomerDeviceBinding.objects.create(
+            device_id=membership.device_id,
+            customer_organization=customer_org,
+            source_organization=self.merchant,
+            accepted_by=customer,
+            acceptance_mode=CustomerDeviceBinding.AcceptanceMode.NEW_CUSTOMER,
+            customer_type=CustomerDeviceBinding.CustomerType.PERSONAL,
+        )
+        campaign = self._recall_campaign(quality_case, [membership.device_id])
+        launch_recall_campaign(user=self.manager, campaign_id=campaign.pk)
+        handover = campaign.customer_handovers.get()
+        select_customer_delivery_method(
+            user=customer,
+            handover_id=handover.pk,
+            delivery_method=QualityRecallCustomerHandover.DeliveryMethod.FACTORY_PICKUP,
+            payload={
+                "contact_name": "测试用户",
+                "contact_phone": "13800000000",
+                "pickup_address": "测试取件地址",
+                "pickup_time_window": "2026-09-01 10:00",
+            },
+        )
+        handover.refresh_from_db()
+        self.assertEqual(handover.status, QualityRecallCustomerHandover.Status.PICKUP_REQUESTED)
+        pickup_task = WorkItem.objects.get(
+            uniq_key=f"quality-recall-pickup:{handover.pk}",
+        )
+        self.assertEqual(
+            set(pickup_task.user_tasks.values_list("to_openid", flat=True)),
+            {self.manager.wx_openid, logistics.wx_openid},
+        )
+        accepted, leg = accept_factory_pickup_request(
+            user=logistics,
+            handover_id=handover.pk,
+            pickup_scheduled_at=timezone.now() + timedelta(days=1),
+            logistics_provider="厂家委托物流",
+        )
+        accepted.refresh_from_db()
+        self.assertEqual(accepted.status, QualityRecallCustomerHandover.Status.PICKUP_ACCEPTED)
+        self.assertIsNotNone(accepted.method_locked_at)
+        self.assertEqual(leg.status, QualityRecallTransportLeg.Status.PREPARING)
+        self.assertEqual(leg.from_organization_id, customer_org.pk)
+        self.assertEqual(leg.to_organization_id, self.factory.pk)
+        customer_dispatch = WorkItem.objects.get(
+            uniq_key=f"quality-recall-pickup-customer-dispatch:{handover.pk}",
+        )
+        self.assertEqual(
+            set(customer_dispatch.user_tasks.values_list("to_openid", flat=True)),
+            {customer.wx_openid},
+        )
+
+        shipped, leg = submit_customer_pickup_shipment(
+            user=customer,
+            handover_id=handover.pk,
+            logistics_provider="厂家委托物流",
+            tracking_no="R1385-PICKUP-001",
+            evidence={"storage_key": "recall/r1385-pickup.jpg"},
+        )
+        shipped.refresh_from_db()
+        customer_dispatch.refresh_from_db()
+        leg.refresh_from_db()
+        self.assertEqual(
+            shipped.status,
+            QualityRecallCustomerHandover.Status.PICKUP_SHIPPED,
+        )
+        self.assertEqual(leg.status, QualityRecallTransportLeg.Status.IN_TRANSIT)
+        self.assertEqual(customer_dispatch.status, "DONE")
+        receipt = WorkItem.objects.get(
+            uniq_key=f"quality-recall-transport:{leg.pk}:receive",
+        )
+        self.assertEqual(
+            set(receipt.user_tasks.values_list("to_openid", flat=True)),
+            {self.manager.wx_openid, self.viewer.wx_openid, logistics.wx_openid},
+        )
+
     def test_activated_device_customer_handover_preserves_activation_and_inventory_facts(self):
         customer_type, _ = OrganizationType.objects.update_or_create(
             code="CUSTOMER", defaults={"name": "用户", "is_active": True},
@@ -934,7 +1857,11 @@ class QualityRuleEngineTests(TestCase):
         handover, created = initialize_customer_handover(
             user=self.manager, recall_device_id=recall_device.pk,
         )
-        self.assertTrue(created)
+        self.assertFalse(created)
+        self.assertEqual(
+            campaign.customer_handovers.count(), 1,
+            "发布召回时应已自动建立且重复同步不得重复创建交接单",
+        )
         acknowledge_customer_recall(
             user=customer, handover_id=handover.pk, note="同意商家上门取回",
         )

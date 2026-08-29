@@ -34,14 +34,28 @@ from .recall_service import (
     launch_recall_campaign,
     transition_recall_device,
 )
-from .recall_task_service import publish_recall_tasks, resolve_recall_responsibility
+from .recall_task_service import (
+    complete_recall_scope_tasks_if_ready,
+    get_recall_task_scope,
+    publish_recall_tasks,
+    resolve_recall_responsibility,
+)
+from .recall_consolidation_service import consolidate_recall_campaigns
 from .recall_return_service import bind_recall_return_transfer, synchronize_recall_return_leg
 from .recall_handover_service import (
+    accept_factory_pickup_request,
+    accept_merchant_handover_by_token,
     acknowledge_customer_recall,
     add_handover_evidence,
+    confirm_factory_pickup_collected,
     confirm_merchant_handover_receipt,
+    ensure_customer_handover,
     initialize_customer_handover,
     schedule_customer_pickup,
+    select_customer_delivery_method,
+    submit_customer_direct_shipment,
+    submit_customer_pickup_shipment,
+    sync_recall_delivery_collaboration,
 )
 from .recall_transport_service import (
     create_next_recall_transport_leg,
@@ -93,9 +107,20 @@ __all__ = [
     "transition_recall_device",
     "publish_recall_tasks",
     "resolve_recall_responsibility",
+    "get_recall_task_scope",
+    "complete_recall_scope_tasks_if_ready",
+    "consolidate_recall_campaigns",
     "bind_recall_return_transfer",
     "synchronize_recall_return_leg",
     "initialize_customer_handover",
+    "ensure_customer_handover",
+    "select_customer_delivery_method",
+    "submit_customer_direct_shipment",
+    "submit_customer_pickup_shipment",
+    "sync_recall_delivery_collaboration",
+    "accept_factory_pickup_request",
+    "confirm_factory_pickup_collected",
+    "accept_merchant_handover_by_token",
     "acknowledge_customer_recall",
     "schedule_customer_pickup",
     "add_handover_evidence",

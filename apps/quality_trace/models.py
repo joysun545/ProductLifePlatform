@@ -526,6 +526,7 @@ class QualityRecallCampaign(TimeStampedModel):
         ACTIVE = "ACTIVE", "召回中"
         COMPLETED = "COMPLETED", "已完成"
         CANCELLED = "CANCELLED", "已取消"
+        SUPERSEDED = "SUPERSEDED", "已被主批次接管"
 
     class RiskLevel(models.TextChoices):
         LOW = "LOW", "一般"
@@ -555,8 +556,14 @@ class QualityRecallCampaign(TimeStampedModel):
     )
     title = models.CharField(max_length=160)
     reason = models.TextField()
-    risk_level = models.CharField(max_length=16, choices=RiskLevel.choices)
-    remedy_type = models.CharField(max_length=16, choices=RemedyType.choices)
+    # Risk classification and final disposition are deliberately deferred until
+    # every recall device has returned and the factory starts closeout review.
+    risk_level = models.CharField(
+        max_length=16, choices=RiskLevel.choices, blank=True, default="",
+    )
+    remedy_type = models.CharField(
+        max_length=16, choices=RemedyType.choices, blank=True, default="",
+    )
     deadline = models.DateField()
     status = models.CharField(
         max_length=16, choices=Status.choices, default=Status.DRAFT, db_index=True,
@@ -576,6 +583,22 @@ class QualityRecallCampaign(TimeStampedModel):
         related_name="completed_quality_recalls",
     )
     completed_at = models.DateTimeField(null=True, blank=True)
+    superseded_by = models.ForeignKey(
+        "self",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="superseded_campaigns",
+    )
+    superseded_at = models.DateTimeField(null=True, blank=True)
+    superseded_by_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="superseded_quality_recalls",
+    )
+    supersession_reason = models.TextField(blank=True, default="")
 
     class Meta:
         ordering = ("-created_at", "-id")
@@ -589,6 +612,57 @@ class QualityRecallCampaign(TimeStampedModel):
         constraints = [
             models.CheckConstraint(
                 condition=Q(device_count__gt=0), name="qtrace_recall_device_count_positive",
+            ),
+        ]
+
+
+class QualityRecallCampaignCaseLink(models.Model):
+    """Auditable association between one execution campaign and contributing cases."""
+
+    class LinkType(models.TextChoices):
+        PRIMARY = "PRIMARY", "主案件"
+        CONTRIBUTING = "CONTRIBUTING", "关联案件"
+
+    campaign = models.ForeignKey(
+        QualityRecallCampaign,
+        on_delete=models.PROTECT,
+        related_name="case_links",
+    )
+    quality_case = models.ForeignKey(
+        BatchQualityCase,
+        on_delete=models.PROTECT,
+        related_name="recall_campaign_links",
+    )
+    link_type = models.CharField(max_length=16, choices=LinkType.choices)
+    source_campaign = models.ForeignKey(
+        QualityRecallCampaign,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="migrated_case_links",
+    )
+    linked_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="linked_quality_recall_cases",
+    )
+    reason = models.TextField(blank=True, default="")
+    linked_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("campaign_id", "link_type", "quality_case_id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("campaign", "quality_case"),
+                name="qtrace_unique_recall_campaign_case",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=("quality_case", "link_type"),
+                name="qtrace_recall_case_link_idx",
             ),
         ]
 
@@ -739,9 +813,27 @@ class QualityRecallReturnLeg(models.Model):
 
 
 class QualityRecallCustomerHandover(TimeStampedModel):
-    """Activated-device custody handover from customer to source merchant."""
+    """Activated-device recall handover selected by the owning customer.
+
+    The row is created automatically with the recall task.  It is deliberately
+    independent from an ordinary sales return because an installed device may
+    no longer have its product QR code or original packaging.
+    """
+
+    class DeliveryMethod(models.TextChoices):
+        MERCHANT_HANDOVER = "MERCHANT_HANDOVER", "交给来源商家"
+        CUSTOMER_DIRECT_SHIP = "CUSTOMER_DIRECT_SHIP", "用户直寄厂家"
+        FACTORY_PICKUP = "FACTORY_PICKUP", "厂家上门取件"
 
     class Status(models.TextChoices):
+        PENDING_CUSTOMER_CHOICE = "PENDING_CUSTOMER_CHOICE", "待选择交付方式"
+        METHOD_SELECTED = "METHOD_SELECTED", "已选择交付方式"
+        DIRECT_SHIPPED = "DIRECT_SHIPPED", "用户已直寄"
+        PICKUP_REQUESTED = "PICKUP_REQUESTED", "已申请厂家取件"
+        PICKUP_ACCEPTED = "PICKUP_ACCEPTED", "厂家已受理取件"
+        PICKUP_SHIPPED = "PICKUP_SHIPPED", "用户已交付取件物流"
+        # Legacy states remain readable so deployed historical rows retain a
+        # complete audit trail after the R13.8.4 migration.
         PENDING_CUSTOMER_ACK = "PENDING_CUSTOMER_ACK", "待用户确认"
         ACKNOWLEDGED = "ACKNOWLEDGED", "用户已确认"
         PICKUP_SCHEDULED = "PICKUP_SCHEDULED", "已预约取回"
@@ -764,8 +856,24 @@ class QualityRecallCustomerHandover(TimeStampedModel):
     )
     status = models.CharField(
         max_length=32, choices=Status.choices,
-        default=Status.PENDING_CUSTOMER_ACK, db_index=True,
+        default=Status.PENDING_CUSTOMER_CHOICE, db_index=True,
     )
+    delivery_method = models.CharField(
+        max_length=32, choices=DeliveryMethod.choices, blank=True, default="",
+        db_index=True,
+    )
+    method_selected_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="selected_quality_recall_delivery_methods",
+    )
+    method_selected_role = models.CharField(max_length=64, blank=True, default="")
+    method_selected_at = models.DateTimeField(null=True, blank=True)
+    method_locked_at = models.DateTimeField(null=True, blank=True)
+    method_payload = models.JSONField(default=dict)
+    merchant_transfer_token = models.UUIDField(
+        null=True, blank=True, unique=True, editable=False,
+    )
+    merchant_transfer_expires_at = models.DateTimeField(null=True, blank=True)
     customer_snapshot = models.JSONField(default=dict)
     merchant_snapshot = models.JSONField(default=dict)
     customer_confirmed_by = models.ForeignKey(
@@ -804,6 +912,8 @@ class QualityRecallHandoverEvidence(models.Model):
         CUSTOMER_CONFIRMATION = "CUSTOMER_CONFIRMATION", "用户确认凭证"
         PICKUP = "PICKUP", "取回凭证"
         MERCHANT_RECEIPT = "MERCHANT_RECEIPT", "商家验收凭证"
+        DIRECT_SHIPMENT = "DIRECT_SHIPMENT", "用户直寄凭证"
+        FACTORY_PICKUP = "FACTORY_PICKUP", "厂家取件凭证"
 
     handover = models.ForeignKey(
         QualityRecallCustomerHandover, on_delete=models.PROTECT, related_name="evidence",

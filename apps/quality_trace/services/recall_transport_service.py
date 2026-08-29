@@ -16,6 +16,12 @@ from quality_trace.models import (
 from workflow.models import UserTask, WorkItem
 from workflow.services.workflow_service import publish_workitem
 
+from .recall_collaboration_service import (
+    close_factory_recall_progress,
+    close_merchant_return_task,
+    publish_factory_recall_progress,
+    publish_merchant_return_task,
+)
 from .recall_service import QualityRecallError
 
 
@@ -23,8 +29,14 @@ MERCHANT_ROLES = {
     "merchant_owner", "merchant_manager", "merchant_senior_manager",
     "merchant_sales", "merchant_stock",
 }
-FACTORY_RECEIPT_ROLES = {"factory_admin", "factory_chief_engineer"}
-FACTORY_ISOLATION_ROLES = {"factory_admin", "factory_chief_engineer"}
+FACTORY_RECEIPT_ROLES = {
+    "factory_admin", "factory_chief_engineer", "factory_sales",
+    "factory_logistics", "factory_sales_assistant",
+}
+FACTORY_ISOLATION_ROLES = {
+    "factory_admin", "factory_chief_engineer", "factory_logistics",
+    "factory_sales_assistant",
+}
 
 
 def _identity(user):
@@ -184,6 +196,18 @@ def create_next_recall_transport_leg(*, user, recall_device_id):
         actor_openid=user.wx_openid or "",
         mark_workitem_done_immediately=False,
     )
+    handover = getattr(row, "customer_handover", None)
+    if handover:
+        close_merchant_return_task(handover, current, user=user)
+        publish_factory_recall_progress(
+            handover,
+            user=user,
+            stage="RETURN_LEG_CREATED",
+            summary=(
+                f"{current.name}已建立召回专用退回程次，设备{row.sn_snapshot}"
+                f"将发往{target.name}。"
+            ),
+        )
     _event(row, "RECALL_TRANSPORT_LEG_CREATED", user, identity.role.code, {
         "transport_leg_id": leg.pk, "sequence_no": sequence,
         "from_organization_id": current.pk, "to_organization_id": target.pk,
@@ -227,6 +251,17 @@ def dispatch_recall_transport_leg(*, user, leg_id, logistics_provider, tracking_
             to_status=row.status, reason="召回专用运输已发出", actor=user,
             actor_role_snapshot=identity.role.code, payload={"transport_leg_id": leg.pk},
         )
+    handover = getattr(row, "customer_handover", None)
+    if handover:
+        publish_factory_recall_progress(
+            handover,
+            user=user,
+            stage="RETURN_IN_TRANSIT",
+            summary=(
+                f"召回设备{row.sn_snapshot}已由{leg.from_organization.name}发出，"
+                f"正在运往{leg.to_organization.name}；物流：{provider} {number}。"
+            ),
+        )
     _event(row, "RECALL_TRANSPORT_DISPATCHED", user, identity.role.code, {
         "transport_leg_id": leg.pk, "tracking_no": number,
     })
@@ -265,6 +300,29 @@ def receive_recall_transport_leg(*, user, leg_id, evidence, receipt_note=""):
         "custody_snapshot", "updated_at",
     ))
     _complete_workitem(leg, user)
+    handover = getattr(leg.recall_device, "customer_handover", None)
+    if handover:
+        if leg.is_factory_destination:
+            publish_factory_recall_progress(
+                handover,
+                user=user,
+                stage="FACTORY_RECEIVED_PENDING_ISOLATION",
+                summary=(
+                    f"召回设备{leg.recall_device.sn_snapshot}已由厂家验收，"
+                    "当前待进入召回专用隔离区。"
+                ),
+            )
+        else:
+            publish_merchant_return_task(handover, leg.to_organization, user=user)
+            publish_factory_recall_progress(
+                handover,
+                user=user,
+                stage="UPSTREAM_MERCHANT_RECEIVED",
+                summary=(
+                    f"{leg.to_organization.name}已验收召回设备"
+                    f"{leg.recall_device.sn_snapshot}，待继续逐级退回厂家。"
+                ),
+            )
     _event(leg.recall_device, "RECALL_TRANSPORT_RECEIVED", user, identity.role.code, {
         "transport_leg_id": leg.pk,
         "factory_pending_isolation": leg.is_factory_destination,
@@ -324,4 +382,16 @@ def isolate_recalled_device(*, user, leg_id, disposition, isolation_location, ev
         "disposition": disposition, "source_activation_preserved": True,
         "ordinary_inventory_created": False,
     })
+    handover = getattr(row, "customer_handover", None)
+    if handover:
+        publish_factory_recall_progress(
+            handover,
+            user=user,
+            stage="FACTORY_ISOLATED",
+            summary=(
+                f"召回设备{row.sn_snapshot}已由厂家完成收货和隔离入库，"
+                f"隔离位置：{location}。"
+            ),
+        )
+        close_factory_recall_progress(handover, user=user)
     return receipt

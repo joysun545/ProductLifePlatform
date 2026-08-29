@@ -1,5 +1,6 @@
 import json
 
+from django.db.models import Q
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 
@@ -10,6 +11,7 @@ from quality_trace.models import (
     QualityAlert,
     QualityAlertRule,
     QualityControlAction,
+    QualityRecallCampaign,
     QualityMetricSnapshot,
     QualityGateDecision,
 )
@@ -29,7 +31,6 @@ from quality_trace.services import (
     revoke_temporary_hold,
     place_formal_hold,
     release_formal_hold,
-    start_recall,
     complete_recall,
     serialize_assessment,
     serialize_case,
@@ -38,6 +39,10 @@ from quality_trace.services import (
     serialize_gate_decision,
 )
 from quality_trace.services.rule_service import serialize_rule
+from quality_trace.services.recall_service import (
+    QualityRecallError,
+    ensure_recall_campaign,
+)
 
 
 def _authenticated_user(request):
@@ -438,12 +443,55 @@ def quality_case_detail(request, case_id):
     active_temporary = next((item for item in active_actions if item.action_type == QualityControlAction.ActionType.TEMPORARY_HOLD), None)
     active_formal = next((item for item in active_actions if item.action_type == QualityControlAction.ActionType.FORMAL_HOLD), None)
     active_recall = next((item for item in active_actions if item.action_type == QualityControlAction.ActionType.RECALL), None)
+    current_campaign = (
+        QualityRecallCampaign.objects.select_related("control_action")
+        .filter(Q(quality_case=row) | Q(case_links__quality_case=row))
+        .filter(status__in=(
+            QualityRecallCampaign.Status.DRAFT,
+            QualityRecallCampaign.Status.ACTIVE,
+        ))
+        .distinct()
+        .order_by("-id")
+        .first()
+    )
+    bound_action_ids = set(
+        row.recall_campaigns.exclude(control_action_id=None)
+        .values_list("control_action_id", flat=True)
+    )
+    orphan_recall = bool(active_recall and active_recall.pk not in bound_action_ids)
+    can_control = identity.organization.organization_type.code == "OWNER"
+    data["recall_campaign"] = ({
+        "id": current_campaign.pk,
+        "recall_no": current_campaign.recall_no,
+        "title": current_campaign.title,
+        "status": current_campaign.status,
+        "device_count": current_campaign.device_count,
+        "deadline": current_campaign.deadline.isoformat(),
+        "control_action_id": current_campaign.control_action_id,
+    } if current_campaign else None)
+    data["recall_binding"] = {
+        "has_live_campaign": bool(current_campaign),
+        "has_orphan_active_action": orphan_recall,
+        "is_consistent": not active_recall or bool(
+            current_campaign and current_campaign.control_action_id == active_recall.pk
+        ),
+    }
     data["available_actions"] = {
-        "temporary_hold": row.status == BatchQualityCase.Status.OPEN and not active_actions,
-        "formal_hold": row.status in {BatchQualityCase.Status.OPEN, BatchQualityCase.Status.HELD} and not active_formal and not active_recall,
-        "start_recall": row.status in {BatchQualityCase.Status.OPEN, BatchQualityCase.Status.HELD} and not active_recall,
-        "revoke_temporary_action_id": active_temporary.pk if active_temporary and not active_recall else None,
-        "release_formal_action_id": active_formal.pk if active_formal and not active_recall else None,
+        "temporary_hold": can_control and row.status == BatchQualityCase.Status.OPEN and not active_actions,
+        "formal_hold": can_control and row.status in {BatchQualityCase.Status.OPEN, BatchQualityCase.Status.HELD} and not active_formal and not active_recall,
+        "start_recall": can_control and row.status in {
+            BatchQualityCase.Status.OPEN,
+            BatchQualityCase.Status.HELD,
+        } and not current_campaign and not active_recall,
+        "create_recall_campaign": False,
+        "open_recall_detail": can_control and row.status in {
+            BatchQualityCase.Status.OPEN,
+            BatchQualityCase.Status.HELD,
+            BatchQualityCase.Status.RECALLING,
+        } and bool(current_campaign or orphan_recall),
+        "continue_recall_campaign_id": current_campaign.pk if current_campaign else None,
+        "revoke_temporary_action_id": active_temporary.pk if can_control and active_temporary and not active_recall else None,
+        "release_formal_action_id": active_formal.pk if can_control and active_formal and not active_recall else None,
         "complete_recall_action_id": None,
     }
     data["events"] = [{
@@ -550,15 +598,24 @@ def recall_start(request, case_id):
     if error_response:
         return error_response
     try:
-        row = start_recall(
-            user=user, case_id=case_id,
+        campaign = ensure_recall_campaign(
+            user=user,
+            case_id=case_id,
             reason=_request_data(request).get("reason"),
         )
-    except QualityCaseError as exc:
+    except (QualityCaseError, QualityRecallError) as exc:
         return JsonResponse({"code": 1, "msg": str(exc), "data": {}}, status=200)
     return JsonResponse({
-        "code": 0, "msg": "召回行动已启动",
-        "data": serialize_case(row.quality_case),
+        "code": 0,
+        "msg": "召回已启动，召回批次与质量案件已绑定",
+        "data": {
+            "id": campaign.pk,
+            "recall_no": campaign.recall_no,
+            "quality_case_id": campaign.quality_case_id,
+            "status": campaign.status,
+            "control_action_id": campaign.control_action_id,
+            "device_count": campaign.device_count,
+        },
     }, status=200)
 
 

@@ -13,6 +13,7 @@ from .models import (
     QualityGateDecision,
     QualityTraceEvent,
     QualityRecallCampaign,
+    QualityRecallCampaignCaseLink,
     QualityRecallDevice,
     QualityRecallDeviceEvent,
     QualityRecallReturnLeg,
@@ -61,6 +62,7 @@ admin.site.register(QualityMetricSnapshot)
 admin.site.register(QualityMetricSnapshotDevice)
 admin.site.register(QualityGateDecision)
 admin.site.register(QualityRecallCampaign)
+admin.site.register(QualityRecallCampaignCaseLink)
 admin.site.register(QualityRecallDevice)
 admin.site.register(QualityRecallDeviceEvent)
 admin.site.register(QualityRecallReturnLeg)

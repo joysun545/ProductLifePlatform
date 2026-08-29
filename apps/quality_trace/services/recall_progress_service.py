@@ -5,6 +5,7 @@ from django.utils import timezone
 
 from account.models import UserOrganization
 from quality_trace.models import (
+    BatchQualityCase,
     QualityControlAction,
     QualityRecallCampaign,
     QualityRecallCloseout,
@@ -303,6 +304,46 @@ def complete_recall_campaign(*, user, campaign_id, reason):
     campaign.save(update_fields=(
         "status", "completed_by", "completed_at", "updated_at",
     ))
+    linked_cases = list(
+        BatchQualityCase.objects.select_for_update()
+        .select_related("source_alert")
+        .filter(recall_campaign_links__campaign=campaign)
+        .exclude(pk=campaign.quality_case_id)
+        .distinct()
+    )
+    for linked_case in linked_cases:
+        completed_action_ids = []
+        for action in linked_case.control_actions.select_for_update().filter(
+            action_type__in=(
+                QualityControlAction.ActionType.RECALL,
+                QualityControlAction.ActionType.FORMAL_HOLD,
+                QualityControlAction.ActionType.TEMPORARY_HOLD,
+            ),
+            status=QualityControlAction.Status.ACTIVE,
+        ):
+            action.status = QualityControlAction.Status.COMPLETED
+            action.ended_at = now
+            action.ended_by = user
+            action.end_reason = f"主召回批次{campaign.recall_no}完成，关联管控同步结束"
+            action.save(update_fields=(
+                "status", "ended_at", "ended_by", "end_reason",
+            ))
+            completed_action_ids.append(action.pk)
+        linked_case.status = BatchQualityCase.Status.REMEDIATING
+        linked_case.save(update_fields=("status", "updated_at"))
+        QualityTraceEvent.objects.create(
+            quality_case=linked_case,
+            alert=linked_case.source_alert,
+            event_type="RECALL_COMPLETED_BY_CANONICAL_CAMPAIGN",
+            actor=user,
+            actor_role_snapshot=identity.role.code,
+            payload={
+                "canonical_campaign_id": campaign.pk,
+                "canonical_recall_no": campaign.recall_no,
+                "completed_control_action_ids": completed_action_ids,
+                "reason": reason,
+            },
+        )
     closeout = QualityRecallCloseout.objects.create(
         campaign=campaign,
         progress_snapshot=progress,
@@ -336,7 +377,7 @@ def complete_recall_campaign(*, user, campaign_id, reason):
             "recall_campaign_id": campaign.pk,
             "closeout_id": closeout.pk,
             "progress_snapshot_id": progress.pk,
-            "remediation_hold_action_id": remediation_hold.pk,
+            "remediation_hold_action_id": terminal_control.pk,
         },
     )
     return closeout

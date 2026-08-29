@@ -6,7 +6,11 @@ from django.utils import timezone
 
 from account.services.auth_service import get_active_identity
 from lifecycle.models import Device
-from quality_trace.models import QualityControlAction, QualityGateDecision
+from quality_trace.models import (
+    BatchQualityCase,
+    QualityControlAction,
+    QualityGateDecision,
+)
 
 from .case_service import expire_temporary_holds
 
@@ -26,6 +30,13 @@ BLOCKING_ACTION_TYPES = {
     QualityControlAction.ActionType.FORMAL_HOLD,
     QualityControlAction.ActionType.RECALL,
 }
+
+REMEDIATION_BLOCKING_STATUSES = {
+    BatchQualityCase.Status.REMEDIATING,
+    BatchQualityCase.Status.PENDING_RELEASE,
+}
+
+
 def _operation(value):
     result = str(value or "").strip().upper()
     valid = {item for item, _ in QualityGateDecision.Operation.choices}
@@ -65,6 +76,24 @@ def _active_action(device, at):
     )
 
 
+def _remediation_case(device):
+    """Return the newest case whose post-recall isolation is still in force.
+
+    Recall completion ends the recall/hold actions themselves, but the frozen
+    device set must remain isolated while engineering remediation and release
+    approval are pending.  This is a case-stage gate, not another control
+    action, so it deliberately does not create or reactivate an action row.
+    """
+    return (
+        BatchQualityCase.objects.filter(
+            affected_devices__device=device,
+            status__in=REMEDIATION_BLOCKING_STATUSES,
+        )
+        .order_by("-updated_at", "-id")
+        .first()
+    )
+
+
 def serialize_gate_decision(row):
     return {
         "id": row.pk,
@@ -97,6 +126,8 @@ def check_device_operation(
     if not device:
         raise QualityGateError("设备不存在。")
     action = _active_action(device, at)
+    remediation_case = None if action else _remediation_case(device)
+    blocking_case = action.quality_case if action else remediation_case
     actor, role = _actor_snapshot(user)
     context_snapshot = dict(context) if isinstance(context, dict) else {}
     context_snapshot.update({
@@ -107,11 +138,21 @@ def check_device_operation(
         "production_batch_no": device.batch.batch_no,
         "checked_at": at.isoformat(),
     })
-    if action:
-        message = (
-            f"设备{device.sn}受质量管控限制，当前不能执行"
-            f"{dict(QualityGateDecision.Operation.choices)[operation]}。"
-        )
+    if blocking_case:
+        if action:
+            message = (
+                f"设备{device.sn}受质量管控限制，当前不能执行"
+                f"{dict(QualityGateDecision.Operation.choices)[operation]}。"
+            )
+            gate_basis = "ACTIVE_CONTROL_ACTION"
+        else:
+            message = (
+                f"设备{device.sn}处于召回完成后的质量整改隔离阶段，当前不能执行"
+                f"{dict(QualityGateDecision.Operation.choices)[operation]}。"
+            )
+            gate_basis = "REMEDIATION_ISOLATION"
+        context_snapshot["quality_gate_basis"] = gate_basis
+        context_snapshot["quality_case_status"] = blocking_case.status
         row = QualityGateDecision.objects.create(
             factory_organization=device.batch.manufacturer,
             device=device,
@@ -119,7 +160,7 @@ def check_device_operation(
             allowed=False,
             decision_code="QUALITY_CONTROL_BLOCKED",
             reason=message,
-            quality_case=action.quality_case,
+            quality_case=blocking_case,
             control_action=action,
             checked_by=actor,
             checked_role_snapshot=role,
@@ -133,11 +174,15 @@ def check_device_operation(
             "device_id": device.pk,
             "device_sn": device.sn,
             "operation": operation,
-            "quality_case_id": action.quality_case_id,
-            "case_no": action.quality_case.case_no,
-            "control_action_id": action.pk,
-            "control_action_type": action.action_type,
-            "expires_at": action.expires_at.isoformat() if action.expires_at else "",
+            "quality_case_id": blocking_case.pk,
+            "case_no": blocking_case.case_no,
+            "control_action_id": action.pk if action else None,
+            "control_action_type": (
+                action.action_type if action else "REMEDIATION_ISOLATION"
+            ),
+            "expires_at": (
+                action.expires_at.isoformat() if action and action.expires_at else ""
+            ),
             "audit": serialize_gate_decision(row),
         }
     row = None

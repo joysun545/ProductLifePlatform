@@ -96,6 +96,9 @@ class OrderPlanApiTests(TestCase):
         self.factory_manager_role = OrganizationRole.objects.get(
             code="factory_manager"
         )
+        self.factory_chief_engineer_role = OrganizationRole.objects.get(
+            code="factory_chief_engineer"
+        )
         self.merchant_owner_role = OrganizationRole.objects.get(code="merchant_owner")
         self.merchant_senior_manager_role = OrganizationRole.objects.get(
             code="merchant_senior_manager"
@@ -186,6 +189,12 @@ class OrderPlanApiTests(TestCase):
             "openid-order-factory-manager",
             self.factory,
             self.factory_manager_role,
+        )
+        self.factory_chief_engineer = self._user_with_identity(
+            "order-factory-chief-engineer",
+            "openid-order-factory-chief-engineer",
+            self.factory,
+            self.factory_chief_engineer_role,
         )
         self.factory_assistant_1 = self._user_with_identity(
             "order-factory-assistant-1",
@@ -1089,7 +1098,7 @@ class OrderPlanApiTests(TestCase):
                     trace_evidence_snapshot={"is_fault": True},
                 )
                 action = place_temporary_hold(
-                    user=self.factory_manager,
+                    user=self.factory_chief_engineer,
                     case_id=quality_case.pk,
                     reason="阻断二维码确认打印",
                     duration_hours=1,
@@ -1112,7 +1121,7 @@ class OrderPlanApiTests(TestCase):
                     "ORDER_QRCODE_PRINT_CONFIRM",
                 )
                 revoke_temporary_hold(
-                    user=self.factory_manager,
+                    user=self.factory_chief_engineer,
                     action_id=action.pk,
                     reason="测试完成后恢复二维码打印",
                 )
@@ -1131,7 +1140,7 @@ class OrderPlanApiTests(TestCase):
         )
 
         outbound_hold = place_temporary_hold(
-            user=self.factory_manager,
+            user=self.factory_chief_engineer,
             case_id=quality_case.pk,
             reason="阻断厂家库存出库",
             duration_hours=1,
@@ -1171,7 +1180,7 @@ class OrderPlanApiTests(TestCase):
             "ORDER_PLAN_STOCK_OUTBOUND",
         )
         revoke_temporary_hold(
-            user=self.factory_manager,
+            user=self.factory_chief_engineer,
             action_id=outbound_hold.pk,
             reason="测试完成后恢复厂家出库",
         )
