@@ -9,6 +9,7 @@ from quality_trace.models import (
     BatchQualityCase,
     QualityAlert,
     QualityAlertRule,
+    QualityControlAction,
     QualityMetricSnapshot,
     QualityGateDecision,
 )
@@ -36,6 +37,7 @@ from quality_trace.services import (
     check_device_operation,
     serialize_gate_decision,
 )
+from quality_trace.services.rule_service import serialize_rule
 
 
 def _authenticated_user(request):
@@ -139,6 +141,32 @@ def rules(request):
     return JsonResponse({"code": 0, "msg": message, "data": data}, status=200)
 
 
+def rule_detail(request, rule_id):
+    if request.method != "GET":
+        return _method_error()
+    user, error_response = _authenticated_user(request)
+    if error_response:
+        return error_response
+    try:
+        identity = get_quality_trace_identity(user)
+    except QualityTraceAccessError as exc:
+        return JsonResponse({"code": 1, "msg": str(exc), "data": {}}, status=200)
+    if identity.organization.organization_type.code != "OWNER":
+        return JsonResponse({"code": 1, "msg": "只有厂家可以查看质量规则。", "data": {}}, status=200)
+    rule = QualityAlertRule.objects.filter(
+        pk=rule_id, factory_organization=identity.organization,
+    ).prefetch_related("versions").first()
+    if not rule:
+        return JsonResponse({"code": 1, "msg": "质量规则不存在或不属于当前厂家。", "data": {}}, status=200)
+    data = serialize_rule(rule)
+    data["versions"] = [
+        serialize_rule(rule, version)["version"]
+        for version in rule.versions.order_by("-version")
+    ]
+    data["can_manage"] = identity.role.code in {"factory_admin", "factory_chief_engineer"}
+    return JsonResponse({"code": 0, "msg": "", "data": data}, status=200)
+
+
 @csrf_exempt
 def evaluate_rules(request):
     if request.method != "POST":
@@ -150,7 +178,7 @@ def evaluate_rules(request):
         identity = get_quality_trace_identity(user)
         if (
             identity.organization.organization_type.code != "OWNER"
-            or identity.role.code not in {"factory_admin", "factory_manager"}
+            or identity.role.code not in {"factory_admin", "factory_chief_engineer"}
         ):
             raise QualityTraceAccessError("当前岗位无权执行质量规则重算。")
         payload = _request_data(request)
@@ -305,6 +333,14 @@ def alert_detail(request, alert_id):
             for row in evidence_rows[:500]
         ],
         "device_evidence_complete_count": evidence_rows.count() if metric else 0,
+        "available_actions": {
+            "assess": alert.status not in {QualityAlert.Status.DISMISSED, QualityAlert.Status.CLOSED},
+            "open_case": (
+                alert.status not in {QualityAlert.Status.DISMISSED, QualityAlert.Status.CLOSED}
+                and alert.assessments.exists()
+                and not alert.quality_cases.exists()
+            ),
+        },
     }
     return JsonResponse({"code": 0, "msg": "", "data": data}, status=200)
 
@@ -397,9 +433,27 @@ def quality_case_detail(request, case_id):
     row = BatchQualityCase.objects.filter(**filters).first()
     if not row:
         return JsonResponse({"code": 1, "msg": "质量案件不存在或无权查看。", "data": {}}, status=200)
-    return JsonResponse({
-        "code": 0, "msg": "", "data": serialize_case(row, include_devices=True),
-    }, status=200)
+    data = serialize_case(row, include_devices=True)
+    active_actions = list(row.control_actions.filter(status=QualityControlAction.Status.ACTIVE))
+    active_temporary = next((item for item in active_actions if item.action_type == QualityControlAction.ActionType.TEMPORARY_HOLD), None)
+    active_formal = next((item for item in active_actions if item.action_type == QualityControlAction.ActionType.FORMAL_HOLD), None)
+    active_recall = next((item for item in active_actions if item.action_type == QualityControlAction.ActionType.RECALL), None)
+    data["available_actions"] = {
+        "temporary_hold": row.status == BatchQualityCase.Status.OPEN and not active_actions,
+        "formal_hold": row.status in {BatchQualityCase.Status.OPEN, BatchQualityCase.Status.HELD} and not active_formal and not active_recall,
+        "start_recall": row.status in {BatchQualityCase.Status.OPEN, BatchQualityCase.Status.HELD} and not active_recall,
+        "revoke_temporary_action_id": active_temporary.pk if active_temporary and not active_recall else None,
+        "release_formal_action_id": active_formal.pk if active_formal and not active_recall else None,
+        "complete_recall_action_id": None,
+    }
+    data["events"] = [{
+        "id": event.pk,
+        "event_type": event.event_type,
+        "actor_role": event.actor_role_snapshot,
+        "payload": event.payload,
+        "created_at": event.created_at.isoformat(),
+    } for event in row.events.order_by("-created_at", "-id")[:100]]
+    return JsonResponse({"code": 0, "msg": "", "data": data}, status=200)
 
 
 @csrf_exempt

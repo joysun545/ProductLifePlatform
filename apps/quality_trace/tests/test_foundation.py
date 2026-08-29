@@ -27,7 +27,7 @@ class QualityTraceFoundationTests(TestCase):
             name="质量测试商家", code="QUALITY-MERCHANT", organization_type=cls.merchant_type,
         )
         cls.factory_role = OrganizationRole.objects.get(
-            organization_type=cls.factory_type, code="factory_manager",
+            organization_type=cls.factory_type, code="factory_chief_engineer",
         )
         cls.merchant_role = OrganizationRole.objects.get(
             organization_type=cls.merchant_type, code="merchant_owner",
@@ -52,6 +52,20 @@ class QualityTraceFoundationTests(TestCase):
     def test_merchant_identity_is_rejected(self):
         with self.assertRaisesMessage(QualityTraceAccessError, "无权访问"):
             get_quality_trace_identity(self.merchant_user)
+
+    def test_factory_business_role_is_rejected(self):
+        sales_user = User.objects.create_user(
+            username="quality-factory-sales", wx_openid="quality-factory-sales-openid",
+        )
+        UserOrganization.objects.create(
+            user=sales_user,
+            organization=self.factory,
+            role=OrganizationRole.objects.get(
+                organization_type=self.factory_type, code="factory_sales",
+            ),
+        )
+        with self.assertRaisesMessage(QualityTraceAccessError, "无权访问"):
+            get_quality_trace_identity(sales_user)
 
     def test_rule_rejects_non_factory_owner(self):
         rule = QualityAlertRule(

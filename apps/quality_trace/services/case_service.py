@@ -23,9 +23,9 @@ class QualityCaseError(Exception):
     pass
 
 
-ASSESSOR_ROLES = {"factory_admin", "factory_manager", "factory_aftersales"}
-CASE_MANAGER_ROLES = {"factory_admin", "factory_manager", "factory_aftersales"}
-CONTROL_MANAGER_ROLES = {"factory_admin", "factory_manager"}
+ASSESSOR_ROLES = {"factory_admin", "factory_chief_engineer"}
+CASE_MANAGER_ROLES = {"factory_admin", "factory_chief_engineer"}
+CONTROL_MANAGER_ROLES = {"factory_admin", "factory_chief_engineer"}
 MAX_TEMPORARY_HOLD_HOURS = 168
 
 
@@ -277,6 +277,14 @@ def place_temporary_hold(*, user, case_id, reason, duration_hours):
         status=QualityControlAction.Status.ACTIVE,
     ).exists():
         raise QualityCaseError("该案件已经存在生效中的临时拦截。")
+    if quality_case.control_actions.filter(
+        action_type__in=(
+            QualityControlAction.ActionType.FORMAL_HOLD,
+            QualityControlAction.ActionType.RECALL,
+        ),
+        status=QualityControlAction.Status.ACTIVE,
+    ).exists():
+        raise QualityCaseError("正式拦截或召回已经生效，不能降级追加临时拦截。")
     try:
         duration_hours = int(duration_hours)
     except (TypeError, ValueError) as exc:
@@ -324,12 +332,28 @@ def place_temporary_hold(*, user, case_id, reason, duration_hours):
     return action
 
 
-def _restore_case_after_hold(quality_case):
-    if not quality_case.control_actions.filter(
-        action_type=QualityControlAction.ActionType.TEMPORARY_HOLD,
+def _synchronize_case_control_status(quality_case):
+    """Keep the case projection in sync without weakening another active control."""
+    active_types = set(quality_case.control_actions.filter(
         status=QualityControlAction.Status.ACTIVE,
-    ).exists():
-        quality_case.status = BatchQualityCase.Status.OPEN
+    ).values_list("action_type", flat=True))
+    if QualityControlAction.ActionType.RECALL in active_types:
+        next_status = BatchQualityCase.Status.RECALLING
+    elif active_types.intersection({
+        QualityControlAction.ActionType.TEMPORARY_HOLD,
+        QualityControlAction.ActionType.FORMAL_HOLD,
+    }):
+        next_status = BatchQualityCase.Status.HELD
+    elif quality_case.status not in {
+        BatchQualityCase.Status.REMEDIATING,
+        BatchQualityCase.Status.PENDING_RELEASE,
+        BatchQualityCase.Status.CLOSED,
+    }:
+        next_status = BatchQualityCase.Status.OPEN
+    else:
+        next_status = quality_case.status
+    if quality_case.status != next_status:
+        quality_case.status = next_status
         quality_case.save(update_fields=("status", "updated_at"))
 
 
@@ -350,12 +374,17 @@ def revoke_temporary_hold(*, user, action_id, reason):
         raise QualityCaseError("临时拦截记录不存在或不属于当前厂家。")
     if action.status != QualityControlAction.Status.ACTIVE:
         raise QualityCaseError("该临时拦截已经结束。")
+    if action.quality_case.control_actions.filter(
+        action_type=QualityControlAction.ActionType.RECALL,
+        status=QualityControlAction.Status.ACTIVE,
+    ).exists():
+        raise QualityCaseError("召回进行中，禁止解除临时拦截。")
     action.status = QualityControlAction.Status.REVOKED
     action.ended_at = timezone.now()
     action.ended_by = user
     action.end_reason = _reason(reason)
     action.save(update_fields=("status", "ended_at", "ended_by", "end_reason"))
-    _restore_case_after_hold(action.quality_case)
+    _synchronize_case_control_status(action.quality_case)
     _event(
         event_type="TEMPORARY_HOLD_REVOKED",
         actor=user,
@@ -406,19 +435,38 @@ def _frozen_scope(quality_case):
 def place_formal_hold(*, user, case_id, reason):
     identity = _identity(user, CONTROL_MANAGER_ROLES)
     quality_case = _case_for_control(identity, case_id)
-    if _active_blocking_exists(quality_case):
-        raise QualityCaseError("该案件已有生效中的质量管控。")
+    if quality_case.control_actions.filter(
+        action_type=QualityControlAction.ActionType.FORMAL_HOLD,
+        status=QualityControlAction.Status.ACTIVE,
+    ).exists():
+        raise QualityCaseError("该案件已经存在生效中的正式拦截。")
+    now = timezone.now()
+    temporary_actions = list(quality_case.control_actions.select_for_update().filter(
+        action_type=QualityControlAction.ActionType.TEMPORARY_HOLD,
+        status=QualityControlAction.Status.ACTIVE,
+    ))
     action = QualityControlAction.objects.create(
         quality_case=quality_case,
         action_type=QualityControlAction.ActionType.FORMAL_HOLD,
         operation_scope=_frozen_scope(quality_case),
         status=QualityControlAction.Status.ACTIVE,
         reason=_reason(reason),
-        effective_at=timezone.now(),
+        effective_at=now,
         acted_by=user,
     )
-    quality_case.status = BatchQualityCase.Status.HELD
-    quality_case.save(update_fields=("status", "updated_at"))
+    for temporary in temporary_actions:
+        temporary.status = QualityControlAction.Status.COMPLETED
+        temporary.ended_at = now
+        temporary.ended_by = user
+        temporary.end_reason = f"升级为正式拦截（正式拦截动作 {action.pk}）"
+        temporary.save(update_fields=("status", "ended_at", "ended_by", "end_reason"))
+        _event(
+            event_type="TEMPORARY_HOLD_UPGRADED",
+            actor=user, identity=identity, quality_case=quality_case,
+            alert=quality_case.source_alert,
+            payload={"temporary_action_id": temporary.pk, "formal_action_id": action.pk},
+        )
+    _synchronize_case_control_status(quality_case)
     _event(
         event_type="FORMAL_HOLD_PLACED", actor=user, identity=identity,
         quality_case=quality_case, alert=quality_case.source_alert,
@@ -442,6 +490,11 @@ def release_formal_hold(*, user, action_id, reason):
     )
     if not action or action.status != QualityControlAction.Status.ACTIVE:
         raise QualityCaseError("正式拦截不存在或已经结束。")
+    if action.quality_case.control_actions.filter(
+        action_type=QualityControlAction.ActionType.RECALL,
+        status=QualityControlAction.Status.ACTIVE,
+    ).exists():
+        raise QualityCaseError("召回进行中，禁止解除正式拦截。")
     now = timezone.now()
     action.status = QualityControlAction.Status.REVOKED
     action.ended_at = now
@@ -460,8 +513,7 @@ def release_formal_hold(*, user, action_id, reason):
         ended_by=user,
         end_reason=action.end_reason,
     )
-    action.quality_case.status = BatchQualityCase.Status.OPEN
-    action.quality_case.save(update_fields=("status", "updated_at"))
+    _synchronize_case_control_status(action.quality_case)
     _event(
         event_type="FORMAL_HOLD_RELEASED", actor=user, identity=identity,
         quality_case=action.quality_case, alert=action.quality_case.source_alert,
@@ -475,8 +527,11 @@ def release_formal_hold(*, user, action_id, reason):
 def start_recall(*, user, case_id, reason):
     identity = _identity(user, CONTROL_MANAGER_ROLES)
     quality_case = _case_for_control(identity, case_id)
-    if _active_blocking_exists(quality_case):
-        raise QualityCaseError("该案件已有生效中的质量管控。")
+    if quality_case.control_actions.filter(
+        action_type=QualityControlAction.ActionType.RECALL,
+        status=QualityControlAction.Status.ACTIVE,
+    ).exists():
+        raise QualityCaseError("该案件已经存在执行中的召回行动。")
     action = QualityControlAction.objects.create(
         quality_case=quality_case,
         action_type=QualityControlAction.ActionType.RECALL,
@@ -486,8 +541,7 @@ def start_recall(*, user, case_id, reason):
         effective_at=timezone.now(),
         acted_by=user,
     )
-    quality_case.status = BatchQualityCase.Status.RECALLING
-    quality_case.save(update_fields=("status", "updated_at"))
+    _synchronize_case_control_status(quality_case)
     _event(
         event_type="RECALL_STARTED", actor=user, identity=identity,
         quality_case=quality_case, alert=quality_case.source_alert,
@@ -516,22 +570,27 @@ def complete_recall(*, user, action_id, reason):
     action.ended_by = user
     action.end_reason = _reason(reason)
     action.save(update_fields=("status", "ended_at", "ended_by", "end_reason"))
-    remediation_hold = QualityControlAction.objects.create(
-        quality_case=action.quality_case,
-        action_type=QualityControlAction.ActionType.FORMAL_HOLD,
-        operation_scope=action.operation_scope,
+    completed_controls = []
+    for control in action.quality_case.control_actions.select_for_update().filter(
+        action_type__in=(
+            QualityControlAction.ActionType.TEMPORARY_HOLD,
+            QualityControlAction.ActionType.FORMAL_HOLD,
+        ),
         status=QualityControlAction.Status.ACTIVE,
-        reason="召回完成后继续隔离，等待维修、报废或质量放行。",
-        effective_at=action.ended_at,
-        acted_by=user,
-    )
+    ):
+        control.status = QualityControlAction.Status.COMPLETED
+        control.ended_at = action.ended_at
+        control.ended_by = user
+        control.end_reason = "召回批次完成，关联拦截同步结束"
+        control.save(update_fields=("status", "ended_at", "ended_by", "end_reason"))
+        completed_controls.append(control.pk)
     action.quality_case.status = BatchQualityCase.Status.REMEDIATING
     action.quality_case.save(update_fields=("status", "updated_at"))
     _event(
         event_type="RECALL_COMPLETED", actor=user, identity=identity,
         quality_case=action.quality_case, alert=action.quality_case.source_alert,
         payload={"control_action_id": action.pk,
-                 "remediation_hold_action_id": remediation_hold.pk,
+                 "completed_control_action_ids": completed_controls,
                  "reason": action.end_reason},
     )
     return action
@@ -560,7 +619,7 @@ def expire_temporary_holds(*, at=None):
         action.ended_at = at
         action.end_reason = "临时拦截到期自动解除"
         action.save(update_fields=("status", "ended_at", "end_reason"))
-        _restore_case_after_hold(action.quality_case)
+        _synchronize_case_control_status(action.quality_case)
         QualityTraceEvent.objects.create(
             quality_case=action.quality_case,
             alert=action.quality_case.source_alert,

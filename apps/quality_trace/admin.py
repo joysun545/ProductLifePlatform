@@ -12,6 +12,17 @@ from .models import (
     QualityMetricSnapshotDevice,
     QualityGateDecision,
     QualityTraceEvent,
+    QualityRecallCampaign,
+    QualityRecallDevice,
+    QualityRecallDeviceEvent,
+    QualityRecallReturnLeg,
+    QualityRecallCustomerHandover,
+    QualityRecallHandoverEvidence,
+    QualityRecallTransportLeg,
+    QualityRecallIsolationReceipt,
+    QualityRecallProgressSnapshot,
+    QualityRecallExceptionDecision,
+    QualityRecallCloseout,
 )
 
 
@@ -49,3 +60,14 @@ admin.site.register(QualityTraceEvent)
 admin.site.register(QualityMetricSnapshot)
 admin.site.register(QualityMetricSnapshotDevice)
 admin.site.register(QualityGateDecision)
+admin.site.register(QualityRecallCampaign)
+admin.site.register(QualityRecallDevice)
+admin.site.register(QualityRecallDeviceEvent)
+admin.site.register(QualityRecallReturnLeg)
+admin.site.register(QualityRecallCustomerHandover)
+admin.site.register(QualityRecallHandoverEvidence)
+admin.site.register(QualityRecallTransportLeg)
+admin.site.register(QualityRecallIsolationReceipt)
+admin.site.register(QualityRecallProgressSnapshot)
+admin.site.register(QualityRecallExceptionDecision)
+admin.site.register(QualityRecallCloseout)

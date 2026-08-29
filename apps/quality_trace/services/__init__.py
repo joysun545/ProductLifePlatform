@@ -28,6 +28,33 @@ from .case_service import (
     serialize_case,
     serialize_control_action,
 )
+from .recall_service import (
+    QualityRecallError,
+    create_recall_campaign,
+    launch_recall_campaign,
+    transition_recall_device,
+)
+from .recall_task_service import publish_recall_tasks, resolve_recall_responsibility
+from .recall_return_service import bind_recall_return_transfer, synchronize_recall_return_leg
+from .recall_handover_service import (
+    acknowledge_customer_recall,
+    add_handover_evidence,
+    confirm_merchant_handover_receipt,
+    initialize_customer_handover,
+    schedule_customer_pickup,
+)
+from .recall_transport_service import (
+    create_next_recall_transport_leg,
+    dispatch_recall_transport_leg,
+    isolate_recalled_device,
+    receive_recall_transport_leg,
+)
+from .recall_progress_service import (
+    calculate_recall_progress,
+    complete_recall_campaign,
+    decide_unreachable_device,
+    evaluate_active_recall_progress,
+)
 
 __all__ = [
     "QualityTraceAccessError",
@@ -60,4 +87,25 @@ __all__ = [
     "serialize_gate_decision",
     "persist_blocked_decision_after_rollback",
     "quality_gate_atomic",
+    "QualityRecallError",
+    "create_recall_campaign",
+    "launch_recall_campaign",
+    "transition_recall_device",
+    "publish_recall_tasks",
+    "resolve_recall_responsibility",
+    "bind_recall_return_transfer",
+    "synchronize_recall_return_leg",
+    "initialize_customer_handover",
+    "acknowledge_customer_recall",
+    "schedule_customer_pickup",
+    "add_handover_evidence",
+    "confirm_merchant_handover_receipt",
+    "create_next_recall_transport_leg",
+    "dispatch_recall_transport_leg",
+    "receive_recall_transport_leg",
+    "isolate_recalled_device",
+    "calculate_recall_progress",
+    "evaluate_active_recall_progress",
+    "decide_unreachable_device",
+    "complete_recall_campaign",
 ]

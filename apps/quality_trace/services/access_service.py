@@ -8,6 +8,7 @@ class QualityTraceAccessError(Exception):
 FACTORY_ORGANIZATION_TYPE = "OWNER"
 SUPPLIER_ORGANIZATION_TYPE = "SUPPLIER"
 SUPPLIER_ALLOWED_ROLES = {"supplier_owner", "supplier_sales"}
+FACTORY_QUALITY_ROLES = {"factory_admin", "factory_chief_engineer"}
 
 
 def get_quality_trace_identity(user):
@@ -17,7 +18,10 @@ def get_quality_trace_identity(user):
     if not identity:
         raise QualityTraceAccessError("当前账号没有有效的组织身份。")
     organization_type = identity.organization.organization_type.code
-    if organization_type == FACTORY_ORGANIZATION_TYPE:
+    if (
+        organization_type == FACTORY_ORGANIZATION_TYPE
+        and identity.role.code in FACTORY_QUALITY_ROLES
+    ):
         return identity
     if (
         organization_type == SUPPLIER_ORGANIZATION_TYPE
@@ -25,4 +29,3 @@ def get_quality_trace_identity(user):
     ):
         return identity
     raise QualityTraceAccessError("当前岗位无权访问质量追溯数据。")
-

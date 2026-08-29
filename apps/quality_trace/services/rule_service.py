@@ -13,7 +13,7 @@ class QualityRuleError(Exception):
     pass
 
 
-RULE_MANAGER_ROLES = {"factory_admin", "factory_manager"}
+RULE_MANAGER_ROLES = {"factory_admin", "factory_chief_engineer"}
 TARGET_TYPES = {
     "SUPPLIER_BATCH",
     "PRODUCT_MODEL",
