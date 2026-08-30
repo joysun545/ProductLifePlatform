@@ -40,6 +40,7 @@ from quality_trace.models import (
     BatchQualityAffectedDevice,
     BatchQualityCase,
     QualityAlert,
+    QualityAlertRule,
     QualityControlAction,
     QualityMetricSnapshot,
     QualityMetricSnapshotDevice,
@@ -668,6 +669,55 @@ class QualityRuleEngineTests(TestCase):
             remedy_type="RETURN",
             deadline=timezone.localdate() + timedelta(days=10),
             device_ids=device_ids,
+        )
+
+    def test_quality_trace_test_data_reset_preserves_rules_and_business_chain(self):
+        quality_case = self._recall_case()
+        campaign = self._recall_campaign(quality_case)
+        launch_recall_campaign(user=self.manager, campaign_id=campaign.pk)
+        rule = quality_case.source_alert.rule_version.rule
+        rule_version_count = rule.versions.count()
+        device_ids = list(
+            Device.objects.order_by("id").values_list("id", flat=True)
+        )
+
+        ordinary_workitem = WorkItem.objects.create(
+            domain="SYSTEM",
+            type="NON_QUALITY_TEST_NOTICE",
+            biz_id="R13851-NON-QUALITY",
+            title="普通业务任务应保留",
+            uniq_key="r13851-non-quality-workitem",
+        )
+
+        dry_run_output = io.StringIO()
+        call_command("reset_quality_trace_test_data", stdout=dry_run_output)
+        self.assertIn('"mode": "DRY_RUN"', dry_run_output.getvalue())
+        self.assertTrue(QualityRecallCampaign.objects.filter(pk=campaign.pk).exists())
+        self.assertTrue(WorkItem.objects.filter(pk=ordinary_workitem.pk).exists())
+
+        commit_output = io.StringIO()
+        call_command(
+            "reset_quality_trace_test_data",
+            commit=True,
+            confirm="RESET_QUALITY_TRACE",
+            stdout=commit_output,
+        )
+        self.assertIn('"status": "COMPLETED"', commit_output.getvalue())
+
+        rule.refresh_from_db()
+        self.assertEqual(rule.status, QualityAlertRule.Status.SUSPENDED)
+        self.assertEqual(rule.versions.count(), rule_version_count)
+        self.assertFalse(QualityAlert.objects.exists())
+        self.assertFalse(QualityMetricSnapshot.objects.exists())
+        self.assertFalse(BatchQualityCase.objects.exists())
+        self.assertFalse(QualityControlAction.objects.exists())
+        self.assertFalse(QualityRecallCampaign.objects.exists())
+        self.assertFalse(QualityTraceEvent.objects.exists())
+        self.assertFalse(WorkItem.objects.filter(type__startswith="QUALITY_").exists())
+        self.assertTrue(WorkItem.objects.filter(pk=ordinary_workitem.pk).exists())
+        self.assertEqual(
+            list(Device.objects.order_by("id").values_list("id", flat=True)),
+            device_ids,
         )
 
     def _overlap_case(self, suffix, device_ids):
