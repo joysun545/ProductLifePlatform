@@ -72,4 +72,13 @@ urlpatterns = [
         )
     ),
 
+
+    path(
+        "data-statistics/",
+        include(
+            ("data_statistics.api.urls", "data_statistics"),
+            namespace="data_statistics"
+        )
+    ),
+
 ]
