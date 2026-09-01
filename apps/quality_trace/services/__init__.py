@@ -58,6 +58,7 @@ from .recall_handover_service import (
     sync_recall_delivery_collaboration,
 )
 from .recall_transport_service import (
+    confirm_recall_inventory_batch,
     create_next_recall_transport_leg,
     dispatch_recall_transport_leg,
     isolate_recalled_device,
@@ -129,6 +130,7 @@ __all__ = [
     "dispatch_recall_transport_leg",
     "receive_recall_transport_leg",
     "isolate_recalled_device",
+    "confirm_recall_inventory_batch",
     "calculate_recall_progress",
     "evaluate_active_recall_progress",
     "decide_unreachable_device",

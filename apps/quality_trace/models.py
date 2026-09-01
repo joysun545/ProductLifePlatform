@@ -1048,6 +1048,28 @@ class QualityRecallIsolationReceipt(TimeStampedModel):
         ]
 
 
+class QualityRecallInventoryBatchConfirmation(TimeStampedModel):
+    """Sales-assistant confirmation that every recalled device was posted."""
+
+    campaign = models.OneToOneField(
+        QualityRecallCampaign,
+        on_delete=models.PROTECT,
+        related_name="inventory_batch_confirmation",
+    )
+    confirmed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="confirmed_quality_recall_inventory_batches",
+    )
+    confirmed_role_snapshot = models.CharField(max_length=64)
+    confirmed_device_count = models.PositiveIntegerField()
+    confirmed_at = models.DateTimeField()
+    note = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ("-confirmed_at", "-id")
+
+
 class QualityRecallProgressSnapshot(models.Model):
     campaign = models.ForeignKey(
         QualityRecallCampaign, on_delete=models.PROTECT, related_name="progress_snapshots",

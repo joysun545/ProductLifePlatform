@@ -12,6 +12,7 @@ from quality_trace.models import (
     QualityRecallCustomerHandover,
     QualityRecallDevice,
     QualityRecallExceptionDecision,
+    QualityRecallInventoryBatchConfirmation,
     QualityRecallProgressSnapshot,
     QualityRecallTransportLeg,
     QualityTraceEvent,
@@ -261,9 +262,37 @@ def _complete_escalation(campaign, user):
         )
 
 
+def _complete_campaign_workitems(campaign, user):
+    """Close every remaining recall inbox row after terminal completion."""
+
+    now = timezone.now()
+    items = WorkItem.objects.select_for_update().filter(
+        biz_id=str(campaign.pk),
+        type__startswith="QUALITY_RECALL_",
+        status="OPEN",
+    )
+    for item in items:
+        item.status = "DONE"
+        item.done_by_openid = user.wx_openid or ""
+        item.done_at = now
+        item.last_activity_at = now
+        item.save(update_fields=(
+            "status", "done_by_openid", "done_at", "last_activity_at", "updated_at",
+        ))
+        UserTask.objects.filter(workitem=item).exclude(state="DONE").update(
+            state="DONE",
+            done_at=now,
+            done_reason="RECALL_CAMPAIGN_COMPLETED",
+            cursor_time=now,
+            updated_at=now,
+        )
+
+
 @transaction.atomic
 def complete_recall_campaign(*, user, campaign_id, reason):
     identity = _identity(user, CONTROL_MANAGER_ROLES)
+    if identity.role.code != "factory_chief_engineer":
+        raise QualityRecallError("只有厂家总工程师可以确认召回任务完成。")
     campaign = (
         QualityRecallCampaign.objects.select_for_update()
         .select_related("control_action", "quality_case__source_alert")
@@ -285,6 +314,12 @@ def complete_recall_campaign(*, user, campaign_id, reason):
         raise QualityRecallError(
             "召回批次仍有未完成设备："
             + ",".join(str(item) for item in progress.incomplete_device_ids)
+        )
+    if not QualityRecallInventoryBatchConfirmation.objects.filter(
+        campaign=campaign,
+    ).exists():
+        raise QualityRecallError(
+            "厂家销售助理尚未确认本批设备全部入库记账。"
         )
     recall_action = complete_recall(
         user=user, action_id=campaign.control_action_id, reason=reason,
@@ -367,6 +402,7 @@ def complete_recall_campaign(*, user, campaign_id, reason):
         remediation_hold_action=terminal_control,
     )
     _complete_escalation(campaign, user)
+    _complete_campaign_workitems(campaign, user)
     QualityTraceEvent.objects.create(
         quality_case=campaign.quality_case,
         alert=campaign.quality_case.source_alert,

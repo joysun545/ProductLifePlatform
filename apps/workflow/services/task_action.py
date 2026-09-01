@@ -10,6 +10,45 @@ class TaskActionError(Exception):
     """任务不存在或当前账号无权操作。"""
 
 
+def _open_quality_recall_group(task, now):
+    """Acknowledge one account's whole recall-campaign inbox projection.
+
+    The real UserTask rows remain auditable. Knowledge rows finish on open;
+    executable rows only become READ and remain pending until their domain
+    action completes them.
+    """
+
+    workitem = task.workitem
+    if not workitem.type.startswith("QUALITY_RECALL_") or not workitem.biz_id:
+        return False
+
+    tasks = (
+        UserTask.objects.select_for_update()
+        .select_related("workitem")
+        .filter(
+            to_openid=task.to_openid,
+            workitem__type__startswith="QUALITY_RECALL_",
+            workitem__biz_id=workitem.biz_id,
+            state__in=("NEW", "READ"),
+        )
+    )
+    for grouped_task in tasks:
+        if grouped_task.state == "NEW":
+            grouped_task.read_at = now
+        if grouped_task.need_action:
+            grouped_task.state = "READ"
+        else:
+            grouped_task.state = "DONE"
+            grouped_task.done_at = now
+            grouped_task.done_reason = "RECALL_GROUP_OPENED"
+        grouped_task.cursor_time = grouped_task.workitem.last_activity_at
+        grouped_task.save(update_fields=[
+            "state", "read_at", "done_at", "done_reason",
+            "cursor_time", "updated_at",
+        ])
+    return True
+
+
 def _open_aftersales_group(task, now):
     """Opening one after-sales card acknowledges all visible case updates.
 
@@ -84,6 +123,10 @@ def open_task(openid, usertask_id):
 
 
     now = timezone.now()
+
+    if _open_quality_recall_group(task, now):
+        task.refresh_from_db(fields=("state",))
+        return {"state": task.state}
 
     if _open_aftersales_group(task, now):
         task.refresh_from_db(fields=("state",))

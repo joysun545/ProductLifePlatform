@@ -25,6 +25,7 @@ from .recall_collaboration_service import (
     FACTORY_RECALL_COLLABORATION_ROLES,
     close_customer_pickup_dispatch_task,
     organization_recipients,
+    publish_factory_transport_tasks,
     publish_customer_pickup_dispatch_task,
     publish_factory_recall_progress,
     publish_merchant_return_task,
@@ -382,42 +383,10 @@ def _create_customer_factory_leg(handover):
 
 
 def _publish_factory_receipt_task(handover, leg, *, user):
-    factory = handover.campaign.factory_organization
-    recipients = organization_recipients(factory, FACTORY_RECALL_COLLABORATION_ROLES)
-    if not recipients:
-        raise QualityRecallError("厂家没有可接收召回到货任务的总工程师、销售、物流或销售助理岗位。")
-    customer_name = handover.customer_organization.name
-    return publish_workitem(
-        domain="SYSTEM",
-        type="QUALITY_RECALL_TRANSPORT_RECEIPT",
-        biz_id=str(handover.campaign_id),
-        biz_ref=f"QualityRecallTransportLeg:{leg.pk}",
-        uniq_key=f"quality-recall-transport:{leg.pk}:receive",
-        title=f"{customer_name}已把召回设备寄送回厂，待收货",
-        summary=(
-            f"某一批次召回事件 {handover.campaign.recall_no}；"
-            f"设备：{handover.recall_device.sn_snapshot}；"
-            f"交付方式：{handover.get_delivery_method_display()}；"
-            f"物流：{leg.logistics_provider or '待补充'} {leg.tracking_no or ''}。"
-            "到货后须进入召回隔离，不得转普通库存。"
-        ),
-        link=(
-            "/pages/quality_trace/recall_detail/recall_detail"
-            f"?campaign_id={handover.campaign_id}&recall_device_id={handover.recall_device_id}"
-        ),
-        recipients_openids=recipients,
-        need_action=True,
-        action_mode="ANYONE_DO",
-        payload={
-            "transport_leg_id": leg.pk,
-            "recall_device_id": handover.recall_device_id,
-            "device_sn": handover.recall_device.sn_snapshot,
-            "delivery_method": handover.delivery_method,
-            "is_factory_destination": True,
-        },
-        actor_openid=user.wx_openid or "",
-        mark_workitem_done_immediately=False,
-    )
+    try:
+        return publish_factory_transport_tasks(leg, user=user)[0]
+    except ValueError as exc:
+        raise QualityRecallError(str(exc)) from exc
 
 
 @transaction.atomic

@@ -1,11 +1,10 @@
 import hashlib
 
-from django.db.models import Q
-
 from workflow.models import UserTask
 
 
 FACTORY_RETURN_TYPE_PREFIX = "FACTORY_RETURN_"
+QUALITY_RECALL_TYPE_PREFIX = "QUALITY_RECALL_"
 
 
 def _append_query(link, values):
@@ -23,6 +22,17 @@ def _resolved_link(task):
 
     workitem = task.workitem
     payload = workitem.payload if isinstance(workitem.payload, dict) else {}
+    if workitem.type.startswith(QUALITY_RECALL_TYPE_PREFIX):
+        campaign_id = payload.get("recall_campaign_id") or workitem.biz_id
+        if campaign_id:
+            return _append_query(
+                "/pages/quality_trace/recall_detail/recall_detail",
+                {
+                    "campaign_id": campaign_id,
+                    "recall_device_id": payload.get("recall_device_id"),
+                    "focus_stage": payload.get("stage"),
+                },
+            )
     if workitem.type == "ORDER_PLAN_SUPPLIER_PREPARE":
         return _append_query(
             "/pages/sales/order_plan_list/order_plan_list",
@@ -204,6 +214,12 @@ def _task_group_scope(task):
     workitem = task.workitem
     payload = workitem.payload if isinstance(workitem.payload, dict) else {}
 
+    # Every auditable recall update remains a real UserTask, while one account
+    # sees only one inbox card for the whole recall campaign. This also groups
+    # historical rows whose explicit key used to contain an organization id.
+    if workitem.type.startswith(QUALITY_RECALL_TYPE_PREFIX) and workitem.biz_id:
+        return f"quality-recall:campaign:{workitem.biz_id}"
+
     explicit_scope = payload.get("inbox_group_key")
     if explicit_scope:
         return f"explicit:{explicit_scope}"
@@ -235,11 +251,18 @@ def _group_metadata(scope, tasks):
         scope.startswith("explicit:aftersales:")
         or payload.get("inbox_group_kind") == "AFTERSALES"
     )
+    is_quality_recall = scope.startswith("quality-recall:campaign:")
     if is_aftersales:
         return {
             "group_kind": "AFTERSALES",
             "group_label": "售后工单",
             "is_workorder": True,
+        }
+    if is_quality_recall:
+        return {
+            "group_kind": "QUALITY_RECALL",
+            "group_label": "召回任务",
+            "is_workorder": False,
         }
     return {
         "group_kind": payload.get("inbox_group_kind") or "",
@@ -272,7 +295,7 @@ def _compose_group_title(tasks):
     return title or "业务任务"
 
 
-def _entry_task(tasks):
+def _entry_task(tasks, *, prefer_action=False):
     """Select the one real inbox row opened by an aggregated card.
 
     Aggregation must not invent a parent UserTask or acknowledge every child.
@@ -281,13 +304,17 @@ def _entry_task(tasks):
     priority bucket so the card can enter the domain detail directly.
     """
 
+    unread = [task for task in tasks if task.state == "NEW"]
+    pending_action = [
+        task for task in tasks
+        if task.need_action and task.state != "DONE"
+    ]
+    # A recall card can contain both knowledge updates and an executable
+    # node. Enter the executable node when one exists so the direct detail
+    # jump focuses the operation that currently needs this account.
     buckets = (
-        [task for task in tasks if task.state == "NEW"],
-        [
-            task for task in tasks
-            if task.need_action and task.state != "DONE"
-        ],
-        list(tasks),
+        (pending_action, unread, list(tasks))
+        if prefer_action else (unread, pending_action, list(tasks))
     )
     for bucket in buckets:
         for task in bucket:
@@ -302,13 +329,25 @@ def _serialize_group(scope, tasks, *, include_children=False):
     # Query order is newest first and is retained within every child list.
     representative = tasks[0]
     metadata = _group_metadata(scope, tasks)
-    entry_task = _entry_task(tasks)
+    entry_task = _entry_task(
+        tasks,
+        prefer_action=metadata["group_kind"] == "QUALITY_RECALL",
+    )
     child_items = [_serialize_task(task) for task in tasks]
     entry_item = _serialize_task(entry_task)
     entry_link = _resolved_link(entry_task)
-    unread_count = sum(task.state == "NEW" for task in tasks)
-    action_pending_count = sum(
+    child_unread_count = sum(task.state == "NEW" for task in tasks)
+    child_action_pending_count = sum(
         task.need_action and task.state != "DONE" for task in tasks
+    )
+    is_quality_recall = metadata["group_kind"] == "QUALITY_RECALL"
+    unread_count = (
+        int(bool(child_unread_count)) if is_quality_recall
+        else child_unread_count
+    )
+    action_pending_count = (
+        int(bool(child_action_pending_count)) if is_quality_recall
+        else child_action_pending_count
     )
     completed_count = sum(task.state == "DONE" for task in tasks)
     if completed_count == len(tasks):
@@ -329,6 +368,8 @@ def _serialize_group(scope, tasks, *, include_children=False):
         "child_count": len(tasks),
         "unread_count": unread_count,
         "action_pending_count": action_pending_count,
+        "child_unread_count": child_unread_count,
+        "child_action_pending_count": child_action_pending_count,
         "completed_count": completed_count,
         "state": state,
         "need_action": bool(action_pending_count),
@@ -338,12 +379,12 @@ def _serialize_group(scope, tasks, *, include_children=False):
         # auditable in the group/detail view.
         "title": (
             _task_title(representative)
-            if metadata["is_workorder"]
+            if metadata["is_workorder"] or metadata["group_kind"] == "QUALITY_RECALL"
             else _compose_group_title(tasks)
         ),
         "summary": (
             _task_summary(representative)
-            if metadata["is_workorder"]
+            if metadata["is_workorder"] or metadata["group_kind"] == "QUALITY_RECALL"
             else (
                 f"共{len(tasks)}项任务｜{unread_count}项未读｜"
                 f"{action_pending_count}项待处理"
@@ -403,27 +444,26 @@ def get_task_summary(openid):
     }
     """
 
-    qs = UserTask.objects.filter(
-        to_openid=openid,
-        badge_group="MY"
-    )
-
-    unread_count = qs.filter(
-        state="NEW"
-    ).count()
-
-    action_pending_count = qs.filter(
-        need_action=True
-    ).exclude(
-        state="DONE"
-    ).count()
-
-    # 徽标表示“需要关注”，既包含未读通知，也包含已经打开但尚未完成的
-    # 操作任务。使用 OR 查询保证“未读且待处理”的同一任务只计一次。
-    attention_count = qs.filter(
-        Q(state="NEW") |
-        (Q(need_action=True) & ~Q(state="DONE"))
-    ).count()
+    unread_count = 0
+    action_pending_count = 0
+    attention_count = 0
+    for scope, tasks in _task_groups(openid).items():
+        group_unread = sum(task.state == "NEW" for task in tasks)
+        group_action = sum(
+            task.need_action and task.state != "DONE" for task in tasks
+        )
+        if scope.startswith("quality-recall:campaign:"):
+            unread_count += int(bool(group_unread))
+            action_pending_count += int(bool(group_action))
+            attention_count += int(bool(group_unread or group_action))
+            continue
+        unread_count += group_unread
+        action_pending_count += group_action
+        attention_count += sum(
+            task.state == "NEW"
+            or (task.need_action and task.state != "DONE")
+            for task in tasks
+        )
 
     return {
         "unread_count": unread_count,
@@ -458,14 +498,11 @@ def get_task_list(openid, limit=50):
     ]
 
 
-    unread_count = (
-        UserTask.objects
-        .filter(
-            to_openid=openid,
-            badge_group="MY",
-            state="NEW"
-        )
-        .count()
+    unread_count = sum(
+        int(any(task.state == "NEW" for task in tasks))
+        if scope.startswith("quality-recall:campaign:")
+        else sum(task.state == "NEW" for task in tasks)
+        for scope, tasks in groups.items()
     )
 
 

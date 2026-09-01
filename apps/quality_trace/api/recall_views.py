@@ -32,6 +32,7 @@ from quality_trace.services import (
     acknowledge_customer_recall,
     add_handover_evidence,
     calculate_recall_progress,
+    confirm_recall_inventory_batch,
     complete_recall_campaign,
     confirm_merchant_handover_receipt,
     create_next_recall_transport_leg,
@@ -53,6 +54,10 @@ from common.services.wechat_miniprogram_code import (
     WeChatMiniProgramCodeError,
     generate_unlimited_miniprogram_code,
 )
+
+FACTORY_RECALL_VIEW_ROLES = set(FACTORY_QUALITY_ROLES) | {
+    "factory_sales", "factory_sales_assistant", "factory_logistics",
+}
 
 
 def _user(request):
@@ -130,15 +135,8 @@ def _can_view(row, user):
         identity.organization.organization_type.code == "OWNER"
         and row.campaign.factory_organization_id == identity.organization_id
     ):
-        if identity.role.code in FACTORY_QUALITY_ROLES:
+        if identity.role.code in FACTORY_RECALL_VIEW_ROLES:
             return True
-        if identity.role.code in {
-            "factory_sales", "factory_logistics", "factory_sales_assistant",
-        }:
-            return UserTask.objects.filter(
-                to_openid=str(user.wx_openid or ""),
-                workitem__payload__recall_device_id=row.pk,
-            ).exists()
         return False
     openid = str(user.wx_openid or "")
     if any(
@@ -252,6 +250,27 @@ def _leg(item):
 
 def _device(row, user=None):
     isolation = getattr(row, "isolation_receipt", None)
+    transport_legs = list(row.transport_legs.all())
+    latest_leg = transport_legs[-1] if transport_legs else None
+    if isolation:
+        current_stage = "FACTORY_INVENTORY_POSTED"
+        current_stage_label = "已完成召回专用入库记账"
+    elif (
+        latest_leg
+        and latest_leg.is_factory_destination
+        and latest_leg.status == QualityRecallTransportLeg.Status.RECEIVED
+    ):
+        current_stage = "FACTORY_RECEIVED_PENDING_POSTING"
+        current_stage_label = "厂家已收货，待销售助理入库记账"
+    elif latest_leg and latest_leg.status == QualityRecallTransportLeg.Status.IN_TRANSIT:
+        current_stage = "RETURN_IN_TRANSIT"
+        current_stage_label = f"正在运往{latest_leg.to_organization.name}"
+    elif latest_leg and latest_leg.status == QualityRecallTransportLeg.Status.RECEIVED:
+        current_stage = "UPSTREAM_MERCHANT_RECEIVED"
+        current_stage_label = f"{latest_leg.to_organization.name}已收货，待继续退回"
+    else:
+        current_stage = ""
+        current_stage_label = ""
     return {
         "id": row.pk,
         "device_id": row.device_id,
@@ -261,7 +280,9 @@ def _device(row, user=None):
         "production_batch": row.production_batch_snapshot,
         "responsibility": row.responsibility_snapshot,
         "handover": _handover(row, user=user),
-        "transport_legs": [_leg(item) for item in row.transport_legs.all()],
+        "transport_legs": [_leg(item) for item in transport_legs],
+        "current_stage": current_stage,
+        "current_stage_label": current_stage_label,
         "isolation": ({
             "id": isolation.pk,
             "disposition": isolation.disposition,
@@ -291,6 +312,15 @@ def _campaign(row, include_devices=False, *, device_count=None, scope_label=""):
         "superseded_by_campaign_id": row.superseded_by_id,
         "superseded_at": row.superseded_at.isoformat() if row.superseded_at else "",
         "supersession_reason": row.supersession_reason,
+    }
+    accounted = row.isolation_receipts.count()
+    confirmation = getattr(row, "inventory_batch_confirmation", None)
+    data["inventory_posting"] = {
+        "accounted_device_count": accounted,
+        "campaign_device_count": row.device_count,
+        "all_accounted": accounted == row.device_count,
+        "batch_confirmed": bool(confirmation),
+        "confirmed_at": confirmation.confirmed_at.isoformat() if confirmation else "",
     }
     latest = row.progress_snapshots.order_by("-calculated_at", "-id").first()
     data["progress"] = ({
@@ -367,7 +397,7 @@ def campaigns(request):
         "devices__isolation_receipt",
     )
     if identity.organization.organization_type.code == "OWNER":
-        if identity.role.code not in FACTORY_QUALITY_ROLES:
+        if identity.role.code not in FACTORY_RECALL_VIEW_ROLES:
             return _error("当前岗位无权访问厂家质量追溯数据。")
         rows = rows.filter(factory_organization=identity.organization)
     else:
@@ -425,7 +455,7 @@ def campaign_detail(request, campaign_id):
     factory_view = (
         identity.organization.organization_type.code == "OWNER"
         and campaign.factory_organization_id == identity.organization_id
-        and identity.role.code in FACTORY_QUALITY_ROLES
+        and identity.role.code in FACTORY_RECALL_VIEW_ROLES
     )
     if not factory_view and not visible:
         return _error("当前账号无权查看该召回批次。")
@@ -704,6 +734,17 @@ def transport_isolate(request, leg_id):
         user=user, leg_id=leg_id, disposition=data.get("disposition"),
         isolation_location=data.get("isolation_location"), evidence=data.get("evidence"),
     ).pk}}))
+
+
+@csrf_exempt
+def campaign_inventory_confirm(request, campaign_id):
+    return _post(request, lambda user, data: JsonResponse({
+        "code": 0,
+        "msg": "本批召回设备已全部确认入库记账",
+        "data": {"confirmation_id": confirm_recall_inventory_batch(
+            user=user, campaign_id=campaign_id, note=data.get("note", ""),
+        ).pk},
+    }))
 
 
 @csrf_exempt

@@ -40,7 +40,12 @@ MERCHANT_TASK_ROLES = (
     "merchant_sales",
     "merchant_stock",
 )
-FACTORY_TASK_ROLES = ("factory_admin", "factory_chief_engineer")
+FACTORY_TASK_ROLES = (
+    "factory_chief_engineer",
+    "factory_sales",
+    "factory_sales_assistant",
+    "factory_logistics",
+)
 CUSTOMER_TASK_ROLES = ("customer_owner", "driver")
 
 ACTIVE_TRANSFER_STATES = {
@@ -193,6 +198,7 @@ def _scope(organization):
         "activated_user_devices": {},
         "customer_devices": {},
         "in_transit_devices": {},
+        "campaign_devices": {},
         "factory_inventory": {},
         "manual_trace": {},
         "unassigned_organizations": {},
@@ -330,10 +336,18 @@ def _operation_guides(scope):
         if scope["in_transit_devices"]:
             guides.append("在途设备应停止继续交付，收货后隔离并转入召回退回。")
         return guides
-    return [
-        "请核对无法自动送达的组织或设备位置，并通过质量追溯案件补充协同处置。",
-        "厂家库存召回设备应立即隔离，禁止继续出库、发货、流转或激活。",
+    guides = [
+        "请持续跟踪本召回批次全部设备的用户确认、商家接管、在途运输和返厂入库进度。",
     ]
+    if scope["factory_inventory"]:
+        guides.append(
+            "厂家库存召回设备应立即隔离，禁止继续出库、发货、流转或激活。"
+        )
+    if scope["manual_trace"] or scope["unassigned_organizations"]:
+        guides.append(
+            "请核对无法自动送达的组织或设备位置，并通过质量追溯案件补充协同处置。"
+        )
+    return guides
 
 
 def _finalize_scope(scope):
@@ -343,6 +357,7 @@ def _finalize_scope(scope):
     own_inventory = values(scope["own_inventory"])
     customer_devices = values(scope["customer_devices"])
     in_transit = values(scope["in_transit_devices"])
+    campaign_devices = values(scope["campaign_devices"])
     factory_inventory = values(scope["factory_inventory"])
     manual_trace = values(scope["manual_trace"])
     downstream = []
@@ -366,7 +381,14 @@ def _finalize_scope(scope):
         })
     unassigned = values(scope["unassigned_organizations"])
     all_devices = {}
-    for device in own_inventory + customer_devices + in_transit + factory_inventory + manual_trace:
+    for device in (
+        own_inventory
+        + customer_devices
+        + in_transit
+        + campaign_devices
+        + factory_inventory
+        + manual_trace
+    ):
         all_devices[str(device["recall_device_id"])] = device
     for group in downstream + activated:
         for device in group["devices"]:
@@ -386,6 +408,8 @@ def _finalize_scope(scope):
         "customer_device_count": len(customer_devices),
         "in_transit_devices": in_transit,
         "in_transit_device_count": len(in_transit),
+        "campaign_devices": campaign_devices,
+        "campaign_device_count": len(campaign_devices),
         "factory_inventory": factory_inventory,
         "manual_trace": manual_trace,
         "unassigned_organizations": unassigned,
@@ -403,7 +427,7 @@ def _summary(scope):
             f"下级库存{scope['downstream_inventory_count']}台，"
             f"已激活用户设备{scope['activated_user_device_count']}台。"
         )
-    return f"需协调或隔离{scope['device_count']}台召回设备，请查看任务范围。"
+    return f"本召回批次共{scope['device_count']}台设备，请协同跟踪召回与返厂进度。"
 
 
 def _task_type(scope):
@@ -417,7 +441,7 @@ def _task_type(scope):
 def _publish_scope_workitem(*, campaign, scope, recipients, user):
     uniq_key = f"quality-recall:{campaign.pk}:org:{scope['organization']['id']}"
     link = (
-        "/pages/quality_trace/recall_task_detail/recall_task_detail"
+        "/pages/quality_trace/recall_detail/recall_detail"
         f"?campaign_id={campaign.pk}"
     )
     title = f"召回任务：{campaign.recall_no}（{scope['device_count']}台）"
@@ -439,6 +463,10 @@ def _publish_scope_workitem(*, campaign, scope, recipients, user):
     existing_recipients = set(
         existing.user_tasks.values_list("to_openid", flat=True)
     ) if existing else set()
+    expected_need_action = scope["audience_type"] != "FACTORY"
+    existing_need_action = set(
+        existing.user_tasks.values_list("need_action", flat=True)
+    ) if existing else set()
     unchanged = bool(
         existing
         and existing.title == title
@@ -446,6 +474,10 @@ def _publish_scope_workitem(*, campaign, scope, recipients, user):
         and existing.link == link
         and existing.payload == payload
         and existing_recipients == set(recipient_openids)
+        and existing.action_mode == (
+            "EACH_ACK" if scope["audience_type"] == "FACTORY" else "ANYONE_DO"
+        )
+        and existing_need_action == {expected_need_action}
     )
     if unchanged:
         return existing, False
@@ -459,8 +491,8 @@ def _publish_scope_workitem(*, campaign, scope, recipients, user):
         summary=summary,
         link=link,
         recipients_openids=recipient_openids,
-        need_action=True,
-        action_mode="ANYONE_DO",
+        need_action=expected_need_action,
+        action_mode=("EACH_ACK" if scope["audience_type"] == "FACTORY" else "ANYONE_DO"),
         payload=payload,
         actor_openid=user.wx_openid or "",
         mark_workitem_done_immediately=False,
@@ -516,6 +548,20 @@ def publish_recall_tasks(*, user, campaign_id):
                 recipients,
                 section,
             ),
+        )
+
+    # The factory is the owner of the recall campaign and must always receive
+    # one full-batch coordination task.  This scope is independent from the
+    # device's current holder: a completely resolved customer/merchant chain
+    # must not suppress factory coordination.
+    factory_scope = get_scope(campaign.factory_organization)
+    for row in rows:
+        _add_device(factory_scope, "campaign_devices", _device_payload(row))
+        add_visibility(
+            row,
+            campaign.factory_organization,
+            "campaign_devices",
+            key="factory_coordination",
         )
 
     for row in rows:

@@ -17,6 +17,14 @@ FACTORY_PICKUP_REQUEST_ROLES = {
     "factory_chief_engineer",
     "factory_logistics",
 }
+FACTORY_LOGISTICS_ROLES = {"factory_logistics"}
+FACTORY_INVENTORY_POSTING_ROLES = {"factory_sales_assistant"}
+FACTORY_RECEIPT_AWARENESS_ROLES = {
+    "factory_chief_engineer", "factory_sales", "factory_sales_assistant",
+}
+FACTORY_POSTING_AWARENESS_ROLES = {
+    "factory_chief_engineer", "factory_sales",
+}
 MERCHANT_RECALL_RETURN_ROLES = {
     "merchant_owner",
     "merchant_manager",
@@ -232,4 +240,101 @@ def close_factory_recall_progress(handover, *, user):
         f"quality-recall-device-progress:{handover.recall_device_id}",
         user=user,
         reason="RECALL_DEVICE_FACTORY_ISOLATED",
+    )
+
+
+def publish_factory_transport_tasks(leg, *, user):
+    """At factory arrival, logistics acts and the other factory roles observe."""
+    factory = leg.to_organization
+    base = {
+        "recall_campaign_id": leg.campaign_id,
+        "transport_leg_id": leg.pk,
+        "recall_device_id": leg.recall_device_id,
+        "device_sn": leg.recall_device.sn_snapshot,
+        "stage": "FACTORY_PENDING_RECEIPT",
+    }
+    link = (
+        "/pages/quality_trace/recall_detail/recall_detail"
+        f"?campaign_id={leg.campaign_id}&recall_device_id={leg.recall_device_id}"
+    )
+    logistics = organization_recipients(factory, FACTORY_LOGISTICS_ROLES)
+    if not logistics:
+        raise ValueError("厂家没有有效的厂家物流经理账号。")
+    action = publish_workitem(
+        domain="SYSTEM", type="QUALITY_RECALL_FACTORY_RECEIPT",
+        biz_id=str(leg.campaign_id), biz_ref=f"QualityRecallTransportLeg:{leg.pk}",
+        uniq_key=f"quality-recall-transport:{leg.pk}:receive",
+        title=f"召回设备待厂家收货：{leg.recall_device.sn_snapshot}",
+        summary="请厂家物流经理核对线下到货及凭证，并确认货已收到。",
+        link=link, recipients_openids=logistics, need_action=True,
+        action_mode="ANYONE_DO", payload=base,
+        actor_openid=user.wx_openid or "", mark_workitem_done_immediately=False,
+    )
+    # publish_workitem updates an existing item by uniq_key but deliberately
+    # does not rewrite its type.  Upgrade R13.8.5.4 pre-existing receipt items
+    # so inbox grouping and operational audits use the new factory-only type.
+    if action.type != "QUALITY_RECALL_FACTORY_RECEIPT":
+        action.type = "QUALITY_RECALL_FACTORY_RECEIPT"
+        action.save(update_fields=("type", "updated_at"))
+    action.user_tasks.exclude(to_openid__in=logistics).delete()
+    awareness = organization_recipients(factory, FACTORY_RECEIPT_AWARENESS_ROLES)
+    notice = None
+    if awareness:
+        notice = publish_workitem(
+            domain="SYSTEM", type="QUALITY_RECALL_FACTORY_RECEIPT_NOTICE",
+            biz_id=str(leg.campaign_id), biz_ref=f"QualityRecallTransportLeg:{leg.pk}",
+            uniq_key=f"quality-recall-transport:{leg.pk}:receive-notice",
+            title=f"召回设备正在返厂：{leg.recall_device.sn_snapshot}",
+            summary="厂家物流经理负责线下收货确认；本任务仅用于知晓和跟踪。",
+            link=link, recipients_openids=awareness, need_action=False,
+            action_mode="EACH_ACK", payload=base,
+            actor_openid=user.wx_openid or "", mark_workitem_done_immediately=False,
+        )
+        notice.user_tasks.exclude(to_openid__in=awareness).delete()
+    return action, notice
+
+
+def publish_inventory_posting_task(leg, *, user):
+    recipients = organization_recipients(
+        leg.to_organization, FACTORY_INVENTORY_POSTING_ROLES,
+    )
+    if not recipients:
+        raise ValueError("厂家没有有效的厂家销售助理账号。")
+    item = publish_workitem(
+        domain="SYSTEM", type="QUALITY_RECALL_INVENTORY_POSTING",
+        biz_id=str(leg.campaign_id), biz_ref=f"QualityRecallTransportLeg:{leg.pk}",
+        uniq_key=f"quality-recall-transport:{leg.pk}:inventory-posting",
+        title=f"召回设备待入库记账：{leg.recall_device.sn_snapshot}",
+        summary="厂家物流经理已确认收货。请销售助理登记召回专用隔离位置并确认入库记账。",
+        link=("/pages/quality_trace/recall_detail/recall_detail"
+              f"?campaign_id={leg.campaign_id}&recall_device_id={leg.recall_device_id}"),
+        recipients_openids=recipients, need_action=True, action_mode="ANYONE_DO",
+        payload={"recall_campaign_id": leg.campaign_id, "transport_leg_id": leg.pk,
+                 "recall_device_id": leg.recall_device_id,
+                 "stage": "FACTORY_RECEIVED_PENDING_POSTING"},
+        actor_openid=user.wx_openid or "", mark_workitem_done_immediately=False,
+    )
+    item.user_tasks.exclude(to_openid__in=recipients).delete()
+    return item
+
+
+def publish_inventory_posted_notice(receipt, *, user):
+    recipients = organization_recipients(
+        receipt.factory_organization, FACTORY_POSTING_AWARENESS_ROLES,
+    )
+    if not recipients:
+        return None
+    return publish_workitem(
+        domain="SYSTEM", type="QUALITY_RECALL_INVENTORY_POSTED_NOTICE",
+        biz_id=str(receipt.campaign_id), biz_ref=f"QualityRecallIsolationReceipt:{receipt.pk}",
+        uniq_key=f"quality-recall-device:{receipt.recall_device_id}:inventory-posted-notice",
+        title=f"召回设备已入库记账：{receipt.recall_device.sn_snapshot}",
+        summary=f"销售助理已完成召回隔离入库记账；位置：{receipt.isolation_location}。",
+        link=("/pages/quality_trace/recall_detail/recall_detail"
+              f"?campaign_id={receipt.campaign_id}&recall_device_id={receipt.recall_device_id}"),
+        recipients_openids=recipients, need_action=False, action_mode="EACH_ACK",
+        payload={"recall_campaign_id": receipt.campaign_id,
+                 "recall_device_id": receipt.recall_device_id,
+                 "stage": "FACTORY_INVENTORY_POSTED"},
+        actor_openid=user.wx_openid or "", mark_workitem_done_immediately=False,
     )

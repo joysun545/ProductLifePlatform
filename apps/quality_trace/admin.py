@@ -21,6 +21,7 @@ from .models import (
     QualityRecallHandoverEvidence,
     QualityRecallTransportLeg,
     QualityRecallIsolationReceipt,
+    QualityRecallInventoryBatchConfirmation,
     QualityRecallProgressSnapshot,
     QualityRecallExceptionDecision,
     QualityRecallCloseout,
@@ -70,6 +71,7 @@ admin.site.register(QualityRecallCustomerHandover)
 admin.site.register(QualityRecallHandoverEvidence)
 admin.site.register(QualityRecallTransportLeg)
 admin.site.register(QualityRecallIsolationReceipt)
+admin.site.register(QualityRecallInventoryBatchConfirmation)
 admin.site.register(QualityRecallProgressSnapshot)
 admin.site.register(QualityRecallExceptionDecision)
 admin.site.register(QualityRecallCloseout)

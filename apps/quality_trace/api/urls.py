@@ -37,6 +37,7 @@ urlpatterns = [
     path("recalls/<int:campaign_id>/task-scope/", recall_views.campaign_task_scope, name="recall_task_scope"),
     path("recalls/<int:campaign_id>/progress/", recall_views.campaign_progress, name="recall_progress"),
     path("recalls/<int:campaign_id>/complete/", recall_views.campaign_complete, name="recall_campaign_complete"),
+    path("recalls/<int:campaign_id>/inventory-confirm/", recall_views.campaign_inventory_confirm, name="recall_inventory_confirm"),
     path("recall-devices/<int:recall_device_id>/", recall_views.device_detail, name="recall_device_detail"),
     path("recall-devices/<int:recall_device_id>/initialize-handover/", recall_views.handover_initialize, name="recall_handover_initialize"),
     path("recall-devices/<int:recall_device_id>/next-transport/", recall_views.transport_create, name="recall_transport_create"),

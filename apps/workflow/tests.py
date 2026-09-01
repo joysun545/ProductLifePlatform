@@ -273,6 +273,96 @@ class WorkflowTaskAuthenticationTests(TestCase):
         ).json()["data"]
         self.assertEqual(updated_detail["unread_count"], 2)
 
+    def test_quality_recall_tasks_share_campaign_card_and_open_focused_detail(self):
+        self.task.state = "DONE"
+        self.task.need_action = False
+        self.task.save(update_fields=("state", "need_action", "updated_at"))
+        task_ids = []
+        rows = (
+            ("QUALITY_RECALL_FACTORY_COORDINATION", None, "BATCH_TRACKING"),
+            ("QUALITY_RECALL_FACTORY_RECEIPT", 81, "FACTORY_PENDING_RECEIPT"),
+            ("QUALITY_RECALL_FACTORY_RECEIPT_NOTICE", 81, "RETURN_IN_TRANSIT"),
+        )
+        for index, (task_type, device_id, stage) in enumerate(rows, start=1):
+            item = WorkItem.objects.create(
+                domain="SYSTEM",
+                type=task_type,
+                biz_id="44",
+                title=f"召回更新{index}",
+                summary=f"召回设备节点{index}",
+                link=(
+                    "/pages/quality_trace/recall_task_detail/recall_task_detail"
+                    "?campaign_id=44"
+                ),
+                action_mode="EACH_ACK",
+                uniq_key=f"quality-recall-group-test-{index}",
+                payload={
+                    "recall_campaign_id": 44,
+                    "recall_device_id": device_id,
+                    "stage": stage,
+                    "inbox_group_key": f"legacy-org-key-{index}",
+                    "inbox_group_kind": "QUALITY_RECALL",
+                },
+            )
+            task_ids.append(UserTask.objects.create(
+                workitem=item,
+                to_openid=self.user.wx_openid,
+                state="NEW",
+                need_action=index == 2,
+            ).pk)
+
+        response = self.client.get(
+            self.list_url,
+            HTTP_AUTHORIZATION=self.authorization,
+        )
+        groups = [
+            row for row in response.json()["data"]["items"]
+            if row.get("group_kind") == "QUALITY_RECALL"
+        ]
+        self.assertEqual(len(groups), 1)
+        group = groups[0]
+        self.assertEqual(group["child_count"], 3)
+        self.assertEqual(group["group_label"], "召回任务")
+        self.assertEqual(group["unread_count"], 1)
+        self.assertEqual(group["child_unread_count"], 3)
+        summary = self.client.get(
+            self.summary_url,
+            HTTP_AUTHORIZATION=self.authorization,
+        ).json()["data"]
+        self.assertEqual(summary["unread_count"], 1)
+        self.assertEqual(summary["action_pending_count"], 1)
+        self.assertEqual(summary["attention_count"], 1)
+        self.assertIn(
+            "/pages/quality_trace/recall_detail/recall_detail?campaign_id=44",
+            group["link"],
+        )
+        self.assertIn("recall_device_id=81", group["link"])
+        self.assertIn("focus_stage=", group["link"])
+        self.assertNotIn("recall_task_detail", group["link"])
+        self.assertIn(group["entry_task_id"], task_ids)
+        self.assertEqual(group["entry_task_type"], "QUALITY_RECALL_FACTORY_RECEIPT")
+        self.assertTrue(group["need_action"])
+
+        opened = self.client.post(
+            self.open_url,
+            {"usertask_id": group["entry_task_id"]},
+            HTTP_AUTHORIZATION=self.authorization,
+        )
+        self.assertEqual(opened.status_code, 200)
+        self.assertEqual(
+            UserTask.objects.filter(pk__in=task_ids, need_action=False, state="DONE").count(),
+            2,
+        )
+        action_task = UserTask.objects.get(pk__in=task_ids, need_action=True)
+        self.assertEqual(action_task.state, "READ")
+        summary = self.client.get(
+            self.summary_url,
+            HTTP_AUTHORIZATION=self.authorization,
+        ).json()["data"]
+        self.assertEqual(summary["unread_count"], 0)
+        self.assertEqual(summary["action_pending_count"], 1)
+        self.assertEqual(summary["attention_count"], 1)
+
     def test_task_group_cannot_be_read_by_another_account(self):
         response = self.client.get(
             self.list_url,
