@@ -84,3 +84,6 @@ account_backup_before_invite_v2/
 
 # Private quality-recall evidence
 private_quality_recall/
+
+# Deployment backups
+/backups/

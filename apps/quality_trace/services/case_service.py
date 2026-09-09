@@ -26,6 +26,8 @@ class QualityCaseError(Exception):
 ASSESSOR_ROLES = {"factory_admin", "factory_chief_engineer"}
 CASE_MANAGER_ROLES = {"factory_admin", "factory_chief_engineer"}
 CONTROL_MANAGER_ROLES = {"factory_admin", "factory_chief_engineer"}
+# Recall control is distinct from other quality-case management permissions.
+RECALL_MANAGER_ROLES = {"factory_chief_engineer"}
 MAX_TEMPORARY_HOLD_HOURS = 168
 
 
@@ -525,7 +527,7 @@ def release_formal_hold(*, user, action_id, reason):
 
 @transaction.atomic
 def start_recall(*, user, case_id, reason):
-    identity = _identity(user, CONTROL_MANAGER_ROLES)
+    identity = _identity(user, RECALL_MANAGER_ROLES)
     quality_case = _case_for_control(identity, case_id)
     if quality_case.control_actions.filter(
         action_type=QualityControlAction.ActionType.RECALL,
@@ -553,7 +555,7 @@ def start_recall(*, user, case_id, reason):
 
 @transaction.atomic
 def complete_recall(*, user, action_id, reason):
-    identity = _identity(user, CONTROL_MANAGER_ROLES)
+    identity = _identity(user, RECALL_MANAGER_ROLES)
     action = (
         QualityControlAction.objects.select_for_update()
         .select_related("quality_case__source_alert")
@@ -690,3 +692,4 @@ def serialize_case(row, *, include_devices=False):
             for item in row.affected_devices.order_by("device_id")
         ]
     return data
+

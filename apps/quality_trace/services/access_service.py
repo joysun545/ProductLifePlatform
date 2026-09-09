@@ -8,7 +8,12 @@ class QualityTraceAccessError(Exception):
 FACTORY_ORGANIZATION_TYPE = "OWNER"
 SUPPLIER_ORGANIZATION_TYPE = "SUPPLIER"
 SUPPLIER_ALLOWED_ROLES = {"supplier_owner", "supplier_sales"}
-FACTORY_QUALITY_ROLES = {"factory_admin", "factory_chief_engineer"}
+FACTORY_QUALITY_ROLES = {
+    "factory_admin",
+    "factory_chief_engineer",
+    "factory_matching",
+    "factory_production",
+}
 
 
 def get_quality_trace_identity(user):

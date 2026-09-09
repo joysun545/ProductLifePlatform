@@ -15,7 +15,7 @@ from quality_trace.models import (
     QualityTraceEvent,
 )
 
-from .case_service import CONTROL_MANAGER_ROLES, QualityCaseError, _identity, start_recall
+from .case_service import RECALL_MANAGER_ROLES, QualityCaseError, _identity, start_recall
 
 
 class QualityRecallError(QualityCaseError):
@@ -175,7 +175,7 @@ def create_recall_campaign(
     *, user, case_id, title, reason, risk_level, remedy_type, deadline,
     device_ids=None,
 ):
-    identity = _identity(user, CONTROL_MANAGER_ROLES)
+    identity = _identity(user, RECALL_MANAGER_ROLES)
     quality_case = (
         BatchQualityCase.objects.select_for_update()
         .filter(pk=case_id, factory_organization=identity.organization)
@@ -340,7 +340,7 @@ def ensure_recall_campaign(*, user, case_id, reason=""):
     This is the only business-facing recall entry.  Campaign construction and
     legacy control-action backfill stay invisible to the operator.
     """
-    identity = _identity(user, CONTROL_MANAGER_ROLES)
+    identity = _identity(user, RECALL_MANAGER_ROLES)
     quality_case = (
         BatchQualityCase.objects.select_for_update()
         .filter(pk=case_id, factory_organization=identity.organization)
@@ -423,7 +423,7 @@ def ensure_recall_campaign(*, user, case_id, reason=""):
 
 @transaction.atomic
 def launch_recall_campaign(*, user, campaign_id):
-    identity = _identity(user, CONTROL_MANAGER_ROLES)
+    identity = _identity(user, RECALL_MANAGER_ROLES)
     campaign = (
         QualityRecallCampaign.objects.select_for_update()
         .select_related("quality_case")
@@ -474,7 +474,7 @@ def launch_recall_campaign(*, user, campaign_id):
 
 @transaction.atomic
 def transition_recall_device(*, user, recall_device_id, to_status, reason="", payload=None):
-    identity = _identity(user, CONTROL_MANAGER_ROLES)
+    identity = _identity(user, RECALL_MANAGER_ROLES)
     row = (
         QualityRecallDevice.objects.select_for_update()
         .select_related("campaign")

@@ -9,7 +9,6 @@ from workflow.services.workflow_service import publish_workitem
 
 FACTORY_RECALL_COLLABORATION_ROLES = {
     "factory_chief_engineer",
-    "factory_sales",
     "factory_sales_assistant",
     "factory_logistics",
 }
@@ -20,10 +19,10 @@ FACTORY_PICKUP_REQUEST_ROLES = {
 FACTORY_LOGISTICS_ROLES = {"factory_logistics"}
 FACTORY_INVENTORY_POSTING_ROLES = {"factory_sales_assistant"}
 FACTORY_RECEIPT_AWARENESS_ROLES = {
-    "factory_chief_engineer", "factory_sales", "factory_sales_assistant",
+    "factory_chief_engineer", "factory_sales_assistant",
 }
 FACTORY_POSTING_AWARENESS_ROLES = {
-    "factory_chief_engineer", "factory_sales",
+    "factory_chief_engineer",
 }
 MERCHANT_RECALL_RETURN_ROLES = {
     "merchant_owner",
@@ -32,6 +31,17 @@ MERCHANT_RECALL_RETURN_ROLES = {
     "merchant_sales",
     "merchant_stock",
 }
+
+
+def factory_row_recipients(organization, roles, row):
+    from .recall_access_service import RecallViewer
+    recipients = organization_recipients(organization, roles)
+    for identity in UserOrganization.objects.select_related("user").filter(
+            organization=organization, role__code="factory_sales", is_active=True,
+            role__is_active=True, user__is_active=True):
+        if identity.user.wx_openid and RecallViewer(identity.user).allows(row):
+            recipients.append(identity.user.wx_openid)
+    return list(dict.fromkeys(recipients))
 
 
 def organization_recipients(organization, roles):
@@ -208,7 +218,7 @@ def close_merchant_return_task(handover, organization, *, user):
 
 def publish_factory_recall_progress(handover, *, user, stage, summary):
     factory = handover.campaign.factory_organization
-    recipients = organization_recipients(factory, FACTORY_RECALL_COLLABORATION_ROLES)
+    recipients = factory_row_recipients(factory, FACTORY_RECALL_COLLABORATION_ROLES, handover.recall_device)
     if not recipients:
         return None
     return publish_workitem(
@@ -277,7 +287,7 @@ def publish_factory_transport_tasks(leg, *, user):
         action.type = "QUALITY_RECALL_FACTORY_RECEIPT"
         action.save(update_fields=("type", "updated_at"))
     action.user_tasks.exclude(to_openid__in=logistics).delete()
-    awareness = organization_recipients(factory, FACTORY_RECEIPT_AWARENESS_ROLES)
+    awareness = factory_row_recipients(factory, FACTORY_RECEIPT_AWARENESS_ROLES, leg.recall_device)
     notice = None
     if awareness:
         notice = publish_workitem(
@@ -319,8 +329,8 @@ def publish_inventory_posting_task(leg, *, user):
 
 
 def publish_inventory_posted_notice(receipt, *, user):
-    recipients = organization_recipients(
-        receipt.factory_organization, FACTORY_POSTING_AWARENESS_ROLES,
+    recipients = factory_row_recipients(
+        receipt.factory_organization, FACTORY_POSTING_AWARENESS_ROLES, receipt.recall_device,
     )
     if not recipients:
         return None

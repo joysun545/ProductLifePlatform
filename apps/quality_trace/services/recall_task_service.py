@@ -29,7 +29,7 @@ from quality_trace.models import (
 from workflow.models import UserTask, WorkItem
 from workflow.services.workflow_service import publish_workitem
 
-from .case_service import CONTROL_MANAGER_ROLES, _identity
+from .case_service import RECALL_MANAGER_ROLES, _identity
 from .recall_service import QualityRecallError
 
 
@@ -42,7 +42,6 @@ MERCHANT_TASK_ROLES = (
 )
 FACTORY_TASK_ROLES = (
     "factory_chief_engineer",
-    "factory_sales",
     "factory_sales_assistant",
     "factory_logistics",
 )
@@ -323,11 +322,11 @@ def _operation_guides(scope):
         guides = []
         if scope["own_inventory"]:
             guides.append(
-                "本组织库存设备仍使用设备原二维码扫码，系统将自动识别为召回退货并进入逐级退回。"
+                "请在召回详情页核对本组织库存清单，一次填写本批物流及凭证后批量退回上级。"
             )
         if scope["downstream_inventory"]:
             guides.append(
-                "请按清单联系对应下级商家，督促其隔离库存并通过召回退货逐级上返。"
+                "请按清单联系下级商家隔离库存；下级发出后，在召回详情页按到货批次接收并批量继续上返。"
             )
         if scope["activated_user_devices"]:
             guides.append(
@@ -503,7 +502,7 @@ def _publish_scope_workitem(*, campaign, scope, recipients, user):
 @transaction.atomic
 def publish_recall_tasks(*, user, campaign_id):
     """Synchronize one chain-scoped task per organization for an active recall."""
-    identity = _identity(user, CONTROL_MANAGER_ROLES)
+    identity = _identity(user, RECALL_MANAGER_ROLES)
     campaign = (
         QualityRecallCampaign.objects.select_for_update()
         .select_related("quality_case", "factory_organization__organization_type")
@@ -745,74 +744,74 @@ def publish_recall_tasks(*, user, campaign_id):
                 "delivery_policy": "AUTOMATIC_CHAIN_SCOPED",
             },
         )
+    from .recall_notice_service import sync_recall_policy_notices
+    sync_recall_policy_notices(campaign=campaign, actor=user)
     return published
 
 
 def get_recall_task_scope(*, user, campaign_id):
-    """Return only the signed-in recipient organization's frozen task scope."""
-    identity = get_active_identity(user)
-    if not identity:
-        raise QualityRecallError("当前账号没有有效组织身份。")
-    uniq_key = f"quality-recall:{campaign_id}:org:{identity.organization_id}"
-    workitem = (
-        WorkItem.objects.filter(
-            uniq_key=uniq_key,
-            user_tasks__to_openid=user.wx_openid or "",
-        )
-        .distinct()
-        .first()
-    )
-    if not workitem:
-        raise QualityRecallError("当前账号没有该召回批次的链路任务。")
-    campaign = QualityRecallCampaign.objects.filter(pk=campaign_id).first()
-    if not campaign:
-        raise QualityRecallError("召回批次不存在。")
-    payload = workitem.payload if isinstance(workitem.payload, dict) else {}
-    scope = deepcopy(payload.get("scope", {}))
-    title = workitem.title
-    summary = workitem.summary
-    if identity.role.code == "driver" and scope.get("audience_type") == "CUSTOMER":
-        vehicle_ids = DriverVehicleBinding.objects.filter(
-            driver=user,
-            is_active=True,
-        ).values_list("vehicle_id", flat=True)
-        allowed_device_ids = set(
-            CustomerDeviceBinding.objects.filter(
-                customer_organization_id=identity.organization_id,
-                vehicle_id__in=vehicle_ids,
-                status=CustomerDeviceBinding.Status.ACTIVE,
-            ).values_list("device_id", flat=True)
-        )
-        visible = [
-            item for item in scope.get("customer_devices", [])
-            if item.get("device_id") in allowed_device_ids
-        ]
-        scope["devices"] = visible
-        scope["customer_devices"] = visible
-        scope["device_count"] = len(visible)
-        scope["customer_device_count"] = len(visible)
-        title = f"召回任务：{campaign.recall_no}（{len(visible)}台）"
-        summary = f"您关联车辆有{len(visible)}台已激活设备被召回，请与用户负责人协同选择交付方式。"
+    """Legacy task-detail contract, projected from current authorized rows."""
+    from .recall_access_service import RecallViewer, recall_campaign_queryset, visible_rows
+    from .recall_display_service import campaign_context, campaign_text
+    viewer = RecallViewer(user)
+    campaign = recall_campaign_queryset().filter(pk=campaign_id).first()
+    if not viewer.valid or not campaign:
+        raise QualityRecallError("召回批次不存在或当前账号无权查看。")
+    rows = visible_rows(campaign, viewer)
+    if not rows and not viewer.metadata_access(campaign):
+        raise QualityRecallError("当前岗位无权查看该召回链路。")
+    context = campaign_context(campaign, rows, viewer)
+    workitem = WorkItem.objects.filter(
+        uniq_key=f"quality-recall:{campaign_id}:org:{viewer.organization_id}",
+    ).first()
+    scope = _finalize_scope(_scope(viewer.identity.organization))
+    if workitem and not viewer.observer(campaign):
+        payload = workitem.payload if isinstance(workitem.payload, dict) else {}
+        allowed = {row.pk for row in rows}
+        def trim(value):
+            if isinstance(value, list):
+                return [trim(item) for item in value if not isinstance(item, dict)
+                        or not item.get("recall_device_id") or item["recall_device_id"] in allowed]
+            if isinstance(value, dict):
+                result = {key: trim(item) for key, item in value.items()}
+                if isinstance(result.get("devices"), list):
+                    result["device_count"] = len(result["devices"])
+                return result
+            return value
+        scope.update(trim(deepcopy(payload.get("scope", {}))))
+    scope["devices"] = [_device_payload(row) for row in rows]
+    scope["device_count"] = context["device_count"]
+    for section, count_key in (
+        ("own_inventory", "own_inventory_count"), ("customer_devices", "customer_device_count"),
+        ("in_transit_devices", "in_transit_device_count"), ("campaign_devices", "campaign_device_count"),
+    ):
+        scope[count_key] = len(scope.get(section, []))
+    for section, count_key in (("downstream_inventory", "downstream_inventory_count"),
+                               ("activated_user_devices", "activated_user_device_count")):
+        scope[section] = [item for item in scope.get(section, []) if item.get("devices")]
+        scope[count_key] = sum(len(item["devices"]) for item in scope[section])
+    if not viewer.full_campaign(campaign):
+        scope["unassigned_organizations"] = []
+        scope["campaign_devices"] = []
+        scope["campaign_device_count"] = 0
+    scope["operation_guides"] = [item["text"] for item in context["stages"]]
+    title = (f"召回知晓：{campaign.recall_no}" if viewer.observer(campaign)
+             else f"召回任务：{campaign.recall_no}（{len(rows)}台）")
     return {
-        "workitem_id": workitem.pk,
-        "task_type": workitem.type,
-        "title": title,
-        "summary": summary,
-        "campaign": {
-            "id": campaign.pk,
-            "recall_no": campaign.recall_no,
-            "title": campaign.title,
-            "reason": campaign.reason,
-            "deadline": campaign.deadline.isoformat(),
-            "status": campaign.status,
-        },
+        "workitem_id": workitem.pk if workitem else None,
+        "task_type": "QUALITY_RECALL_OBSERVER_NOTICE" if viewer.observer(campaign) else "QUALITY_RECALL_SCOPE",
+        "title": title, "summary": context["scope_summary"] + "。" + context["stage_summary"],
+        "campaign": {"id": campaign.pk, "recall_no": campaign.recall_no,
+                     **campaign_text(campaign, viewer), "deadline": campaign.deadline.isoformat(),
+                     "status": campaign.status},
         "scope": scope,
     }
 
 
-def complete_recall_scope_tasks_if_ready(*, recall_device, user, audience_type):
+def complete_recall_scope_tasks_if_ready(*, recall_device, user, audience_type, workitem_ids=None):
     """Close a consolidated task only after every device in its scope advances."""
-    workitem_ids = (recall_device.responsibility_snapshot or {}).get("workitem_ids") or []
+    if workitem_ids is None:
+        workitem_ids = (recall_device.responsibility_snapshot or {}).get("workitem_ids") or []
     type_by_audience = {
         "CUSTOMER": "QUALITY_RECALL_CUSTOMER_NOTICE",
         "MERCHANT": "QUALITY_RECALL_MERCHANT_SCOPE",

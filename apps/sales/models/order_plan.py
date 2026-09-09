@@ -304,9 +304,19 @@ class OrderPlanReturnInventoryAllocation(models.Model):
     )
     inventory_item = models.OneToOneField(
         "lifecycle.FactoryReturnInventoryItem",
+        null=True,
+        blank=True,
         on_delete=models.PROTECT,
         related_name="order_allocation",
         verbose_name="退货待流转库存设备",
+    )
+    recall_inventory = models.OneToOneField(
+        "quality_trace.QualityRecallReusableInventory",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="order_allocation",
+        verbose_name="召回维修待流转库存设备",
     )
     source_device = models.ForeignKey(
         "lifecycle.Device",
@@ -393,6 +403,15 @@ class OrderPlanReturnInventoryAllocation(models.Model):
             models.Index(
                 fields=("source_device", "status"),
                 name="sales_reissue_dev_st_idx",
+            ),
+        )
+        constraints = (
+            models.CheckConstraint(
+                condition=(
+                    Q(inventory_item__isnull=False, recall_inventory__isnull=True)
+                    | Q(inventory_item__isnull=True, recall_inventory__isnull=False)
+                ),
+                name="sales_reissue_exactly_one_source",
             ),
         )
 

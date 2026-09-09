@@ -10,7 +10,7 @@ from quality_trace.models import (
 )
 from workflow.models import UserTask, WorkItem
 
-from .case_service import CONTROL_MANAGER_ROLES, _identity
+from .case_service import RECALL_MANAGER_ROLES, _identity
 from .recall_service import LIVE_CAMPAIGN_STATUSES, QualityRecallError
 
 
@@ -71,7 +71,7 @@ def consolidate_recall_campaigns(
     redundant campaign may be superseded only when all of its devices are
     already present in the canonical campaign.
     """
-    identity = _identity(user, CONTROL_MANAGER_ROLES)
+    identity = _identity(user, RECALL_MANAGER_ROLES)
     reason = str(reason or "").strip()
     if not reason:
         raise QualityRecallError("请填写重叠召回批次合并理由。")

@@ -4,7 +4,7 @@ from django.core.management.base import BaseCommand, CommandError
 
 from account.models import UserOrganization
 from quality_trace.models import QualityRecallCampaign
-from quality_trace.services.case_service import CONTROL_MANAGER_ROLES
+from quality_trace.services.case_service import RECALL_MANAGER_ROLES
 from quality_trace.services.recall_task_service import publish_recall_tasks
 from quality_trace.services.recall_handover_service import sync_recall_delivery_collaboration
 
@@ -21,7 +21,7 @@ def _actor_for_campaign(campaign):
     ]
     identities = UserOrganization.objects.select_related("user", "role").filter(
         organization_id=campaign.factory_organization_id,
-        role__code__in=CONTROL_MANAGER_ROLES,
+        role__code__in=RECALL_MANAGER_ROLES,
         role__is_active=True,
         user__is_active=True,
         is_active=True,

@@ -70,6 +70,14 @@ from .recall_progress_service import (
     decide_unreachable_device,
     evaluate_active_recall_progress,
 )
+from .recall_disposition_service import (
+    complete_recall_disposition_production,
+    complete_recall_device_disposition,
+    confirm_recall_disposition_matching,
+    confirm_recall_disposition_supplier,
+    start_recall_post_disposition,
+    sync_recall_disposition_execution_tasks,
+)
 
 __all__ = [
     "QualityTraceAccessError",
@@ -135,4 +143,10 @@ __all__ = [
     "evaluate_active_recall_progress",
     "decide_unreachable_device",
     "complete_recall_campaign",
+    "start_recall_post_disposition",
+    "complete_recall_disposition_production",
+    "confirm_recall_disposition_matching",
+    "confirm_recall_disposition_supplier",
+    "complete_recall_device_disposition",
+    "sync_recall_disposition_execution_tasks",
 ]

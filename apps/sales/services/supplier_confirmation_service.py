@@ -197,7 +197,7 @@ def _save_material_batches(*, plan, supplier, user, payload, scope, raw_rows):
         bom_item = bom_items.get(bom_item_id)
         if (
             not bom_item
-            or int(source["supplier_id"]) != supplier.pk
+            or int(source.get("supplier_id") or bom_item.supplier_id) != supplier.pk
             or bom_item.supplier_id != supplier.pk
             or bom_item.material_id != int(source["material_id"])
             or bom_item.material_spec_id != int(source["material_spec_id"])
@@ -255,13 +255,21 @@ def _save_material_batches(*, plan, supplier, user, payload, scope, raw_rows):
 
 
 def _all_supplier_lines_have_batches(plan, supplier_id, payload):
-    required_keys = {
-        (int(row["order_plan_item_id"]), int(row["bom_item_id"]))
-        for row in payload.get("materials", [])
+    candidate_rows = [
+        row for row in payload.get("materials", [])
         if isinstance(row, dict)
-        and int(row.get("supplier_id") or 0) == supplier_id
         and row.get("order_plan_item_id")
         and row.get("bom_item_id")
+    ]
+    bom_supplier_ids = dict(
+        BOMItem.objects.filter(
+            pk__in={int(row["bom_item_id"]) for row in candidate_rows},
+        ).values_list("pk", "supplier_id")
+    )
+    required_keys = {
+        (int(row["order_plan_item_id"]), int(row["bom_item_id"]))
+        for row in candidate_rows
+        if bom_supplier_ids.get(int(row["bom_item_id"])) == supplier_id
     }
     if not required_keys:
         return False

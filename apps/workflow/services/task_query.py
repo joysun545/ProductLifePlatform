@@ -409,9 +409,75 @@ def _serialize_group(scope, tasks, *, include_children=False):
             else entry_link
         ),
     }
+    if is_quality_recall:
+        _recall_display(group, entry_task)
+    context = getattr(entry_task, "_recall_scope_context", None)
+    if context:
+        campaign, viewer, rows = context
+        if not viewer.full_campaign(campaign):
+            # Older notifications can embed a whole-batch count in any display
+            # field. Project every exposed child, not only the parent title.
+            group["latest_summary"] = group["summary"]
+            allowed = {row.pk for row in rows}
+            for child, real_task in zip(child_items, tasks):
+                payload = real_task.workitem.payload if isinstance(real_task.workitem.payload, dict) else {}
+                focus = payload.get("recall_device_id")
+                row = next((row for row in rows if str(row.pk) == str(focus)), None)
+                child["title"] = (f"召回节点记录：{row.sn_snapshot}" if row else group["title"])
+                child["summary"] = group["summary"]
+                child["link"] = (f"/pages/quality_trace/recall_detail/recall_detail?campaign_id={campaign.pk}"
+                                 if rows or viewer.observer(campaign) else "")
+                if row:
+                    child["link"] += f"&recall_device_id={row.pk}"
+                child["done_reason"] = ""  # Historical free text may quote other device counts.
+            group["done_reason"] = ""
+            group["link"] = (f"/pages/quality_trace/recall_detail/recall_detail?campaign_id={campaign.pk}"
+                             if rows or viewer.observer(campaign) else "")
+            focus = (entry_task.workitem.payload or {}).get("recall_device_id")
+            if str(focus) in {str(value) for value in allowed}:
+                group["link"] += f"&recall_device_id={focus}"
     if include_children:
         group["items"] = child_items
     return group
+
+
+def _recall_display(group, task):
+    # A DONE inbox row closes one stage, not the entire recall. Read current
+    # chain facts without rewriting historical tasks, recipients or badges.
+    from account.models import User
+    from quality_trace.services.recall_access_service import (
+        RecallViewer, recall_campaign_queryset, visible_rows,
+    )
+    from quality_trace.services.recall_display_service import campaign_context
+    context_data = getattr(task, "_recall_scope_context", None)
+    if not context_data:
+        return
+    campaign, viewer, rows = context_data
+    if not rows and not viewer.metadata_access(campaign):
+        group.update(title=f"召回历史任务：{campaign.recall_no}",
+                     summary="当前组织或岗位不在此召回链路，请核对登录身份。",
+                     display_state="历史任务", link="", need_action=False, action_pending_count=0)
+        return
+    context = campaign_context(campaign, rows, viewer)
+    group["title"] = (f"召回知晓：{campaign.recall_no}" if viewer.observer(campaign)
+                      else f"召回任务：{campaign.recall_no}（{len(rows)}台）")
+    group["summary"] = context["scope_summary"] + "。" + context["stage_summary"]
+    group["recall_context"] = context
+    if viewer.observer(campaign):
+        group.update(display_state="待知晓" if group["unread_count"] else "已知晓",
+                     need_action=False, action_pending_count=0, child_action_pending_count=0)
+        return
+    if campaign.status == "COMPLETED":
+        state = "召回已完成"
+    elif campaign.status != "ACTIVE":
+        state = campaign.get_status_display()
+    elif context["actionable_device_count"]:
+        state = "本节点可办理"
+    elif group["action_pending_count"]:
+        state = "本阶段待处理"
+    else:
+        state = "跟踪中"
+    group["display_state"] = state
 
 
 def _task_groups(openid):
@@ -425,6 +491,24 @@ def _task_groups(openid):
     for task in tasks:
         scope = _task_group_scope(task)
         grouped.setdefault(scope, []).append(task)
+    from account.models import User
+    from quality_trace.services.recall_access_service import RecallViewer, recall_campaign_queryset, visible_rows
+    user = User.objects.filter(wx_openid=openid, is_active=True).first()
+    if user:
+        viewer = RecallViewer(user)
+        for scope, group_tasks in grouped.items():
+            if not scope.startswith("quality-recall:campaign:"):
+                continue
+            campaign_id = str(group_tasks[0].workitem.biz_id or "")
+            campaign = (recall_campaign_queryset().filter(pk=int(campaign_id)).first()
+                        if campaign_id.isdigit() else None)
+            if not campaign:
+                continue
+            rows = visible_rows(campaign, viewer)
+            for task in group_tasks:
+                task._recall_scope_context = (campaign, viewer, rows)
+                if viewer.observer(campaign) or (not rows and not viewer.full_campaign(campaign)):
+                    task.need_action = False  # Query projection, not a database mutation.
     return grouped
 
 

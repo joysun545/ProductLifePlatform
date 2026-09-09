@@ -9,6 +9,7 @@ from lifecycle.models import (
     QRCode,
 )
 from lifecycle.services.qrcode_service import QRCodeService
+from quality_trace.models import QualityRecallReusableInventory
 from sales.models import (
     OrderPlan,
     OrderPlanItem,
@@ -35,6 +36,19 @@ def _available_queryset(*, factory_organization, product_model):
             stock_status=FactoryReturnInventoryItem.StockStatus.PENDING_REISSUE,
         )
         .order_by("classified_at", "id")
+    )
+
+
+def _available_recall_queryset(*, factory_organization, product_model):
+    return (
+        QualityRecallReusableInventory.objects.select_related(
+            "device", "source_bom", "source_production_batch",
+        ).filter(
+            factory_organization=factory_organization,
+            source_product_model=product_model,
+            disposition__campaign__status="COMPLETED",
+            stock_status=QualityRecallReusableInventory.Status.PENDING_REISSUE,
+        ).order_by("available_at", "id")
     )
 
 
@@ -87,7 +101,10 @@ def get_return_inventory_options(
             factory_organization=factory_organization,
             product_model=product_model,
         )
-    )
+    ) + list(_available_recall_queryset(
+        factory_organization=factory_organization,
+        product_model=product_model,
+    ))
     return {
         "product_model_id": product_model.pk,
         "product_model_name": product_model.name,
@@ -100,16 +117,16 @@ def get_return_inventory_options(
     }
 
 
-def _source_order_snapshots(inventory_item):
+def _source_order_snapshots(source_production_batch):
     source_item = (
         OrderPlanItem.objects.filter(
-            order_batch_code=inventory_item.source_production_batch.batch_no
+            order_batch_code=source_production_batch.batch_no
         )
         .only("order_batch_code", "lifecycle_code")
         .first()
     )
     return (
-        source_item.order_batch_code if source_item else inventory_item.source_production_batch.batch_no,
+        source_item.order_batch_code if source_item else source_production_batch.batch_no,
         source_item.lifecycle_code if source_item else "",
     )
 
@@ -120,18 +137,27 @@ def reserve_return_inventory(*, order_plan_item, requested_quantity, actor):
     requested_quantity = max(0, int(requested_quantity or 0))
     if requested_quantity == 0:
         return []
-    candidates = list(
+    return_candidates = list(
         _available_queryset(
             factory_organization=order_plan_item.plan.factory_organization,
             product_model=order_plan_item.product_model,
         )
         .select_for_update()[:requested_quantity]
     )
+    remaining = requested_quantity - len(return_candidates)
+    recall_candidates = list(
+        _available_recall_queryset(
+            factory_organization=order_plan_item.plan.factory_organization,
+            product_model=order_plan_item.product_model,
+        ).select_for_update()[:remaining]
+    ) if remaining > 0 else []
     allocations = []
-    for inventory_item in candidates:
+    for inventory_item in return_candidates:
         device = inventory_item.transfer_item.device
         qrcode = QRCode.objects.filter(device=device).first()
-        source_order_batch, source_lifecycle = _source_order_snapshots(inventory_item)
+        source_order_batch, source_lifecycle = _source_order_snapshots(
+            inventory_item.source_production_batch
+        )
         allocations.append(
             OrderPlanReturnInventoryAllocation.objects.create(
                 order_plan_item=order_plan_item,
@@ -149,6 +175,27 @@ def reserve_return_inventory(*, order_plan_item, requested_quantity, actor):
             FactoryReturnInventoryItem.StockStatus.RESERVED_FOR_ORDER
         )
         inventory_item.save(update_fields=("stock_status", "updated_at"))
+    for recall_inventory in recall_candidates:
+        device = recall_inventory.device
+        qrcode = QRCode.objects.filter(device=device).first()
+        source_order_batch, source_lifecycle = _source_order_snapshots(
+            recall_inventory.source_production_batch
+        )
+        allocations.append(OrderPlanReturnInventoryAllocation.objects.create(
+            order_plan_item=order_plan_item,
+            recall_inventory=recall_inventory,
+            source_device=device,
+            source_bom=recall_inventory.source_bom,
+            source_order_batch_snapshot=source_order_batch,
+            source_lifecycle_snapshot=source_lifecycle,
+            source_qr_code_snapshot=qrcode.code if qrcode else "",
+            original_qr=qrcode,
+            reserved_by=actor,
+        ))
+        recall_inventory.stock_status = (
+            QualityRecallReusableInventory.Status.RESERVED_FOR_ORDER
+        )
+        recall_inventory.save(update_fields=("stock_status", "updated_at"))
     return allocations
 
 
@@ -185,6 +232,9 @@ def mark_return_inventory_ready_to_ship(*, plan):
         status=OrderPlanReturnInventoryAllocation.Status.RESERVED,
     )
     inventory_ids = list(allocations.values_list("inventory_item_id", flat=True))
+    recall_inventory_ids = list(
+        allocations.values_list("recall_inventory_id", flat=True)
+    )
     allocations.update(
         status=OrderPlanReturnInventoryAllocation.Status.READY_TO_SHIP,
         ready_to_ship_at=now,
@@ -193,6 +243,13 @@ def mark_return_inventory_ready_to_ship(*, plan):
     if inventory_ids:
         FactoryReturnInventoryItem.objects.filter(pk__in=inventory_ids).update(
             stock_status=FactoryReturnInventoryItem.StockStatus.READY_TO_SHIP,
+            updated_at=now,
+        )
+    if recall_inventory_ids:
+        QualityRecallReusableInventory.objects.filter(
+            pk__in=recall_inventory_ids,
+        ).update(
+            stock_status=QualityRecallReusableInventory.Status.READY_TO_SHIP,
             updated_at=now,
         )
 
@@ -244,7 +301,11 @@ def ensure_reissue_qrcodes(*, order_plan_item, actor):
             from_organization=order_plan_item.plan.factory_organization,
             to_organization=order_plan_item.plan.factory_organization,
             data={
-                "subtype": "RETURN_STOCK_REISSUE_QR",
+                "subtype": (
+                    "RECALL_REPAIR_REISSUE_QR"
+                    if allocation.recall_inventory_id
+                    else "RETURN_STOCK_REISSUE_QR"
+                ),
                 "order_plan_id": order_plan_item.plan_id,
                 "order_plan_item_id": order_plan_item.pk,
                 "allocation_id": allocation.pk,
@@ -268,6 +329,9 @@ def mark_return_inventory_reissued(*, plan):
         status=OrderPlanReturnInventoryAllocation.Status.READY_TO_SHIP,
     )
     inventory_ids = list(allocations.values_list("inventory_item_id", flat=True))
+    recall_inventory_ids = list(
+        allocations.values_list("recall_inventory_id", flat=True)
+    )
     allocations.update(
         status=OrderPlanReturnInventoryAllocation.Status.REISSUED,
         reissued_at=now,
@@ -276,5 +340,12 @@ def mark_return_inventory_reissued(*, plan):
     if inventory_ids:
         FactoryReturnInventoryItem.objects.filter(pk__in=inventory_ids).update(
             stock_status=FactoryReturnInventoryItem.StockStatus.REISSUED,
+            updated_at=now,
+        )
+    if recall_inventory_ids:
+        QualityRecallReusableInventory.objects.filter(
+            pk__in=recall_inventory_ids,
+        ).update(
+            stock_status=QualityRecallReusableInventory.Status.REISSUED,
             updated_at=now,
         )

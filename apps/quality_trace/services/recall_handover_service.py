@@ -19,7 +19,7 @@ from quality_trace.models import (
 from workflow.models import UserTask, WorkItem
 from workflow.services.workflow_service import publish_workitem
 
-from .case_service import CONTROL_MANAGER_ROLES, _identity
+from .case_service import RECALL_MANAGER_ROLES, _identity
 from .recall_collaboration_service import (
     FACTORY_PICKUP_REQUEST_ROLES,
     FACTORY_RECALL_COLLABORATION_ROLES,
@@ -59,7 +59,14 @@ def _active_identity(user):
     return identity
 
 
+def _ensure_active_handover(handover):
+    if (handover.campaign.status != QualityRecallCampaign.Status.ACTIVE
+            or handover.status == QualityRecallCustomerHandover.Status.CANCELLED):
+        raise QualityRecallError("当前召回或交接已结束，不能继续办理交付。")
+
+
 def _customer_identity(user, handover):
+    _ensure_active_handover(handover)
     identity = _active_identity(user)
     if (
         identity.organization_id != handover.customer_organization_id
@@ -221,7 +228,7 @@ def ensure_customer_handover(*, recall_device, actor, actor_role="SYSTEM"):
 @transaction.atomic
 def initialize_customer_handover(*, user, recall_device_id):
     """Compatibility wrapper; normal operation creates the row automatically."""
-    identity = _identity(user, CONTROL_MANAGER_ROLES)
+    identity = _identity(user, RECALL_MANAGER_ROLES)
     row = (
         QualityRecallDevice.objects.select_for_update()
         .select_related("campaign__quality_case")
@@ -476,6 +483,7 @@ def accept_factory_pickup_request(
         )
         .get(pk=handover_id)
     )
+    _ensure_active_handover(handover)
     if (
         identity.organization_id != handover.campaign.factory_organization_id
         or identity.role.code not in FACTORY_PICKUP_ROLES
@@ -699,6 +707,7 @@ def accept_merchant_handover_by_token(*, user, token, receipt_note=""):
     )
     if not handover:
         raise QualityRecallError("临时召回流转码无效。")
+    _ensure_active_handover(handover)
     if (
         identity.organization_id != handover.merchant_organization_id
         or identity.role.code not in MERCHANT_HANDOVER_ROLES
@@ -826,6 +835,7 @@ def schedule_customer_pickup(*, user, handover_id, pickup_scheduled_at, pickup_a
     handover = QualityRecallCustomerHandover.objects.select_for_update().select_related(
         "campaign__quality_case",
     ).get(pk=handover_id)
+    _ensure_active_handover(handover)
     if (
         identity.organization_id != handover.merchant_organization_id
         or identity.role.code not in MERCHANT_HANDOVER_ROLES
@@ -853,10 +863,12 @@ def schedule_customer_pickup(*, user, handover_id, pickup_scheduled_at, pickup_a
 def add_handover_evidence(*, user, handover_id, kind, client_request_id, evidence):
     identity = _active_identity(user)
     handover = QualityRecallCustomerHandover.objects.select_for_update().get(pk=handover_id)
-    if identity.organization_id not in {
-        handover.customer_organization_id, handover.merchant_organization_id,
-    }:
-        raise QualityRecallError("当前账号不属于该召回交接链。")
+    _ensure_active_handover(handover)
+    if identity.organization_id == handover.customer_organization_id:
+        _customer_identity(user, handover)
+    elif (identity.organization_id != handover.merchant_organization_id
+          or identity.role.code not in MERCHANT_HANDOVER_ROLES):
+        raise QualityRecallError("当前岗位无权提交该召回交接凭证。")
     data = dict(evidence or {})
     storage_key = str(data.get("storage_key") or "").strip()
     request_id = str(client_request_id or "").strip()
@@ -887,6 +899,7 @@ def confirm_merchant_handover_receipt(*, user, handover_id, receipt_note):
         .select_related("campaign__quality_case", "recall_device")
         .get(pk=handover_id)
     )
+    _ensure_active_handover(handover)
     if (
         identity.organization_id != handover.merchant_organization_id
         or identity.role.code not in MERCHANT_HANDOVER_ROLES

@@ -32,10 +32,14 @@ def _open_quality_recall_group(task, now):
             state__in=("NEW", "READ"),
         )
     )
+    from account.models import User
+    from quality_trace.services.recall_access_service import RecallViewer, FACTORY_RECALL_OBSERVER_ROLES
+    user = User.objects.filter(wx_openid=task.to_openid, is_active=True).first()
+    observer = bool(user and RecallViewer(user).role in FACTORY_RECALL_OBSERVER_ROLES)
     for grouped_task in tasks:
         if grouped_task.state == "NEW":
             grouped_task.read_at = now
-        if grouped_task.need_action:
+        if grouped_task.need_action and not observer:
             grouped_task.state = "READ"
         else:
             grouped_task.state = "DONE"

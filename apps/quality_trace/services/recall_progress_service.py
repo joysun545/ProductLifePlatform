@@ -14,13 +14,14 @@ from quality_trace.models import (
     QualityRecallExceptionDecision,
     QualityRecallInventoryBatchConfirmation,
     QualityRecallProgressSnapshot,
+    QualityRecallPostDisposition,
     QualityRecallTransportLeg,
     QualityTraceEvent,
 )
 from workflow.models import UserTask, WorkItem
 from workflow.services.workflow_service import publish_workitem
 
-from .case_service import CONTROL_MANAGER_ROLES, _identity, complete_recall
+from .case_service import RECALL_MANAGER_ROLES, _identity, complete_recall
 from .recall_service import QualityRecallError
 
 
@@ -89,7 +90,7 @@ def _factory_recipients(campaign):
     return list(
         UserOrganization.objects.filter(
             organization=campaign.factory_organization,
-            role__code__in=("factory_admin", "factory_chief_engineer"),
+            role__code__in=("factory_chief_engineer",),
             role__is_active=True, user__is_active=True, is_active=True,
         ).exclude(user__wx_openid__isnull=True).exclude(user__wx_openid="")
         .values_list("user__wx_openid", flat=True)
@@ -147,7 +148,7 @@ def calculate_recall_progress(*, campaign_id, at=None, source="MANUAL"):
     incomplete_ids = [row.device_id for row in rows if not _is_completion_eligible(row)]
     is_overdue = bool(
         campaign.status == QualityRecallCampaign.Status.ACTIVE
-        and campaign.deadline < at.date()
+        and campaign.deadline < (timezone.localdate(at) if timezone.is_aware(at) else at.date())
         and incomplete_ids
     )
     overdue_ids = list(incomplete_ids) if is_overdue else []
@@ -198,7 +199,7 @@ def evaluate_active_recall_progress(*, at=None, source="SCHEDULED"):
 
 @transaction.atomic
 def decide_unreachable_device(*, user, recall_device_id, decision, reason):
-    identity = _identity(user, CONTROL_MANAGER_ROLES)
+    identity = _identity(user, RECALL_MANAGER_ROLES)
     row = (
         QualityRecallDevice.objects.select_for_update()
         .select_related("campaign__quality_case__source_alert")
@@ -290,7 +291,7 @@ def _complete_campaign_workitems(campaign, user):
 
 @transaction.atomic
 def complete_recall_campaign(*, user, campaign_id, reason):
-    identity = _identity(user, CONTROL_MANAGER_ROLES)
+    identity = _identity(user, RECALL_MANAGER_ROLES)
     if identity.role.code != "factory_chief_engineer":
         raise QualityRecallError("只有厂家总工程师可以确认召回任务完成。")
     campaign = (
@@ -321,6 +322,17 @@ def complete_recall_campaign(*, user, campaign_id, reason):
         raise QualityRecallError(
             "厂家销售助理尚未确认本批设备全部入库记账。"
         )
+    dispositions = QualityRecallPostDisposition.objects.filter(campaign=campaign)
+    physical_device_count = campaign.devices.exclude(
+        status__in=(QualityRecallDevice.Status.UNREACHABLE,
+                    QualityRecallDevice.Status.EXEMPTED),
+    ).count()
+    if dispositions.count() != physical_device_count:
+        raise QualityRecallError("尚未启动本批已返厂设备的召回后处置。")
+    if dispositions.exclude(
+        status=QualityRecallPostDisposition.Status.COMPLETED,
+    ).exists():
+        raise QualityRecallError("本批仍有设备未完成召回后处置。")
     recall_action = complete_recall(
         user=user, action_id=campaign.control_action_id, reason=reason,
     )

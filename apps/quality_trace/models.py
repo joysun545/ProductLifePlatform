@@ -730,6 +730,169 @@ class QualityRecallDevice(models.Model):
         return super().save(*args, **kwargs)
 
 
+class QualityRecallPostDisposition(models.Model):
+    """Per-device execution record after a recalled batch has been posted in."""
+
+    class Method(models.TextChoices):
+        DISASSEMBLE = "DISASSEMBLE", "拆机"
+        REPAIR_NO_PARTS = "REPAIR_NO_PARTS", "不换件维修"
+        REPAIR_WITH_PARTS = "REPAIR_WITH_PARTS", "换件维修"
+
+    class Status(models.TextChoices):
+        PENDING = "PENDING", "待处置"
+        IN_PROGRESS = "IN_PROGRESS", "处置中"
+        COMPLETED = "COMPLETED", "处置完成"
+
+    class StockResult(models.TextChoices):
+        PENDING = "PENDING", "待处理"
+        DISASSEMBLED = "DISASSEMBLED", "已拆机并结束生命周期"
+        READY_FOR_OUTBOUND = "READY_FOR_OUTBOUND", "已维修，入库待流转"
+
+    class ExecutionStage(models.TextChoices):
+        WAITING_PRODUCTION = "WAITING_PRODUCTION", "待生产经理处理"
+        WAITING_SUPPLIER = "WAITING_SUPPLIER", "待供应商负责人确认"
+        WAITING_MATCHING = "WAITING_MATCHING", "待配套经理确认"
+        WAITING_PRODUCTION_COMPLETION = (
+            "WAITING_PRODUCTION_COMPLETION", "待生产经理完成维修"
+        )
+        WAITING_CHIEF_CONFIRMATION = (
+            "WAITING_CHIEF_CONFIRMATION", "待总工程师确认"
+        )
+        COMPLETED = "COMPLETED", "处置完成"
+
+    campaign = models.ForeignKey(
+        QualityRecallCampaign, on_delete=models.PROTECT,
+        related_name="post_dispositions",
+    )
+    recall_device = models.OneToOneField(
+        QualityRecallDevice, on_delete=models.PROTECT,
+        related_name="post_disposition",
+    )
+    method = models.CharField(max_length=24, choices=Method.choices)
+    status = models.CharField(
+        max_length=16, choices=Status.choices, default=Status.PENDING, db_index=True,
+    )
+    stock_result = models.CharField(
+        max_length=24, choices=StockResult.choices, default=StockResult.PENDING,
+    )
+    decision_note = models.TextField(blank=True, default="")
+    completion_note = models.TextField(blank=True, default="")
+    replacement_parts = models.JSONField(default=list, blank=True)
+    execution_stage = models.CharField(
+        max_length=40, choices=ExecutionStage.choices,
+        default=ExecutionStage.WAITING_PRODUCTION, db_index=True,
+    )
+    execution_payload = models.JSONField(default=dict, blank=True)
+    production_completed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="production_completed_recall_dispositions",
+    )
+    production_completed_at = models.DateTimeField(null=True, blank=True)
+    matching_completed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="matching_completed_recall_dispositions",
+    )
+    matching_completed_at = models.DateTimeField(null=True, blank=True)
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT,
+        related_name="decided_recall_post_dispositions",
+    )
+    decided_at = models.DateTimeField()
+    completed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="completed_recall_post_dispositions",
+    )
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ("campaign_id", "recall_device_id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("campaign", "recall_device"),
+                name="qtrace_unique_recall_post_disposition",
+            ),
+        ]
+
+
+class QualityRecallDispositionSupplierConfirmation(models.Model):
+    disposition = models.ForeignKey(
+        QualityRecallPostDisposition, on_delete=models.PROTECT,
+        related_name="supplier_confirmations",
+    )
+    supplier = models.ForeignKey(
+        "account.Organization", on_delete=models.PROTECT,
+        related_name="recall_disposition_confirmations",
+    )
+    supplier_name_snapshot = models.CharField(max_length=255)
+    confirmed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="confirmed_recall_disposition_suppliers",
+    )
+    confirmed_at = models.DateTimeField(null=True, blank=True)
+    note = models.CharField(max_length=1000, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("disposition_id", "supplier_id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("disposition", "supplier"),
+                name="qtrace_unique_disposition_supplier",
+            ),
+        ]
+
+
+class QualityRecallReusableInventory(models.Model):
+    """A repaired recalled device that may be reserved by a future order."""
+
+    class Status(models.TextChoices):
+        PENDING_REISSUE = "PENDING_REISSUE", "入库待流转"
+        RESERVED_FOR_ORDER = "RESERVED_FOR_ORDER", "已被订单占用"
+        READY_TO_SHIP = "READY_TO_SHIP", "待重新发货"
+        REISSUED = "REISSUED", "已重新流转"
+
+    disposition = models.OneToOneField(
+        QualityRecallPostDisposition, on_delete=models.PROTECT,
+        related_name="reusable_inventory",
+    )
+    factory_organization = models.ForeignKey(
+        "account.Organization", on_delete=models.PROTECT,
+        related_name="quality_recall_reusable_inventory",
+    )
+    device = models.ForeignKey(
+        "lifecycle.Device", on_delete=models.PROTECT,
+        related_name="quality_recall_reusable_inventory_rows",
+    )
+    source_product_model = models.ForeignKey(
+        "product.ProductModel", on_delete=models.PROTECT,
+        related_name="quality_recall_reusable_inventory",
+    )
+    source_production_batch = models.ForeignKey(
+        "manufacturing.ProductionBatch", on_delete=models.PROTECT,
+        related_name="quality_recall_reusable_inventory",
+    )
+    source_bom = models.ForeignKey(
+        "product.BOM", on_delete=models.PROTECT,
+        related_name="quality_recall_reusable_inventory",
+    )
+    stock_status = models.CharField(
+        max_length=32, choices=Status.choices,
+        default=Status.PENDING_REISSUE, db_index=True,
+    )
+    available_at = models.DateTimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("available_at", "id")
+        indexes = [
+            models.Index(
+                fields=("factory_organization", "source_product_model", "stock_status"),
+                name="qtrace_reuse_available_idx",
+            ),
+        ]
+
+
 class QualityRecallDeviceEvent(models.Model):
     campaign = models.ForeignKey(
         QualityRecallCampaign, on_delete=models.PROTECT, related_name="device_events",
@@ -1001,6 +1164,44 @@ class QualityRecallTransportLeg(TimeStampedModel):
             models.CheckConstraint(
                 condition=~Q(from_organization=models.F("to_organization")),
                 name="qtrace_transport_orgs_differ",
+            ),
+        ]
+
+
+class QualityRecallBatchOperation(TimeStampedModel):
+    """One submitted batch action, with a stable retry key and per-device result."""
+
+    class Action(models.TextChoices):
+        DISPATCH = "DISPATCH", "批量退回"
+        RECEIVE = "RECEIVE", "批量接收"
+        ISOLATE = "ISOLATE", "批量隔离入账"
+
+    campaign = models.ForeignKey(
+        QualityRecallCampaign, on_delete=models.PROTECT, related_name="batch_operations",
+    )
+    organization = models.ForeignKey(
+        "account.Organization", on_delete=models.PROTECT,
+        related_name="recall_batch_operations",
+    )
+    action = models.CharField(max_length=16, choices=Action.choices)
+    client_request_id = models.CharField(max_length=64)
+    request_fingerprint = models.CharField(max_length=64)
+    request_payload = models.JSONField(default=dict)
+    recall_device_ids = models.JSONField(default=list)
+    result_payload = models.JSONField(default=dict)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT,
+        related_name="recall_batch_operations",
+    )
+    actor_role_snapshot = models.CharField(max_length=64)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ("-created_at", "-id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("campaign", "organization", "client_request_id"),
+                name="qtrace_batch_request_unique",
             ),
         ]
 
