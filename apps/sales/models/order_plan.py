@@ -7,6 +7,11 @@ from django.utils import timezone
 class OrderPlan(models.Model):
     """厂家销售经理提交的一张多型号订单计划主单。"""
 
+    class FlowVersion(models.TextChoices):
+        """The active development branch has a single stock-aware order flow."""
+
+        MATERIAL_STOCK_V2 = "MATERIAL_STOCK_V2", "物料库存订单流程"
+
     class Status(models.TextChoices):
         MATCHING_PENDING = "MATCHING_PENDING", "待物料配套"
         MATCHING_COMPLETED = "MATCHING_COMPLETED", "配套完成"
@@ -79,6 +84,13 @@ class OrderPlan(models.Model):
         default=Status.MATCHING_PENDING,
         db_index=True,
         verbose_name="计划状态",
+    )
+    flow_version = models.CharField(
+        max_length=32,
+        choices=FlowVersion.choices,
+        default=FlowVersion.MATERIAL_STOCK_V2,
+        db_index=True,
+        verbose_name="订单流程版本",
     )
     submitted_at = models.DateTimeField(
         default=timezone.now,
@@ -318,6 +330,14 @@ class OrderPlanReturnInventoryAllocation(models.Model):
         related_name="order_allocation",
         verbose_name="召回维修待流转库存设备",
     )
+    finished_inventory_item = models.OneToOneField(
+        "sales.FactoryFinishedGoodsInventoryItem",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="order_allocation",
+        verbose_name="厂家成品库存设备",
+    )
     source_device = models.ForeignKey(
         "lifecycle.Device",
         on_delete=models.PROTECT,
@@ -408,8 +428,21 @@ class OrderPlanReturnInventoryAllocation(models.Model):
         constraints = (
             models.CheckConstraint(
                 condition=(
-                    Q(inventory_item__isnull=False, recall_inventory__isnull=True)
-                    | Q(inventory_item__isnull=True, recall_inventory__isnull=False)
+                    Q(
+                        inventory_item__isnull=False,
+                        recall_inventory__isnull=True,
+                        finished_inventory_item__isnull=True,
+                    )
+                    | Q(
+                        inventory_item__isnull=True,
+                        recall_inventory__isnull=False,
+                        finished_inventory_item__isnull=True,
+                    )
+                    | Q(
+                        inventory_item__isnull=True,
+                        recall_inventory__isnull=True,
+                        finished_inventory_item__isnull=False,
+                    )
                 ),
                 name="sales_reissue_exactly_one_source",
             ),

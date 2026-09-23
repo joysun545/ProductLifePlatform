@@ -30,6 +30,8 @@ from .goods_transfer import GoodsTransfer, GoodsTransferItem
 from .goods_transfer_settlement import (
     GoodsTransferLogisticsDocument,
     GoodsTransferPayment,
+    GoodsTransferPaymentAllocation,
+    GoodsTransferReceivableAccount,
     GoodsTransferSettlement,
 )
 
@@ -88,6 +90,10 @@ __all__ = [
     "GoodsTransferLogisticsDocument",
 
     "GoodsTransferPayment",
+
+    "GoodsTransferPaymentAllocation",
+
+    "GoodsTransferReceivableAccount",
 
     "GoodsTransferAccountCase",
 

@@ -1,4 +1,4 @@
-from django.urls import path
+from django.urls import include, path
 
 from . import views
 
@@ -7,69 +7,30 @@ app_name = "sales"
 
 
 urlpatterns = [
-    path(
-        "order-plans/",
-        views.order_plan_list,
-        name="order_plan_list",
-    ),
-    path(
-        "order-plans/options/",
-        views.order_plan_options,
-        name="order_plan_options",
-    ),
-    path(
-        "order-plans/reissue-options/",
-        views.order_plan_reissue_options,
-        name="order_plan_reissue_options",
-    ),
-    path(
-        "direct-merchants/configure/",
-        views.configure_merchant_channel,
-        name="configure_merchant_channel",
-    ),
-    path(
-        "order-plans/create/",
-        views.create_plan,
-        name="create_order_plan",
-    ),
-    path(
-        "order-plans/<int:plan_id>/matching/",
-        views.order_plan_matching_detail,
-        name="order_plan_matching_detail",
-    ),
-    path(
-        "order-plans/<int:plan_id>/matching/items/<int:item_id>/boms/<int:bom_id>/",
-        views.order_plan_item_bom_detail,
-        name="order_plan_item_bom_detail",
-    ),
-    path(
-        "order-plans/<int:plan_id>/matching/confirm/",
-        views.confirm_plan_matching,
-        name="confirm_order_plan_matching",
-    ),
-    path(
-        "order-plans/<int:plan_id>/supplier-confirm/",
-        views.confirm_supplier_materials,
-        name="confirm_supplier_materials",
-    ),
-    path(
-        "order-plans/<int:plan_id>/delivery-confirm/",
-        views.order_plan_delivery,
-        name="order_plan_delivery",
-    ),
-    path("order-plans/<int:plan_id>/production-confirm/", views.order_plan_production, name="order_plan_production"),
-    path("order-plans/<int:plan_id>/shipment-authorization/", views.shipment_authorization, name="shipment_authorization"),
-    path("order-plans/<int:plan_id>/stock-outbound/", views.stock_outbound_detail, name="stock_outbound_detail"),
-    path("order-plans/<int:plan_id>/merchant-receipt/", views.merchant_receipt, name="merchant_receipt"),
-    path("order-plans/<int:plan_id>/accounting-confirm/", views.accounting_confirm, name="accounting_confirm"),
-    path("order-plans/<int:plan_id>/finance/", views.order_finance_detail, name="order_finance_detail"),
-    path("order-plans/<int:plan_id>/finance/statement/", views.order_finance_statement, name="order_finance_statement"),
-    path("order-plans/<int:plan_id>/finance/statement-image/", views.order_finance_statement_image, name="order_finance_statement_image"),
-    path("order-plans/<int:plan_id>/finance/payments/", views.order_finance_payments, name="order_finance_payments"),
-    path("order-plans/<int:plan_id>/finance/payments/<int:payment_id>/confirm/", views.order_finance_payment_confirm, name="order_finance_payment_confirm"),
-    path("order-plans/<int:plan_id>/finance/payments/<int:payment_id>/voucher-image/", views.order_finance_voucher_image, name="order_finance_voucher_image"),
-    path("order-plans/<int:plan_id>/logistics/", views.order_logistics_detail, name="order_logistics_detail"),
-    path("order-plans/<int:plan_id>/logistics/documents/", views.order_logistics_documents, name="order_logistics_documents"),
-    path("order-plans/<int:plan_id>/logistics/documents/<int:document_id>/file/", views.order_logistics_document_file, name="order_logistics_document_file"),
-    path("order-plans/<int:plan_id>/items/<int:item_id>/lifecycle-qrcode/", views.lifecycle_qrcode, name="lifecycle_qrcode"),
+    path("order-plans/", views.order_plan_list, name="order_plan_list"),
+    path("order-plans/options/", views.order_plan_options, name="order_plan_options"),
+    path("order-plans/reissue-options/", views.order_plan_reissue_options, name="order_plan_reissue_options"),
+    path("direct-merchants/configure/", views.configure_merchant_channel, name="configure_merchant_channel"),
+    path("order-plans/material-flow/options/", views.material_flow_options, name="material_flow_options"),
+    path("order-plans/material-flow/bom-detail/", views.material_flow_bom_detail, name="material_flow_bom_detail"),
+    path("order-plans/material-flow/", views.create_material_flow_plan, name="create_material_flow_plan"),
+    path("order-plans/<int:plan_id>/material-flow/detail/", views.material_flow_detail, name="material_flow_detail"),
+    path("order-plans/<int:plan_id>/material-flow/warehouse-review/", views.material_flow_warehouse_review, name="material_flow_warehouse_review"),
+    path("order-plans/<int:plan_id>/material-flow/supplier-confirm/", views.material_flow_supplier_confirm, name="material_flow_supplier_confirm"),
+    path("order-plans/<int:plan_id>/material-flow/order-delivery-receipt/", views.material_flow_order_delivery_receipt, name="material_flow_order_delivery_receipt"),
+    path("order-plans/<int:plan_id>/material-flow/material-ready/", views.material_flow_material_ready, name="material_flow_material_ready"),
+    path("order-plans/<int:plan_id>/material-flow/production-confirm/", views.material_flow_production_confirm, name="material_flow_production_confirm"),
+    path("order-plans/<int:plan_id>/material-flow/shipment-create/", views.material_flow_shipment_create, name="material_flow_shipment_create"),
+    path("order-plans/<int:plan_id>/material-flow/shipment-authorize/", views.material_flow_shipment_authorize, name="material_flow_shipment_authorize"),
+    path("order-plans/<int:plan_id>/material-flow/shipment-qrcode-print/", views.material_flow_shipment_qrcode_print, name="material_flow_shipment_qrcode_print"),
+    path("order-plans/<int:plan_id>/material-flow/shipment-logistics-confirm/", views.material_flow_shipment_logistics_confirm, name="material_flow_shipment_logistics_confirm"),
+    path("order-plans/<int:plan_id>/material-flow/shipment-logistics-batch-confirm/", views.material_flow_shipments_logistics_confirm, name="material_flow_shipments_logistics_confirm"),
+    path("order-plans/<int:plan_id>/material-flow/shipment-logistics-document/", views.material_flow_shipment_logistics_document, name="material_flow_shipment_logistics_document"),
+    path("order-plans/<int:plan_id>/material-flow/shipment-logistics-documents/<int:document_id>/file/", views.material_flow_shipment_logistics_document_file, name="material_flow_shipment_logistics_document_file"),
+    path("order-plans/<int:plan_id>/material-flow/shipment-outbound/", views.material_flow_shipment_outbound, name="material_flow_shipment_outbound"),
+    path("order-plans/<int:plan_id>/material-flow/shipment-receipt/", views.material_flow_shipment_receipt, name="material_flow_shipment_receipt"),
+    path("order-plans/<int:plan_id>/material-flow/accounting-confirm/", views.material_flow_accounting_confirm, name="material_flow_accounting_confirm"),
+    path("order-plans/<int:plan_id>/material-flow/cancel/", views.material_flow_cancel, name="material_flow_cancel"),
 ]
+
+urlpatterns += [path("", include("sales.api.finance_urls"))]

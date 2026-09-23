@@ -10,6 +10,64 @@ class TaskActionError(Exception):
     """任务不存在或当前账号无权操作。"""
 
 
+def _open_goods_transfer_group(task, now):
+    """Acknowledge this account's transfer updates, preserving domain actions.
+
+    Reuse the list's canonical scope, including historical references. An old
+    completed entry can still open newly published updates to the same card.
+    No other account, transfer or WorkItem is completed by opening this card.
+    """
+    if not task.workitem.type.startswith("GOODS_TRANSFER_"):
+        return None
+
+    from .task_query import _task_groups, _serialize_group
+
+    match = next((
+        (scope, children) for scope, children in _task_groups(task.to_openid).items()
+        if scope.startswith("goods-transfer:")
+        and any(child.pk == task.pk for child in children)
+    ), None)
+    if match is None:
+        return None
+    scope, children = match
+    child_ids = [child.pk for child in children]
+    pending = (
+        UserTask.objects.select_for_update().select_related("workitem")
+        .filter(pk__in=child_ids, to_openid=task.to_openid,
+                badge_group="MY", state__in=("NEW", "READ"))
+        .order_by("pk")
+    )
+    for child in pending:
+        if child.state == "NEW":
+            child.read_at = now
+        if child.need_action:
+            child.state = "READ"
+        else:
+            child.state = "DONE"
+            child.done_at = now
+            child.done_reason = "GOODS_TRANSFER_GROUP_OPENED"
+        child.cursor_time = child.workitem.last_activity_at
+        child.save(update_fields=[
+            "state", "read_at", "done_at", "done_reason",
+            "cursor_time", "updated_at",
+        ])
+
+    # Resolve the remaining operation after acknowledgement. The client must
+    # not follow an obsolete notice link from a list fetched before this open.
+    refreshed = next(
+        members for key, members in _task_groups(task.to_openid).items() if key == scope
+    )
+    card = _serialize_group(scope, refreshed)
+    task.refresh_from_db(fields=("state",))
+    return {
+        "state": task.state,
+        "group_id": card["group_id"],
+        "group_kind": card["group_kind"],
+        "entry_task_id": card["entry_task_id"],
+        "link": card["link"],
+    }
+
+
 def _open_quality_recall_group(task, now):
     """Acknowledge one account's whole recall-campaign inbox projection.
 
@@ -120,13 +178,16 @@ def open_task(openid, usertask_id):
         raise TaskActionError("任务不存在或无权操作") from exc
 
 
+    now = timezone.now()
+    goods_result = _open_goods_transfer_group(task, now)
+    if goods_result is not None:
+        return goods_result
+
     if task.state == "DONE":
         return {
             "state": task.state
         }
 
-
-    now = timezone.now()
 
     if _open_quality_recall_group(task, now):
         task.refresh_from_db(fields=("state",))

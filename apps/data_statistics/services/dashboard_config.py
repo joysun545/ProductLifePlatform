@@ -10,6 +10,7 @@ ROLE_MODULES = {
     "factory_matching": ("MATERIAL", "AFTERSALES", "QUALITY"),
     "factory_purchase": ("MATERIAL", "AFTERSALES"),
     "factory_stock": ("FLOW", "QUALITY"),
+    "factory_material_stock": ("MATERIAL",),
     "factory_logistics": ("FLOW", "QUALITY"),
     "factory_aftersales": ("AFTERSALES", "MATERIAL", "QUALITY"),
     "merchant_owner": ("FLOW", "AFTERSALES", "QUALITY"),

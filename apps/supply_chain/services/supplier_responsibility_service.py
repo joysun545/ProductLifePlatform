@@ -1,7 +1,4 @@
-from collections import defaultdict
-
 from django.db import transaction
-from django.db.models import Q
 from django.utils import timezone
 
 from account.models import UserOrganization
@@ -69,9 +66,9 @@ def _supplied_materials(supplier):
         Material.objects.filter(
             specs__suppliers__supplier=supplier,
         )
-        .select_related("product_category")
+        .prefetch_related("product_categories")
         .distinct()
-        .order_by("product_category__code", "code", "id")
+        .order_by("code", "id")
     )
 
 
@@ -79,7 +76,6 @@ def _responsibility_assignments(supplier):
     return SupplierSalesResponsibility.objects.select_related(
         "sales_identity",
         "sales_identity__user",
-        "product_category",
         "material",
     ).filter(
         supplier=supplier,
@@ -91,10 +87,8 @@ def _responsibility_assignments(supplier):
     )
 
 
-def get_responsibility_options(*, user):
-    owner_identity = get_supplier_identity(user, ("supplier_owner",))
-    supplier = owner_identity.organization
-    sales_identities = list(
+def _supplier_sales_identities(supplier):
+    return list(
         _active_identity_queryset()
         .filter(
             organization=supplier,
@@ -102,32 +96,35 @@ def get_responsibility_options(*, user):
         )
         .order_by("user__wx_nickname", "user__username", "id")
     )
-    materials = list(_supplied_materials(supplier))
-    categories = {}
-    for material in materials:
-        if material.product_category_id:
-            categories[material.product_category_id] = material.product_category
 
-    assignments = list(_responsibility_assignments(supplier))
-    assignment_by_category = {
-        item.product_category_id: item
-        for item in assignments
-        if item.scope_type == SupplierResponsibilityScope.CATEGORY
-    }
+
+def get_responsibility_options(*, user):
+    owner_identity = get_supplier_identity(user, ("supplier_owner",))
+    supplier = owner_identity.organization
+    sales_identities = _supplier_sales_identities(supplier)
+    materials = list(_supplied_materials(supplier))
     assignment_by_material = {
         item.material_id: item
-        for item in assignments
+        for item in _responsibility_assignments(supplier)
         if item.scope_type == SupplierResponsibilityScope.MATERIAL
     }
-    manager_assignments = defaultdict(list)
-    for item in assignments:
-        manager_assignments[item.sales_identity_id].append(item)
+
+    if not sales_identities:
+        assignment_mode = "OWNER_ONLY"
+        rule_message = "当前组织仅有供应商负责人账号，负责人负责全部物料。"
+    elif len(sales_identities) == 1:
+        assignment_mode = "SINGLE_SALES_DEFAULT_ALL"
+        rule_message = "当前组织只有一名供应商销售经理，默认负责全部物料，无需逐项分配。"
+    else:
+        assignment_mode = "MULTI_SALES_BY_MATERIAL"
+        rule_message = "当前组织有多名供应商销售经理，请按物料类型指定唯一负责销售经理。"
 
     managers = []
     for identity in sales_identities:
-        own_assignments = manager_assignments.get(identity.pk, [])
-        scope_types = {item.scope_type for item in own_assignments}
-        scope_type = next(iter(scope_types)) if len(scope_types) == 1 else ""
+        own_assignments = [
+            item for item in assignment_by_material.values()
+            if item.sales_identity_id == identity.pk
+        ]
         managers.append(
             {
                 "identity_id": identity.pk,
@@ -138,15 +135,10 @@ def get_responsibility_options(*, user):
                     or identity.user.username
                 ),
                 "phone": identity.user.phone or "",
-                "scope_type": scope_type,
-                "target_ids": [
-                    (
-                        item.product_category_id
-                        if item.scope_type == SupplierResponsibilityScope.CATEGORY
-                        else item.material_id
-                    )
-                    for item in own_assignments
-                ],
+                "default_all_materials": (
+                    assignment_mode == "SINGLE_SALES_DEFAULT_ALL"
+                ),
+                "target_ids": [item.material_id for item in own_assignments],
                 "assignment_count": len(own_assignments),
             }
         )
@@ -163,35 +155,29 @@ def get_responsibility_options(*, user):
             ),
         }
 
+    def category_data(material):
+        categories = list(material.product_categories.all())
+        return {
+            "category_ids": [category.pk for category in categories],
+            "category_names": [category.name for category in categories],
+        }
+
     return {
         "supplier": {
             "id": supplier.pk,
             "name": supplier.name,
         },
-        "precedence_rule": "具体物料责任优先于品类责任",
+        "assignment_mode": assignment_mode,
+        "rule_message": rule_message,
         "sales_managers": managers,
-        "categories": [
-            {
-                "id": category.pk,
-                "code": category.code,
-                "name": category.name,
-                "assigned_manager": assigned_manager(
-                    assignment_by_category.get(category.pk)
-                ),
-            }
-            for category in sorted(categories.values(), key=lambda value: value.code)
-        ],
         "materials": [
             {
                 "id": material.pk,
                 "code": material.code,
                 "name": material.name,
-                "category_id": material.product_category_id,
-                "category_name": (
-                    material.product_category.name
-                    if material.product_category_id
-                    else "未分类"
-                ),
+                "category_id": (category_data(material)["category_ids"] or [None])[0],
+                "category_name": "、".join(category_data(material)["category_names"]) or "未分类",
+                **category_data(material),
                 "assigned_manager": assigned_manager(
                     assignment_by_material.get(material.pk)
                 ),
@@ -354,45 +340,27 @@ def assign_supplier_sales_responsibilities(
         raise SupplierResponsibilityError("所选销售经理不属于当前供应商组织。")
 
     scope_type = str(scope_type or "").strip().upper()
-    if scope_type not in {
-        SupplierResponsibilityScope.CATEGORY,
-        SupplierResponsibilityScope.MATERIAL,
-    }:
-        raise SupplierResponsibilityError("请选择按品类或按物料分配。")
+    if scope_type != SupplierResponsibilityScope.MATERIAL:
+        raise SupplierResponsibilityError("供应商销售责任只能按物料类型分配。")
+    if len(_supplier_sales_identities(supplier)) < 2:
+        raise SupplierResponsibilityError("仅有一名供应商销售经理时默认负责全部物料，无需手工分配。")
     target_ids = _normalize_target_ids(target_ids)
 
     supplied_materials = list(_supplied_materials(supplier))
     supplied_material_ids = {item.pk for item in supplied_materials}
-    supplied_category_ids = {
-        item.product_category_id
-        for item in supplied_materials
-        if item.product_category_id
-    }
-    allowed_ids = (
-        supplied_category_ids
-        if scope_type == SupplierResponsibilityScope.CATEGORY
-        else supplied_material_ids
-    )
-    if not set(target_ids).issubset(allowed_ids):
-        raise SupplierResponsibilityError("只能分配当前组织实际供应的品类或物料。")
+    if not set(target_ids).issubset(supplied_material_ids):
+        raise SupplierResponsibilityError("只能分配当前组织实际供应的物料。")
 
     SupplierSalesResponsibility.objects.select_for_update().filter(
         supplier=supplier,
         sales_identity=sales_identity,
     ).delete()
 
-    target_filter = {
-        (
-            "product_category_id__in"
-            if scope_type == SupplierResponsibilityScope.CATEGORY
-            else "material_id__in"
-        ): target_ids
-    }
     if target_ids:
         SupplierSalesResponsibility.objects.select_for_update().filter(
             supplier=supplier,
-            scope_type=scope_type,
-            **target_filter,
+            scope_type=SupplierResponsibilityScope.MATERIAL,
+            material_id__in=target_ids,
         ).delete()
 
     rows = []
@@ -400,18 +368,9 @@ def assign_supplier_sales_responsibilities(
         row = SupplierSalesResponsibility(
             supplier=supplier,
             sales_identity=sales_identity,
-            scope_type=scope_type,
+            scope_type=SupplierResponsibilityScope.MATERIAL,
             assigned_by=user,
-            product_category_id=(
-                target_id
-                if scope_type == SupplierResponsibilityScope.CATEGORY
-                else None
-            ),
-            material_id=(
-                target_id
-                if scope_type == SupplierResponsibilityScope.MATERIAL
-                else None
-            ),
+            material_id=target_id,
         )
         row.full_clean()
         rows.append(row)
@@ -422,27 +381,24 @@ def assign_supplier_sales_responsibilities(
 
 
 def responsibility_map_for_materials(*, supplier, materials):
-    """按“具体物料优先、品类兜底”解析每个物料的责任销售身份。"""
+    """按组织销售人数解析物料责任人。
+
+    无销售经理：负责人独自办理；一名销售经理：默认负责全部物料；
+    多名销售经理：只认负责人按物料类型作出的明确分配。
+    """
 
     material_rows = list(materials)
+    sales_identities = _supplier_sales_identities(supplier)
+    if len(sales_identities) == 1:
+        return {material.pk: sales_identities[0] for material in material_rows}
+    if not sales_identities:
+        return {material.pk: None for material in material_rows}
+
     material_ids = {item.pk for item in material_rows}
-    category_ids = {
-        item.product_category_id
-        for item in material_rows
-        if item.product_category_id
-    }
     assignments = list(
         _responsibility_assignments(supplier).filter(
-            (
-                Q(
-                    scope_type=SupplierResponsibilityScope.MATERIAL,
-                    material_id__in=material_ids,
-                )
-                | Q(
-                    scope_type=SupplierResponsibilityScope.CATEGORY,
-                    product_category_id__in=category_ids,
-                )
-            )
+            scope_type=SupplierResponsibilityScope.MATERIAL,
+            material_id__in=material_ids,
         )
     )
     direct = {
@@ -450,16 +406,8 @@ def responsibility_map_for_materials(*, supplier, materials):
         for item in assignments
         if item.scope_type == SupplierResponsibilityScope.MATERIAL
     }
-    by_category = {
-        item.product_category_id: item.sales_identity
-        for item in assignments
-        if item.scope_type == SupplierResponsibilityScope.CATEGORY
-    }
     return {
-        material.pk: (
-            direct.get(material.pk)
-            or by_category.get(material.product_category_id)
-        )
+        material.pk: direct.get(material.pk)
         for material in material_rows
     }
 
@@ -476,6 +424,115 @@ def get_responsible_material_ids(*, sales_identity):
         for material_id, identity in mapping.items()
         if identity and identity.pk == sales_identity.pk
     }
+
+
+def get_v2_supplier_delivery_snapshot_access(
+    *,
+    supplier,
+    sales_identity,
+    plan_id=None,
+):
+    """Return a supplier-sales user's immutable V2 delivery-task scope.
+
+    Responsibility assignment is deliberately a *current* configuration, but
+    an ``ORDER_PLAN_SUPPLIER_DELIVERY`` task is an audited operational fact.
+    Once the 10:00/22:00 dispatcher has created that task, changing a material
+    assignment must neither remove the original sales recipient nor let a new
+    sales recipient take over the old task.  The task's ``UserTask`` recipient
+    and the ``recipient_scopes`` stored in that work item are therefore read
+    as a snapshot here; this helper never updates either of them.
+
+    ``open_plan_ids`` is intentionally returned for *all* open V2 delivery
+    tasks of the supplier, even when the current sales identity was not a
+    recipient.  Callers use it to prevent a newly assigned sales manager from
+    seeing an open historical task merely through the live responsibility
+    table.  ``*_material_ids_by_plan`` only contains exact supplier-sales
+    task recipients and is suitable for scoped detail/list projections.
+    """
+
+    empty = {
+        "open_plan_ids": set(),
+        "open_material_ids_by_plan": {},
+        "history_material_ids_by_plan": {},
+    }
+    if not supplier or not sales_identity:
+        return empty
+    if getattr(getattr(sales_identity, "role", None), "code", "") != "supplier_sales":
+        return empty
+    if sales_identity.organization_id != supplier.pk:
+        return empty
+    openid = (sales_identity.user.wx_openid or "").strip()
+    if not openid:
+        return empty
+
+    workitem_filters = {
+        "type": "ORDER_PLAN_SUPPLIER_DELIVERY",
+        "status__in": ("OPEN", "DONE"),
+    }
+    if plan_id not in (None, ""):
+        try:
+            workitem_filters["biz_ref"] = f"sales.OrderPlan:{int(plan_id)}"
+        except (TypeError, ValueError):
+            return empty
+
+    workitems = list(WorkItem.objects.filter(**workitem_filters))
+    if not workitems:
+        return empty
+    recipient_workitem_ids = set(
+        UserTask.objects.filter(
+            workitem_id__in=[item.pk for item in workitems],
+            to_openid=openid,
+            to_role_snapshot="supplier_sales",
+        ).values_list("workitem_id", flat=True)
+    )
+
+    def _payload_int(payload, key):
+        try:
+            return int(payload.get(key))
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    def _scope_material_ids(scope):
+        if not isinstance(scope, dict):
+            return set()
+        values = set()
+        for raw in scope.get("material_ids", []) or []:
+            try:
+                material_id = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if material_id > 0:
+                values.add(material_id)
+        return values
+
+    for workitem in workitems:
+        payload = workitem.payload if isinstance(workitem.payload, dict) else {}
+        if _payload_int(payload, "supplier_id") != supplier.pk:
+            continue
+        payload_plan_id = _payload_int(payload, "order_plan_id")
+        if not payload_plan_id:
+            continue
+        if workitem.status == "OPEN":
+            empty["open_plan_ids"].add(payload_plan_id)
+        if workitem.pk not in recipient_workitem_ids:
+            continue
+        scopes = payload.get("recipient_scopes") or {}
+        scope = scopes.get(openid) if isinstance(scopes, dict) else None
+        # Both snapshots must say supplier_sales.  Do not infer permission
+        # from a current identity or from a recipient of another role.
+        if not isinstance(scope, dict) or scope.get("role") != "supplier_sales":
+            continue
+        material_ids = _scope_material_ids(scope)
+        if not material_ids:
+            continue
+        empty["history_material_ids_by_plan"].setdefault(
+            payload_plan_id, set()
+        ).update(material_ids)
+        if workitem.status == "OPEN":
+            empty["open_material_ids_by_plan"].setdefault(
+                payload_plan_id, set()
+            ).update(material_ids)
+    return empty
 
 
 def get_supplier_task_recipients(*, supplier, material_ids):
@@ -532,5 +589,19 @@ def get_supplier_task_recipients(*, supplier, material_ids):
         "owner_openids": owner_openids,
         "sales_openids": sales_openids,
         "sales_identity_ids": list(sales_identities),
+        # A supplier owner may always close a delivery.  Sales can close it
+        # collectively only when every material line has an explicit,
+        # task-reachable responsible sales identity.  A configured identity
+        # without a live WeChat openid cannot receive this immutable task, so
+        # it must be treated like an owner-required line rather than allowing
+        # some other sales account to complete the full delivery alone.
+        # Keep the set in the task snapshot so a later responsibility
+        # reconfiguration cannot silently change the completion rule for an
+        # already-dispatched delivery.
+        "unassigned_material_ids": sorted(
+            material_id
+            for material_id, identity in mapping.items()
+            if identity is None or not (identity.user.wx_openid or "").strip()
+        ),
         "recipient_scopes": recipient_scopes,
     }

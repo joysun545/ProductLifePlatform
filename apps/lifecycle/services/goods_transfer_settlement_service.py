@@ -4,7 +4,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from django.db import transaction
-from django.db.models import Max, Sum
+from django.db.models import Max, Sum, Q
 from django.utils import timezone
 
 from account.models import UserOrganization
@@ -18,6 +18,7 @@ from lifecycle.models import (
 )
 from workflow.models import WorkItem
 from workflow.services.workflow_service import publish_workitem
+from .goods_transfer_receivable_service import financial_write_errors
 
 
 class GoodsTransferSettlementError(Exception):
@@ -236,7 +237,7 @@ def _ensure_document_task(transfer, actor_openid=""):
     return _publish_document_task(transfer, actor_openid)
 
 
-def _publish_payment_upload_task(settlement, sequence_no, actor_openid=""):
+def _publish_payment_upload_task(settlement, sequence_no, actor_openid="", *, task_key=None, outstanding=None):
     transfer = settlement.transfer
     recipients = _role_openids(transfer.to_organization)
     if not recipients:
@@ -246,9 +247,10 @@ def _publish_payment_upload_task(settlement, sequence_no, actor_openid=""):
         type=PAYMENT_UPLOAD_WORK_TYPE,
         biz_id=transfer.flow_no,
         biz_ref=f"lifecycle.GoodsTransfer:{transfer.pk}",
-        uniq_key=_payment_upload_key(transfer, sequence_no),
+        uniq_key=task_key or _payment_upload_key(transfer, sequence_no),
         title=f"商品第{sequence_no}笔付款待处理",
-        summary=f"应收货款 ¥{settlement.receivable_amount}",
+        summary=(f"累计待付 ¥{outstanding:.2f}，包含前单未收余额"
+                 if outstanding is not None else f"应收货款 ¥{settlement.receivable_amount}"),
         link=_settlement_link(transfer),
         recipients_openids=recipients,
         need_action=True,
@@ -259,8 +261,8 @@ def _publish_payment_upload_task(settlement, sequence_no, actor_openid=""):
     )
 
 
-def _publish_payment_confirm_task(payment, actor_openid=""):
-    settlement = payment.settlement
+def _publish_payment_confirm_task(payment, actor_openid="", *, entry_settlement=None):
+    settlement = entry_settlement or payment.settlement
     transfer = settlement.transfer
     recipients = _role_openids(transfer.from_organization)
     if not recipients:
@@ -284,6 +286,7 @@ def _publish_payment_confirm_task(payment, actor_openid=""):
             transfer,
             payment_id=payment.pk,
             payment_sequence=payment.sequence_no,
+            payment_source_transfer_id=payment.settlement.transfer_id,
         ),
         actor_openid=actor_openid,
         mark_workitem_done_immediately=False,
@@ -415,26 +418,11 @@ def _logistics_rows(settlement):
 
 
 def _totals(settlement, payments=None):
-    payments = payments if payments is not None else _payment_rows(settlement)
-    confirmed_total = sum(
-        (
-            payment.confirmed_amount
-            for payment in payments
-            if payment.status == GoodsTransferPayment.Status.CONFIRMED
-            and payment.confirmed_amount is not None
-        ),
-        Decimal("0.00"),
-    )
-    receivable = settlement.receivable_amount
-    credited_total = GoodsTransferCreditAllocation.objects.filter(
-        target_shipment_settlement=settlement
-    ).aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
-    outstanding = (
-        None
-        if receivable is None
-        else receivable - confirmed_total - credited_total
-    )
-    return confirmed_total, credited_total, outstanding
+    # Payment origin is immutable; actual receipt credited to this invoice
+    # comes from the allocation ledger, including payments uploaded later.
+    from .goods_transfer_receivable_service import invoice_totals
+    totals = invoice_totals(settlement)
+    return totals["received_amount"], totals["credit_amount"], totals["outstanding_amount"]
 
 
 def _state(settlement, documents, payments, confirmed_total, outstanding):
@@ -472,133 +460,149 @@ def _viewer_can_confirm_payment(user, transfer, payment):
     ).exclude(user_tasks__state="DONE").exists()
 
 
-def _serialize(settlement, user, identity, side):
-    transfer = settlement.transfer
-    documents = _logistics_rows(settlement)
-    payments = _payment_rows(settlement)
-    confirmed_total, credited_total, outstanding = _totals(settlement, payments)
-    state, state_name = _state(
-        settlement,
-        documents,
-        payments,
-        confirmed_total,
-        outstanding,
-    )
-    pending_exists = any(
-        payment.status == GoodsTransferPayment.Status.PENDING
-        for payment in payments
-    )
+def _serialize_payment(payment, user, entry_transfer, side, is_current):
     return {
-        "state": state,
-        "state_name": state_name,
+        "id": payment.pk,
+        "sequence_no": payment.sequence_no,
+        "source_transfer_id": payment.settlement.transfer_id,
+        "source_flow_no": payment.settlement.transfer.flow_no,
+        "status": payment.status,
+        "status_name": payment.get_status_display(),
+        "voucher_original_name": payment.voucher_original_name,
+        "voucher_preview_path": (
+            f"/lifecycle/goods-transfers/{payment.settlement.transfer_id}/settlement/"
+            f"payments/{payment.pk}/voucher-file/"
+        ),
+        "uploaded_by_name": _display_name(payment.uploaded_by),
+        "uploaded_at": payment.uploaded_at.isoformat(),
+        "confirmed_amount": _money(payment.confirmed_amount),
+        "confirmed_by_name": _display_name(payment.confirmed_by) if payment.confirmed_by else "",
+        "confirmed_at": payment.confirmed_at.isoformat() if payment.confirmed_at else None,
+        "can_confirm": bool(is_current and side == "SENDER"
+                            and _viewer_can_confirm_payment(user, entry_transfer, payment)),
+        "allocations": [{"transfer_id": row.settlement.transfer_id,
+                         "flow_no": row.settlement.transfer.flow_no,
+                         "amount": _money(row.amount)}
+                        for row in payment.allocations.all()],
+    }
+
+
+def _serialize(settlement, user, identity, side):
+    from .goods_transfer_receivable_service import pair_context
+    context = pair_context(settlement)
+    transfer = settlement.transfer
+    active = context["active_settlement"]
+    is_current = bool(active and active.pk == settlement.pk)
+    documents = _logistics_rows(settlement)
+    if is_current:
+        payment_filter = Q(settlement_id__in=[row["settlement"].pk for row in context["rows"]])
+    else:
+        payment_filter = Q(settlement=settlement) | Q(allocations__settlement=settlement)
+    payments = list(GoodsTransferPayment.objects.filter(payment_filter).distinct()
+                    .select_related("uploaded_by", "confirmed_by", "settlement__transfer")
+                    .prefetch_related("allocations__settlement__transfer")
+                    .order_by("uploaded_at", "pk"))
+    confirmed_total, credited_total, outstanding = _totals(settlement)
+    state, state_name = _state(settlement, documents, payments,
+                              context["received_amount"] if is_current else confirmed_total,
+                              context["outstanding_amount"] if is_current else outstanding)
+    if active and not is_current and settlement.statement_submitted_at and outstanding and outstanding > 0:
+        state, state_name = "ROLLED_FORWARD", "未收余额已结转至后续发货单"
+    pending_exists = bool(context["pending_payments"])
+    active_row = next((row for row in context["rows"] if active and row["settlement"].pk == active.pk), None)
+    rolling = {
+        "enabled": True,
+        "is_current": is_current,
+        "active_transfer_id": active.transfer_id if active else None,
+        "active_flow_no": active.transfer.flow_no if active else "",
+        "receivable_amount": _money(context["receivable_amount"]),
+        "confirmed_received_amount": _money(context["received_amount"]),
+        "confirmed_credit_amount": _money(context["credit_amount"]),
+        "outstanding_amount": _money(context["outstanding_amount"]),
+        "carry_forward_amount": _money(sum((row["outstanding_amount"] for row in context["rows"]
+                                             if not active or row["settlement"].pk != active.pk), Decimal("0.00"))),
+        "current_receivable_amount": _money(active_row["receivable_amount"]) if active_row else None,
+        "current_received_amount": _money(active_row["received_amount"]) if active_row else None,
+        "current_credit_amount": _money(active_row["credit_amount"]) if active_row else None,
+        "current_outstanding_amount": _money(active_row["outstanding_amount"]) if active_row else None,
+        "settlements": [{"transfer_id": row["settlement"].transfer_id,
+                         "flow_no": row["settlement"].transfer.flow_no,
+                         "receivable_amount": _money(row["receivable_amount"]),
+                         "received_amount": _money(row["received_amount"]),
+                         "credit_amount": _money(row["credit_amount"]),
+                         "unpaid_amount": _money(row["outstanding_amount"]),
+                         "is_current": bool(active and row["settlement"].pk == active.pk)}
+                        for row in context["rows"]],
+    }
+    return {
+        "state": state, "state_name": state_name,
         "physical_status": transfer.status,
         "physical_status_name": transfer.get_status_display(),
         "receivable_amount": _money(settlement.receivable_amount),
         "confirmed_received_amount": _money(confirmed_total),
         "confirmed_credit_amount": _money(credited_total),
         "outstanding_amount": _money(outstanding),
-        "commercial_documents_complete": bool(
-            settlement.statement_submitted_at and documents
-        ),
+        "rolling_receivables": rolling,
+        "commercial_documents_complete": bool(settlement.statement_submitted_at and documents),
         "payment_count": len(payments),
-        "pending_payment_count": sum(
-            1
-            for payment in payments
-            if payment.status == GoodsTransferPayment.Status.PENDING
-        ),
+        "pending_payment_count": sum(payment.status == GoodsTransferPayment.Status.PENDING for payment in payments),
         "goods_transfer": {
-            "id": transfer.pk,
-            "flow_no": transfer.flow_no,
+            "id": transfer.pk, "flow_no": transfer.flow_no,
             "from_organization_name": transfer.from_organization.name,
             "to_organization_name": transfer.to_organization.name,
             "device_count": transfer.items.count(),
         },
-        "viewer": {
-            "role": identity.role.code,
-            "side": side,
-        },
+        "viewer": {"role": identity.role.code, "side": side},
         "statement": {
             "submitted": bool(settlement.statement_submitted_at),
             "original_name": settlement.statement_original_name,
-            "submitted_by_name": (
-                _display_name(settlement.statement_submitted_by)
-                if settlement.statement_submitted_by
-                else ""
-            ),
-            "submitted_at": (
-                settlement.statement_submitted_at.isoformat()
-                if settlement.statement_submitted_at
-                else None
-            ),
-            "preview_path": (
-                f"/lifecycle/goods-transfers/{transfer.pk}/settlement/statement-file/"
-                if settlement.statement_image
-                else ""
-            ),
+            "submitted_by_name": (_display_name(settlement.statement_submitted_by)
+                                  if settlement.statement_submitted_by else ""),
+            "submitted_at": (settlement.statement_submitted_at.isoformat()
+                             if settlement.statement_submitted_at else None),
+            "preview_path": (f"/lifecycle/goods-transfers/{transfer.pk}/settlement/statement-file/"
+                             if settlement.statement_image else ""),
         },
-        "logistics_documents": [
-            {
-                "id": document.pk,
-                "sequence_no": document.sequence_no,
-                "original_name": document.original_name,
-                "file_type": document.file_type,
-                "content_type": document.content_type,
-                "file_size": document.file_size,
-                "remark": document.remark,
-                "uploaded_by_name": _display_name(document.uploaded_by),
-                "uploaded_at": document.uploaded_at.isoformat(),
-                "preview_path": (
-                    f"/lifecycle/goods-transfers/{transfer.pk}/settlement/"
-                    f"logistics-documents/{document.pk}/file/"
-                ),
-            }
-            for document in documents
-        ],
+        "logistics_documents": [{
+            "id": document.pk, "sequence_no": document.sequence_no,
+            "original_name": document.original_name, "file_type": document.file_type,
+            "content_type": document.content_type, "file_size": document.file_size,
+            "remark": document.remark, "uploaded_by_name": _display_name(document.uploaded_by),
+            "uploaded_at": document.uploaded_at.isoformat(),
+            "preview_path": (f"/lifecycle/goods-transfers/{transfer.pk}/settlement/"
+                             f"logistics-documents/{document.pk}/file/"),
+        } for document in documents],
         "actions": {
-            "can_submit_statement": (
-                side == "SENDER" and not settlement.statement_submitted_at
-            ),
+            "can_submit_statement": side == "SENDER" and not settlement.statement_submitted_at,
             "can_upload_logistics": side == "SENDER",
-            "can_upload_payment": (
-                side == "RECEIVER"
-                and bool(settlement.statement_submitted_at)
-                and not pending_exists
-                and outstanding is not None
-                and outstanding > 0
-            ),
+            "can_upload_payment": bool(side == "RECEIVER" and is_current
+                                       and not pending_exists and context["outstanding_amount"] > 0),
         },
-        "payments": [
-            {
-                "id": payment.pk,
-                "sequence_no": payment.sequence_no,
-                "status": payment.status,
-                "status_name": payment.get_status_display(),
-                "voucher_original_name": payment.voucher_original_name,
-                "voucher_preview_path": (
-                    f"/lifecycle/goods-transfers/{transfer.pk}/settlement/"
-                    f"payments/{payment.pk}/voucher-file/"
-                ),
-                "uploaded_by_name": _display_name(payment.uploaded_by),
-                "uploaded_at": payment.uploaded_at.isoformat(),
-                "confirmed_amount": _money(payment.confirmed_amount),
-                "confirmed_by_name": (
-                    _display_name(payment.confirmed_by)
-                    if payment.confirmed_by
-                    else ""
-                ),
-                "confirmed_at": (
-                    payment.confirmed_at.isoformat()
-                    if payment.confirmed_at
-                    else None
-                ),
-                "can_confirm": (
-                    side == "SENDER"
-                    and _viewer_can_confirm_payment(user, transfer, payment)
-                ),
-            }
-            for payment in payments
-        ],
+        "payments": [_serialize_payment(payment, user, active.transfer if active else transfer,
+                                         side, is_current) for payment in payments],
     }
+
+
+def _lock_financial_pair(transfer):
+    from .goods_transfer_receivable_service import lock_receivable_account
+    return lock_receivable_account(transfer)
+
+
+def _current_financial_context(settlement):
+    from .goods_transfer_receivable_service import pair_context
+    context = pair_context(settlement)
+    active = context["active_settlement"]
+    if active is None:
+        raise GoodsTransferSettlementError("发货方尚未提交货品清单和应收金额。")
+    if active.pk != settlement.pk:
+        raise GoodsTransferSettlementError(
+            f"本单款项已转至 {active.transfer.flow_no}，请进入最新发货单办理累计货款。")
+    return context
+
+
+def _reconcile_financial_tasks(settlement, actor_openid=""):
+    from .goods_transfer_receivable_task_service import reconcile_receivable_tasks
+    return reconcile_receivable_tasks(settlement, actor_openid)
 
 
 def get_goods_transfer_settlement_detail(*, user, transfer_id):
@@ -611,6 +615,7 @@ def get_goods_transfer_settlement_detail(*, user, transfer_id):
     return _serialize(settlement, user, identity, side)
 
 
+@financial_write_errors(GoodsTransferSettlementError)
 @transaction.atomic
 def submit_goods_transfer_statement(
     *,
@@ -619,7 +624,8 @@ def submit_goods_transfer_statement(
     receivable_amount,
     image,
 ):
-    transfer, identity, side = _authorized_transfer(user, transfer_id, lock=True)
+    transfer, identity, side = _authorized_transfer(user, transfer_id)
+    _lock_financial_pair(transfer)
     if side != "SENDER":
         raise GoodsTransferSettlementError("只有发货方可以提交货品清单。")
     settlement, _created = GoodsTransferSettlement.objects.select_for_update().get_or_create(
@@ -643,7 +649,7 @@ def submit_goods_transfer_statement(
     settlement.statement_submitted_at = now
     settlement.save()
     _complete_document_task_if_ready(settlement, user)
-    _publish_payment_upload_task(settlement, 1, user.wx_openid or "")
+    _reconcile_financial_tasks(settlement, user.wx_openid or "")
     return _serialize(settlement, user, identity, side)
 
 
@@ -700,143 +706,113 @@ def upload_goods_transfer_logistics_document(
     return _serialize(settlement, user, identity, side), True
 
 
+@financial_write_errors(GoodsTransferSettlementError)
 @transaction.atomic
 def upload_goods_transfer_payment_voucher(
-    *,
-    user,
-    transfer_id,
-    client_request_id,
-    image,
+    *, user, transfer_id, client_request_id, image,
 ):
-    transfer, identity, side = _authorized_transfer(user, transfer_id, lock=True)
+    transfer, identity, side = _authorized_transfer(user, transfer_id)
     if side != "RECEIVER":
         raise GoodsTransferSettlementError("只有收货方可以上传付款凭证。")
-    settlement = GoodsTransferSettlement.objects.select_for_update().filter(
-        transfer=transfer
-    ).first()
+    _lock_financial_pair(transfer)
+    settlement = GoodsTransferSettlement.objects.select_for_update().filter(transfer=transfer).first()
     if not settlement or not settlement.statement_submitted_at:
         raise GoodsTransferSettlementError("发货方尚未提交货品清单和应收金额。")
     request_id = str(client_request_id or "").strip()
     if not request_id or len(request_id) > 64:
         raise GoodsTransferSettlementError("付款凭证请求标识无效，请重新进入页面。")
-    existing = settlement.payments.filter(
-        client_request_id=request_id
-    ).select_related("uploaded_by", "confirmed_by").first()
-    if existing:
-        return _serialize(settlement, user, identity, side), False
-    if settlement.payments.filter(
-        status=GoodsTransferPayment.Status.PENDING
-    ).exists():
-        raise GoodsTransferSettlementError("上一笔付款凭证尚未确认，请等待发货方处理。")
-    _confirmed_total, _credited_total, outstanding = _totals(settlement)
-    if outstanding is None or outstanding <= 0:
-        raise GoodsTransferSettlementError("该商品流转已经完成全部收款。")
-    suffix, original_name, _content_type = _validate_image(image, "付款凭证")
-    sequence_no = (
-        settlement.payments.aggregate(value=Max("sequence_no"))["value"] or 0
-    ) + 1
-    workitem = WorkItem.objects.select_for_update().filter(
-        type=PAYMENT_UPLOAD_WORK_TYPE,
-        uniq_key=_payment_upload_key(transfer, sequence_no),
+    # A retried request remains the same voucher after another shipment was
+    # priced. Deduplicate across this directed organization pair, not just one
+    # URL, without changing the original payment/attachment association.
+    existing = GoodsTransferPayment.objects.filter(
+        settlement__transfer__flow_type=GoodsTransfer.FlowType.SHIPMENT,
+        settlement__transfer__from_organization_id=transfer.from_organization_id,
+        settlement__transfer__to_organization_id=transfer.to_organization_id,
+        client_request_id=request_id,
     ).first()
+    if existing:
+        if existing.uploaded_by_id != user.pk:
+            raise GoodsTransferSettlementError("付款请求标识已被其他成员使用，请刷新后重试。")
+        return _serialize(settlement, user, identity, side), False
+    context = _current_financial_context(settlement)
+    if context["pending_payments"]:
+        raise GoodsTransferSettlementError("已有付款凭证尚未确认，请等待发货方处理。")
+    if context["outstanding_amount"] <= 0:
+        raise GoodsTransferSettlementError("双方累计应收已经完成全部收款。")
+    suffix, original_name, _content_type = _validate_image(image, "付款凭证")
+    sequence_no = (settlement.payments.aggregate(value=Max("sequence_no"))["value"] or 0) + 1
+    _reconcile_financial_tasks(settlement, user.wx_openid or "")
+    workitem = WorkItem.objects.select_for_update().filter(
+        type=PAYMENT_UPLOAD_WORK_TYPE, status="OPEN",
+        biz_ref=f"lifecycle.GoodsTransfer:{transfer.pk}",
+        payload__payment_sequence=sequence_no,
+    ).order_by("-pk").first()
     if not workitem:
-        _publish_payment_upload_task(
-            settlement,
-            sequence_no,
-            user.wx_openid or "",
-        )
-        workitem = WorkItem.objects.select_for_update().filter(
-            type=PAYMENT_UPLOAD_WORK_TYPE,
-            uniq_key=_payment_upload_key(transfer, sequence_no),
-        ).first()
-    if not workitem:
-        raise GoodsTransferSettlementError("未找到收货方付款任务。")
+        raise GoodsTransferSettlementError("未找到当前累计货款的付款任务，请刷新后重试。")
     _complete_anyone(
-        workitem,
-        user,
+        workitem, user,
         actor_title=f"第{sequence_no}笔付款凭证已上传",
         peer_title=f"{_display_name(user)}已上传第{sequence_no}笔付款凭证",
     )
     payment = GoodsTransferPayment(
-        settlement=settlement,
-        sequence_no=sequence_no,
-        client_request_id=request_id,
-        voucher_original_name=original_name,
-        uploaded_by=user,
+        settlement=settlement, sequence_no=sequence_no, client_request_id=request_id,
+        voucher_original_name=original_name, uploaded_by=user,
     )
-    payment.voucher_image.save(
-        f"payment-{sequence_no}-{uuid.uuid4().hex}{suffix}",
-        image,
-        save=False,
-    )
+    payment.voucher_image.save(f"payment-{sequence_no}-{uuid.uuid4().hex}{suffix}", image, save=False)
     payment.save()
-    _publish_payment_confirm_task(payment, user.wx_openid or "")
+    _reconcile_financial_tasks(settlement, user.wx_openid or "")
     return _serialize(settlement, user, identity, side), True
 
 
+@financial_write_errors(GoodsTransferSettlementError)
 @transaction.atomic
-def confirm_goods_transfer_payment(
-    *,
-    user,
-    transfer_id,
-    payment_id,
-    amount,
-):
-    transfer, identity, side = _authorized_transfer(user, transfer_id, lock=True)
+def confirm_goods_transfer_payment(*, user, transfer_id, payment_id, amount):
+    transfer, identity, side = _authorized_transfer(user, transfer_id)
     if side != "SENDER":
         raise GoodsTransferSettlementError("只有发货方可以确认实际收款。")
-    settlement = GoodsTransferSettlement.objects.select_for_update().filter(
-        transfer=transfer
-    ).first()
+    _lock_financial_pair(transfer)
+    settlement = GoodsTransferSettlement.objects.select_for_update().filter(transfer=transfer).first()
     if not settlement:
         raise GoodsTransferSettlementError("商品流转应收主账不存在。")
-    payment = (
-        GoodsTransferPayment.objects.select_for_update()
-        .select_related("uploaded_by", "confirmed_by", "settlement")
-        .filter(pk=payment_id, settlement=settlement)
-        .first()
-    )
+    payment = (GoodsTransferPayment.objects.select_for_update()
+               .select_related("uploaded_by", "confirmed_by", "settlement__transfer")
+               .filter(pk=payment_id,
+                       settlement__transfer__flow_type=GoodsTransfer.FlowType.SHIPMENT,
+                       settlement__transfer__from_organization_id=transfer.from_organization_id,
+                       settlement__transfer__to_organization_id=transfer.to_organization_id).first())
     if not payment:
-        raise GoodsTransferSettlementError("付款记录不存在。")
+        raise GoodsTransferSettlementError("付款记录不存在或不属于该上下级关系。")
     if payment.status == GoodsTransferPayment.Status.CONFIRMED:
         return _serialize(settlement, user, identity, side), False
+    context = _current_financial_context(settlement)
+    if payment.settlement_id not in {row["settlement"].pk for row in context["rows"]}:
+        raise GoodsTransferSettlementError("付款记录不属于当前有效应收。")
     confirmed_amount = _parse_amount(amount, "实际到账金额")
-    _confirmed_total, _credited_total, current_outstanding = _totals(settlement)
-    if current_outstanding is None or confirmed_amount > current_outstanding:
-        raise GoodsTransferSettlementError("实际到账金额超过当前应收余额。")
+    if confirmed_amount > context["outstanding_amount"]:
+        raise GoodsTransferSettlementError("实际到账金额超过双方累计应收余额。")
+    _reconcile_financial_tasks(settlement, user.wx_openid or "")
     workitem = WorkItem.objects.select_for_update().filter(
-        type=PAYMENT_CONFIRM_WORK_TYPE,
+        type=PAYMENT_CONFIRM_WORK_TYPE, status="OPEN",
         uniq_key=_payment_confirm_key(transfer, payment),
     ).first()
     if not workitem:
-        raise GoodsTransferSettlementError("未找到收款确认任务。")
+        raise GoodsTransferSettlementError("未找到最新发货单的收款确认任务。")
     _complete_anyone(
-        workitem,
-        user,
+        workitem, user,
         actor_title=f"第{payment.sequence_no}笔收款已确认",
         peer_title=f"{_display_name(user)}已确认第{payment.sequence_no}笔收款",
     )
-    now = timezone.now()
     payment.confirmed_amount = confirmed_amount
     payment.confirmed_by = user
-    payment.confirmed_at = now
+    payment.confirmed_at = timezone.now()
     payment.status = GoodsTransferPayment.Status.CONFIRMED
-    payment.save(
-        update_fields=(
-            "confirmed_amount",
-            "confirmed_by",
-            "confirmed_at",
-            "status",
-            "updated_at",
-        )
-    )
-    _confirmed_total, _credited_total, outstanding = _totals(settlement)
-    if outstanding > 0:
-        _publish_payment_upload_task(
-            settlement,
-            payment.sequence_no + 1,
-            user.wx_openid or "",
-        )
+    payment.save(update_fields=("confirmed_amount", "confirmed_by", "confirmed_at", "status", "updated_at"))
+    from .goods_transfer_receivable_service import allocate_payment_fifo, GoodsTransferReceivableError
+    try:
+        allocate_payment_fifo(payment)
+    except GoodsTransferReceivableError as exc:
+        raise GoodsTransferSettlementError(str(exc)) from exc
+    _reconcile_financial_tasks(settlement, user.wx_openid or "")
     return _serialize(settlement, user, identity, side), True
 
 

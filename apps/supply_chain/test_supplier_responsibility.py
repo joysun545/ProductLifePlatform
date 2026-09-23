@@ -131,8 +131,8 @@ class SupplierResponsibilityTests(TestCase):
             data=json.dumps(
                 {
                     "sales_identity_id": self.sales_a.organization_identity.pk,
-                    "scope_type": SupplierResponsibilityScope.CATEGORY,
-                    "target_ids": [self.category.pk],
+                    "scope_type": SupplierResponsibilityScope.MATERIAL,
+                    "target_ids": [self.material_a.pk],
                 }
             ),
             content_type="application/json",
@@ -143,13 +143,7 @@ class SupplierResponsibilityTests(TestCase):
         self.assertEqual(response.json()["code"], 1)
         self.assertFalse(SupplierSalesResponsibility.objects.exists())
 
-    def test_material_assignment_overrides_category_assignment(self):
-        self._assign(
-            self.owner,
-            self.sales_a,
-            SupplierResponsibilityScope.CATEGORY,
-            [self.category.pk],
-        )
+    def test_multi_sales_uses_material_assignment_only(self):
         self._assign(
             self.owner,
             self.sales_b,
@@ -161,7 +155,7 @@ class SupplierResponsibilityTests(TestCase):
             get_responsible_material_ids(
                 sales_identity=self.sales_a.organization_identity,
             ),
-            {self.material_a.pk},
+            set(),
         )
         self.assertSetEqual(
             get_responsible_material_ids(
@@ -169,6 +163,15 @@ class SupplierResponsibilityTests(TestCase):
             ),
             {self.material_b.pk},
         )
+
+    def test_non_material_assignment_is_rejected(self):
+        with self.assertRaises(SupplierResponsibilityError):
+            self._assign(
+                self.owner,
+                self.sales_a,
+                "CATEGORY",
+                [self.category.pk],
+            )
 
     def test_owner_can_reassign_same_material_to_another_sales_manager(self):
         self._assign(
@@ -211,8 +214,8 @@ class SupplierResponsibilityTests(TestCase):
         self._assign(
             self.owner,
             self.sales_a,
-            SupplierResponsibilityScope.CATEGORY,
-            [self.category.pk],
+            SupplierResponsibilityScope.MATERIAL,
+            [self.material_b.pk],
         )
         recipients = get_supplier_task_recipients(
             supplier=self.supplier,
@@ -266,3 +269,25 @@ class SupplierResponsibilityTests(TestCase):
 
         self.assertEqual(recipients["sales_openids"], [])
         self.assertEqual(recipients["openids"], [self.owner.wx_openid])
+
+    def test_one_sales_manager_defaults_to_all_materials(self):
+        self.sales_b.organization_identity.is_active = False
+        self.sales_b.organization_identity.save(update_fields=("is_active", "updated_at"))
+
+        payload = get_responsibility_options(user=self.owner)
+        self.assertEqual(payload["assignment_mode"], "SINGLE_SALES_DEFAULT_ALL")
+        self.assertTrue(payload["sales_managers"][0]["default_all_materials"])
+        self.assertSetEqual(
+            get_responsible_material_ids(
+                sales_identity=self.sales_a.organization_identity,
+            ),
+            {self.material_a.pk, self.material_b.pk},
+        )
+        recipients = get_supplier_task_recipients(
+            supplier=self.supplier,
+            material_ids=[self.material_a.pk, self.material_b.pk],
+        )
+        self.assertSetEqual(
+            set(recipients["openids"]),
+            {self.owner.wx_openid, self.sales_a.wx_openid},
+        )

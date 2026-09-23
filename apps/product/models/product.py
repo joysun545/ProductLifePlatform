@@ -12,20 +12,8 @@ class ProductModel(models.Model):
 
     示例：
 
-    品牌：
-    劲龙
-
-    型号：
-    JL5000
-
-
-    OEM:
-
-    品牌：
-    客户A
-
-    生产厂家：
-    重庆航迪
+    品牌不属于产品型号主数据。品牌在渠道授权和订单计划中管理，
+    同一型号可按不同订单、渠道使用不同品牌。
     """
 
 
@@ -41,17 +29,6 @@ class ProductModel(models.Model):
         max_length=128,
         verbose_name="型号名称"
     )
-
-
-    brand = models.ForeignKey(
-        "product.Brand",
-        on_delete=models.PROTECT,
-        related_name="products",
-        null=True,
-        blank=True,
-        verbose_name="所属品牌"
-    )
-
 
     category = models.ForeignKey(
         "product.ProductCategory",

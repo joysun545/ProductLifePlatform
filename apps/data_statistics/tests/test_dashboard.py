@@ -8,6 +8,8 @@ from data_statistics.services.flow_service import build_flow_statistics
 from lifecycle.models import ActivationRecord, AfterSalesApplication, Device, InstallationRecord, OrganizationDevice
 from manufacturing.models import ProductionBatch
 from product.models import BOM, Brand, ProductCategory, ProductModel
+from supply_chain.models import FactoryMaterialLot, FactoryMaterialStock, Material, MaterialSpec
+from data_statistics.services.material_service import build_factory_material_lot_catalog
 
 
 class DataStatisticsDashboardTests(TestCase):
@@ -74,3 +76,19 @@ class DataStatisticsDashboardTests(TestCase):
             sum(value for key, value in totals.items() if key != "market_device_count"),
             totals["market_device_count"],
         )
+
+    def test_material_warehouse_keeper_sees_historical_lot_catalog_only_in_statistics(self):
+        role = OrganizationRole.objects.get(organization_type__code="OWNER", code="factory_material_stock")
+        keeper = User.objects.create_user(username="stats-material-keeper")
+        UserOrganization.objects.create(user=keeper, organization=self.factory, role=role)
+        supplier = Organization.objects.create(name="南方供应商", code="STATS-SUPPLIER", organization_type=OrganizationType.objects.get(code="SUPPLIER"))
+        material = Material.objects.create(code="STATS-MATERIAL", name="物料控制器")
+        spec = MaterialSpec.objects.create(material=material, code="STATS-SPEC", name="统计规格")
+        stock = FactoryMaterialStock.objects.create(factory=self.factory, supplier=supplier, material_spec=spec, unit="件")
+        FactoryMaterialLot.objects.create(stock=stock, batch_code="ML-STATS-HISTORY", received_milli=5000, on_hand_milli=0, received_by=keeper)
+        identity = get_statistics_identity(keeper)
+        dashboard = build_dashboard(identity)
+        self.assertEqual(dashboard["modules"], ["MATERIAL"])
+        catalog = build_factory_material_lot_catalog(identity, query="南")
+        self.assertEqual(catalog["items"][0]["batch_code"], "ML-STATS-HISTORY")
+        self.assertEqual(catalog["items"][0]["status"], "已用完或已退完")

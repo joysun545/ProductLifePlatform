@@ -1,39 +1,60 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>PLDP 产品生命周期二维码打印中心</title>
-  <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PLDP V2 二维码打印中心</title>
   <style>
-    *{box-sizing:border-box}body{margin:0;padding:28px;background:#f4f7f6;color:#17251f;font-family:"Microsoft YaHei",Arial,sans-serif}.container{max-width:1180px;margin:auto}.header,.panel{background:#fff;border-radius:16px;box-shadow:0 5px 20px rgba(0,0,0,.06)}.header{padding:24px;margin-bottom:22px;text-align:center}.header h1{margin:0;font-size:25px}.panel{padding:24px;margin-bottom:22px}.panel-title{margin:0 0 18px;font-size:19px}label{display:block;margin:0 0 8px;font-weight:700}select{width:100%;min-height:44px;padding:10px 12px;border:1px solid #cfdad5;border-radius:8px;background:#fff;font-size:15px}.hint,.empty,.message{margin-top:14px;padding:13px 15px;border-radius:9px;line-height:1.7}.hint{background:#edf8f3;color:#315f4d}.empty{background:#f5f5f5;color:#777;text-align:center}.message{display:none;background:#fff2f0;color:#a33b31}.order-summary{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:18px}.summary-cell{padding:14px;border-radius:10px;background:#f5faf8}.summary-cell small{display:block;margin-bottom:6px;color:#79847f}.items{display:grid;gap:12px;margin-top:18px}.item{display:grid;grid-template-columns:minmax(240px,1fr) 150px 120px;align-items:center;gap:16px;padding:16px;border:1px solid #dce7e2;border-radius:12px;cursor:pointer}.item:hover,.item.selected{border-color:#07c160;background:#f1fbf6}.item-name{font-weight:700}.item-meta{margin-top:5px;color:#748079;font-size:13px}.badge{justify-self:end;padding:6px 12px;border-radius:20px;background:#e4f7ed;color:#078443;white-space:nowrap}.actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:18px}button{border:0;border-radius:8px;padding:11px 24px;font-size:15px;cursor:pointer}button.primary{background:#07c160;color:#fff}button.secondary{background:#e9f7f0;color:#087a45}button:disabled{cursor:not-allowed;opacity:.55}.qr-header{margin-bottom:16px;line-height:1.8}.qr-list{display:grid;grid-template-columns:repeat(3,minmax(220px,1fr));gap:16px}.qr-card{padding:14px;border:1px solid #d9e2de;border-radius:10px;text-align:center;break-inside:avoid}.qr-box{display:flex;justify-content:center;margin:10px auto}.qr-sn{font-weight:700}.qr-code-text{margin-top:7px;font-size:11px;word-break:break-all;color:#68736d}
-    @media(max-width:760px){body{padding:12px}.order-summary{grid-template-columns:1fr}.item{grid-template-columns:1fr}.badge{justify-self:start}.qr-list{grid-template-columns:1fr}}
-    @media print{@page{size:A4;margin:10mm}body{padding:0;background:#fff}body>.container>:not(#result-panel){display:none!important}#result-panel{box-shadow:none;padding:0;margin:0}#result-panel .actions{display:none!important}.qr-list{grid-template-columns:repeat(3,1fr);gap:7mm}.qr-card{border:1px solid #aaa;padding:4mm}}
+    *{box-sizing:border-box}body{margin:0;padding:28px;background:#f4f7f6;color:#17251f;font-family:"Microsoft YaHei",Arial,sans-serif}.container{max-width:1180px;margin:auto}.header,.panel{background:#fff;border-radius:16px;box-shadow:0 5px 20px rgba(0,0,0,.06)}.header{padding:24px;margin-bottom:22px;text-align:center}.header h1{margin:0;font-size:25px}.header p{margin:9px 0 0;color:#66756c}.panel{padding:24px;margin-bottom:22px}.panel-title{margin:0 0 18px;font-size:19px}label{display:block;margin:0 0 8px;font-weight:700}select{width:100%;min-height:44px;padding:10px 12px;border:1px solid #cfdad5;border-radius:8px;background:#fff;font-size:15px}.hint,.empty,.message{margin-top:14px;padding:13px 15px;border-radius:9px;line-height:1.7}.hint{background:#edf8f3;color:#315f4d}.empty{background:#f5f5f5;color:#777;text-align:center}.message{display:none;background:#fff2f0;color:#a33b31}.actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:18px}button{border:0;border-radius:8px;padding:11px 24px;font-size:15px;cursor:pointer}button.primary{background:#07c160;color:#fff}button.secondary{background:#e9f7f0;color:#087a45}button:disabled{cursor:not-allowed;opacity:.55}.qr-header{margin-bottom:16px;line-height:1.8}.qr-list{display:grid;grid-template-columns:repeat(3,minmax(220px,1fr));gap:16px}.qr-card{padding:14px;border:1px solid #d9e2de;border-radius:10px;text-align:center;break-inside:avoid}.qr-box{display:flex;justify-content:center;margin:10px auto}.qr-box img{width:150px;height:150px;image-rendering:pixelated}.qr-sn{font-weight:700}.qr-code-text{margin-top:7px;font-size:11px;word-break:break-all;color:#68736d}@media(max-width:760px){body{padding:12px}.qr-list{grid-template-columns:1fr}}@media print{body:not(.print-allowed) #result-panel{display:none!important}@page{size:A4;margin:10mm}body{padding:0;background:#fff}body>.container>:not(#result-panel){display:none!important}#result-panel{box-shadow:none;padding:0;margin:0}#result-panel .actions{display:none!important}.qr-list{grid-template-columns:repeat(3,1fr);gap:7mm}.qr-card{border:1px solid #aaa;padding:4mm}}
   </style>
 </head>
-<body><main class="container">
-  <header class="header"><h1>PLDP 产品生命周期二维码打印中心</h1></header>
-  <section class="panel"><h2 class="panel-title">第一步：选择待打印订单</h2>
-    <label for="order-select">订单计划（订单号｜商家｜厂家销售经理）</label><select id="order-select"><option value="">正在加载...</option></select>
-    <div class="hint">仅显示已完成生产、销售经理已下达发货指令，且仍有产品型号未完成二维码打印的订单。</div><div id="message" class="message"></div>
-    <div id="order-content" hidden><div class="order-summary">
-      <div class="summary-cell"><small>订单计划</small><span id="plan-code"></span></div><div class="summary-cell"><small>商家</small><span id="merchant-name"></span></div><div class="summary-cell"><small>厂家销售经理</small><span id="sales-manager"></span></div>
-    </div><h2 class="panel-title" style="margin-top:22px">第二步：选择本轮打印的产品型号</h2><div id="items" class="items"></div><div class="actions"><button id="generate-btn" class="primary" disabled>生成本型号全部二维码</button></div></div>
-    <div id="empty" class="empty" hidden>当前没有待打印的订单。</div>
-  </section>
-  <section id="result-panel" class="panel" hidden><h2 class="panel-title">第三步：打印本型号二维码</h2><div id="qr-header" class="qr-header"></div><div id="qr-list" class="qr-list"></div><div class="actions"><button id="print-btn" class="primary">打印二维码</button><button id="confirm-btn" class="secondary">确认本型号已打印完成</button></div></section>
-</main>
-<script>
-const DATA_URL="{% url 'pldp:web:print:data' %}",GENERATE_URL="{% url 'pldp:web:print:print_qrcode' %}",CONFIRM_URL="{% url 'pldp:web:print:print_confirm' %}";
-const state={orders:[],order:null,item:null,result:null},$=id=>document.getElementById(id);
-function cookie(name){const part=document.cookie.split("; ").find(row=>row.startsWith(name+"="));return part?decodeURIComponent(part.split("=").slice(1).join("=")):""}
-async function api(url,options={}){const response=await fetch(url,{credentials:"same-origin",...options,headers:{"Content-Type":"application/json","X-CSRFToken":cookie("csrftoken"),...(options.headers||{})}}),payload=await response.json();if(!response.ok||payload.code!==0)throw new Error(payload.msg||"请求失败");return payload.data}
-function showError(error){$("message").textContent=error.message||String(error);$("message").style.display="block"}function clearError(){$("message").style.display="none"}
-function renderOrders(){const select=$("order-select");select.innerHTML='<option value="">请选择待打印订单</option>';state.orders.forEach(order=>{const option=document.createElement("option");option.value=order.id;option.textContent=`${order.plan_code}｜${order.merchant_name}｜${order.sales_manager_name}`;select.appendChild(option)});$("empty").hidden=state.orders.length>0;$("order-content").hidden=true;$("result-panel").hidden=true}
-function renderOrder(){const order=state.order;$("order-content").hidden=!order;$("result-panel").hidden=true;state.item=null;$("generate-btn").disabled=true;if(!order)return;$("plan-code").textContent=order.plan_code;$("merchant-name").textContent=order.merchant_name;$("sales-manager").textContent=order.sales_manager_name;const list=$("items");list.innerHTML="";order.items.forEach(item=>{const node=document.createElement("div");node.className="item";node.innerHTML=`<div><div class="item-name">${item.product_model_name}</div><div class="item-meta">${item.category_name}｜${item.product_model_code}</div></div><div><strong>${item.quantity}</strong> 台<br><span class="item-meta">${item.order_batch_code}</span></div><span class="badge">${item.generated?"已生成·待打印":"待生成"}</span>`;node.onclick=()=>{document.querySelectorAll(".item").forEach(el=>el.classList.remove("selected"));node.classList.add("selected");state.item=item;$("generate-btn").disabled=false;$("generate-btn").textContent=item.generated?"重新显示本型号二维码":"生成本型号全部二维码"};list.appendChild(node)})}
-function renderQRCodes(data){state.result=data;const item=data.item;$("qr-header").innerHTML=`<strong>${item.product_model_name}</strong>（${item.product_model_code}）<br>订单批次：${item.order_batch_code}｜本轮共 ${data.qrcodes.length} 张`;const list=$("qr-list");list.innerHTML="";data.qrcodes.forEach((entry,index)=>{const card=document.createElement("div");card.className="qr-card";card.innerHTML=`<div>${index+1} / ${data.qrcodes.length}</div><div class="qr-box"></div><div class="qr-sn">${entry.device_sn}</div><div class="qr-code-text">${entry.code}</div>`;list.appendChild(card);new QRCode(card.querySelector(".qr-box"),{text:entry.code,width:150,height:150})});$("result-panel").hidden=false;$("result-panel").scrollIntoView({behavior:"smooth"})}
-async function load(){clearError();try{const data=await api(DATA_URL);state.orders=data.orders||[];state.order=null;renderOrders()}catch(error){showError(error)}}
-$("order-select").onchange=event=>{state.order=state.orders.find(order=>String(order.id)===event.target.value)||null;renderOrder()};
-$("generate-btn").onclick=async()=>{if(!state.item)return;clearError();$("generate-btn").disabled=true;try{renderQRCodes(await api(GENERATE_URL,{method:"POST",body:JSON.stringify({item_id:state.item.id})}))}catch(error){showError(error)}finally{$("generate-btn").disabled=false}};
-$("print-btn").onclick=()=>window.print();
-$("confirm-btn").onclick=async()=>{if(!state.result||!confirm("请确认本型号全部二维码已经实际打印完成。确认后，本型号将从待打印列表移除。"))return;$("confirm-btn").disabled=true;try{await api(CONFIRM_URL,{method:"POST",body:JSON.stringify({item_id:state.result.item.id})});alert("本型号打印完成，待打印列表已更新。全部型号完成后，该订单将自动消失。");await load()}catch(error){showError(error)}finally{$("confirm-btn").disabled=false}};load();
-</script></body></html>
+<body>
+  <main class="container">
+    <header class="header">
+      <h1>PLDP V2 二维码打印中心</h1>
+      <p>{{ identity.organization.name }} · {{ identity.role.name }} · 已扫码登录</p>
+      <button id="logout-btn" class="secondary">退出打印中心</button>
+    </header>
+    <section class="panel">
+      <h2 class="panel-title">第一步：选择已授权发货批次</h2>
+      <label for="shipment-select">订单计划｜收货商家｜发货批次</label>
+      <select id="shipment-select">
+        <option value="">请选择待打印的发货批次</option>
+        {% for shipment in shipments %}
+          <option value="{{ shipment.id }}">{{ shipment.order_plan.plan_code }}｜{{ shipment.order_plan.merchant_organization.name }}｜{% if shipment.production_subplan %}子计划 {{ shipment.production_subplan.sequence_no }}{% else %}成品库存调用{% endif %}｜第 {{ shipment.sequence_no }} 批</option>
+        {% endfor %}
+      </select>
+      <div class="hint">仅显示本厂销售经理已授权、且尚未确认打印贴包的 V2 发货批次。二维码与设备 SN 一一对应；请实际打印并贴包后再确认。</div>
+      {% if not shipments %}<div class="empty">当前没有待打印的 V2 发货批次。</div>{% endif %}
+      <div id="message" class="message"></div>
+      <div class="actions"><button id="generate-btn" class="primary" disabled>生成本批二维码清单</button></div>
+    </section>
+    <section id="result-panel" class="panel" hidden>
+      <h2 class="panel-title">第二步：打印并确认本批二维码</h2>
+      <div id="qr-header" class="qr-header"></div>
+      <div id="qr-list" class="qr-list"></div>
+      <div class="actions"><button id="print-btn" class="primary">打印二维码</button><button id="confirm-btn" class="secondary">确认本批已打印贴包</button></div>
+    </section>
+  </main>
+  <script>
+    const PREPARE_URL="{% url 'pldp:web:print:prepare' %}",CONFIRM_URL="{% url 'pldp:web:print:confirm' %}",LOGOUT_URL="{% url 'pldp:web:print:logout' %}";
+    const $=id=>document.getElementById(id),state={shipmentId:null,result:null,busy:false};
+    const csrf="{{ csrf_token|escapejs }}";
+    async function api(url,body){const response=await fetch(url,{method:"POST",credentials:"same-origin",cache:"no-store",headers:{"Content-Type":"application/json","X-CSRFToken":csrf},body:JSON.stringify(body)});let payload;try{payload=await response.json()}catch(e){throw new Error("请求失败，请刷新页面重试。")}if(!response.ok||payload.code!==0){if(response.status===403){clearResult();setTimeout(()=>window.location.reload(),1200)}throw new Error(payload.msg||"请求失败")}return payload.data}
+    function showError(error){$("message").textContent=error.message||String(error);$("message").style.display="block"}function clearError(){$("message").style.display="none"}
+    function clearResult(){state.result=null;$("qr-list").textContent="";$("result-panel").hidden=true;document.body.classList.remove("print-allowed")}
+    function renderQRCodes(data){state.result=data;$("qr-header").textContent=`${data.plan_code}｜${data.shipment_title}｜本批共 ${data.qrcodes.length} 张`;const list=$("qr-list");list.textContent="";data.qrcodes.forEach((entry,index)=>{const card=document.createElement("div");card.className="qr-card";const sequence=document.createElement("div");sequence.textContent=`${index+1} / ${data.qrcodes.length}`;const box=document.createElement("div");box.className="qr-box";const img=document.createElement("img");img.src=entry.qr_image;img.alt=entry.device_sn+"二维码";box.appendChild(img);const sn=document.createElement("div");sn.className="qr-sn";sn.textContent=entry.device_sn;const code=document.createElement("div");code.className="qr-code-text";code.textContent=entry.code;card.append(sequence,box,sn,code);list.appendChild(card)});$("result-panel").hidden=false;$("result-panel").scrollIntoView({behavior:"smooth"})}
+    $("shipment-select").onchange=event=>{state.shipmentId=event.target.value||null;clearResult();$("generate-btn").disabled=!state.shipmentId;clearError()};
+    $("generate-btn").onclick=async()=>{if(!state.shipmentId||state.busy)return;const selected=state.shipmentId;clearError();state.busy=true;$("generate-btn").disabled=true;$("shipment-select").disabled=true;try{renderQRCodes(await api(PREPARE_URL,{shipment_id:selected}))}catch(error){clearResult();showError(error)}finally{state.busy=false;$("shipment-select").disabled=false;$("generate-btn").disabled=!state.shipmentId}};
+    $("print-btn").onclick=async()=>{if(!state.result||state.busy)return;state.busy=true;$("print-btn").disabled=true;try{await api(PREPARE_URL,{shipment_id:state.result.shipment_id});await Promise.all(Array.from($("qr-list").querySelectorAll("img")).map(img=>img.decode()));document.body.classList.add("print-allowed");window.print()}catch(error){clearResult();showError(error)}finally{state.busy=false;$("print-btn").disabled=false;document.body.classList.remove("print-allowed")}};
+    $("confirm-btn").onclick=async()=>{if(!state.result||state.busy||!confirm("请确认本批二维码已实际打印并贴到对应包装。确认后不能再次生成打印清单。"))return;state.busy=true;$("confirm-btn").disabled=true;try{const shipmentId=state.result.shipment_id;await api(CONFIRM_URL,{shipment_id:shipmentId});clearResult();try{localStorage.setItem("pldp.printedShipment",JSON.stringify({shipmentId,at:Date.now()}))}catch(e){}alert("本批二维码已确认打印贴包。");window.location.replace("{% url 'pldp:web:print:center' %}")}catch(error){showError(error);$("confirm-btn").disabled=false}finally{state.busy=false}};
+    $("logout-btn").onclick=async()=>{try{await api(LOGOUT_URL,{});clearResult();window.location.replace("{% url 'pldp:web:print:center' %}")}catch(error){showError(error)}};
+    window.addEventListener("keydown",event=>{if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==="p"){event.preventDefault();$("print-btn").click()}});
+    window.addEventListener("afterprint",()=>document.body.classList.remove("print-allowed"));
+    window.addEventListener("storage",event=>{if(event.key==="pldp.printedShipment"){let update;try{update=JSON.parse(event.newValue)}catch(e){return}if(update&&String(update.shipmentId)===String(state.shipmentId)){clearResult();window.location.reload()}}});
+    window.addEventListener("pageshow",event=>{if(event.persisted){clearResult();window.location.reload()}});
+    const expiresAt=Number("{{ grant_expires_at }}")*1000;
+    setTimeout(()=>{clearResult();window.location.replace("{% url 'pldp:web:print:center' %}")},Math.max(0,expiresAt-Date.now()));
+  </script>
+</body>
+</html>

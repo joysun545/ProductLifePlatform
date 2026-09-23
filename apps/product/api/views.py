@@ -256,7 +256,7 @@ def validate_bom_items(category, raw_items):
         material = materials.get(row["material_id"])
         if not material:
             return None, f"BOM第{index}行的物料不存在"
-        if material.product_category_id != category.id:
+        if not material.product_categories.filter(pk=category.pk).exists():
             return None, f"物料“{material.name}”不属于当前产品品类"
 
         spec = specs.get(row["material_spec_id"])
@@ -337,7 +337,7 @@ class ProductModelListAPI(APIView):
             product_model_id=OuterRef("pk"),
             version=V1_VERSION,
         )
-        products = ProductModel.objects.select_related("category", "brand").annotate(
+        products = ProductModel.objects.select_related("category").annotate(
             has_v1_bom=Exists(v1_boms),
             active_document_count=Count(
                 "documents",
@@ -356,7 +356,6 @@ class ProductModelListAPI(APIView):
                     "name": product.name,
                     "code": product.code,
                     "description": product.description,
-                    "brand": product.brand.name if product.brand else None,
                     "category_id": product.category_id,
                     "category": product.category.name,
                     "has_v1_bom": product.has_v1_bom,
@@ -444,7 +443,6 @@ class ProductModelCreateAPI(APIView):
                     code=code,
                     name=name,
                     category=category,
-                    brand=None,
                     description=description,
                 )
                 bom = BOM.objects.create(
@@ -489,7 +487,7 @@ class CategoryBOMOptionsAPI(APIView):
         specs = MaterialSpec.objects.order_by("code").prefetch_related(
             Prefetch("suppliers", queryset=supplier_links)
         )
-        materials = Material.objects.filter(product_category=category).order_by(
+        materials = Material.objects.filter(product_categories=category).distinct().order_by(
             "code", "id"
         ).prefetch_related(Prefetch("specs", queryset=specs))
 

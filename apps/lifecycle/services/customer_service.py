@@ -471,7 +471,6 @@ class CustomerDeviceService:
             Device.objects.select_related(
                 "product_model",
                 "product_model__category",
-                "product_model__brand",
                 "state",
                 "batch",
                 "batch__manufacturer",
@@ -543,7 +542,6 @@ class CustomerDeviceService:
             )
             .select_related(
                 "device__product_model__category",
-                "device__product_model__brand",
                 "device__batch__manufacturer",
                 "device__batch__bom",
                 "device__state",
@@ -578,11 +576,6 @@ class CustomerDeviceService:
                     "product_model": device.product_model.name,
                     "product_model_code": device.product_model.code,
                     "category": device.product_model.category.name,
-                    "brand": (
-                        device.product_model.brand.name
-                        if device.product_model.brand
-                        else ""
-                    ),
                     "manufacturer": device.batch.manufacturer.name,
                     "production_batch": device.batch.batch_no,
                     "bom_version": device.batch.bom.version,
@@ -991,7 +984,6 @@ class CustomerDeviceService:
                 "product_model": product_model.name,
                 "product_model_code": product_model.code,
                 "category": product_model.category.name,
-                "brand": product_model.brand.name if product_model.brand else "",
                 "description": product_model.description,
                 "source_organization": (
                     binding.source_organization.name if binding else ""
@@ -1008,10 +1000,6 @@ class CustomerDeviceService:
             "parameters": [
                 {"label": "型号编码", "value": product_model.code},
                 {"label": "产品品类", "value": product_model.category.name},
-                {
-                    "label": "品牌",
-                    "value": product_model.brand.name if product_model.brand else "未设置",
-                },
                 {"label": "生产批次", "value": batch.batch_no},
                 {"label": "BOM版本", "value": batch.bom.version},
             ],

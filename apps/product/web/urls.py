@@ -15,5 +15,6 @@ urlpatterns = [
         views.product_manage,
         name="product_manage"
     ),
+    path("material-fault-causes/", views.material_fault_causes, name="material_fault_causes"),
 
 ]

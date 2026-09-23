@@ -1,10 +1,40 @@
 import hashlib
+import re
+from urllib.parse import parse_qs, urlsplit
 
 from workflow.models import UserTask
 
 
 FACTORY_RETURN_TYPE_PREFIX = "FACTORY_RETURN_"
 QUALITY_RECALL_TYPE_PREFIX = "QUALITY_RECALL_"
+GOODS_TRANSFER_TYPE_PREFIX = "GOODS_TRANSFER_"
+# A grouped inbox card normally opens the newest unread update.  Some business
+# flows also place a real operation and read-only progress notices in the same
+# group.  In those flows the operation must win the card entry so the user is
+# taken to the node they can actually complete.
+ACTION_PREFERRED_GROUP_KINDS = frozenset({"QUALITY_RECALL", "ORDER_PLAN", "GOODS_TRANSFER"})
+# A grouped V2 order plan is one inbox card even though it deliberately keeps
+# every auditable child UserTask.  The card-level counters below are used by
+# the tab badge and the task-list badge, while ``child_*`` counters remain
+# available to the detail view for the real underlying task count.
+CARD_COUNTED_GROUP_KINDS = frozenset({"QUALITY_RECALL", "ORDER_PLAN", "GOODS_TRANSFER"})
+SUPPLIER_COLLABORATION_TYPES = frozenset(
+    {
+        # The first two are the verified legacy supplier-confirmation flow.
+        "ORDER_PLAN_SUPPLIER_PREPARE",
+        "ORDER_PLAN_SUPPLIER_CONFIRMED",
+        # V2 sends an independent material-delivery task.  It uses the same
+        # immutable responsibility scope, but its link opens the V2 detail
+        # rather than the legacy list.
+        "ORDER_PLAN_SUPPLIER_DELIVERY",
+    }
+)
+SUPPLIER_ACTION_TYPES = frozenset(
+    {
+        "ORDER_PLAN_SUPPLIER_PREPARE",
+        "ORDER_PLAN_SUPPLIER_DELIVERY",
+    }
+)
 
 
 def _append_query(link, values):
@@ -65,6 +95,22 @@ def _resolved_link(task):
         )
     if workitem.link:
         return workitem.link
+    transfer_id = _goods_transfer_id(workitem)
+    if transfer_id:
+        page = (
+            "goods_transfer_accounts"
+            if workitem.type.startswith("GOODS_TRANSFER_ACCOUNT_")
+            else (
+                "goods_transfer_settlement"
+                if workitem.type in {
+                    "GOODS_TRANSFER_DOCUMENTS_UPLOAD",
+                    "GOODS_TRANSFER_PAYMENT_UPLOAD",
+                    "GOODS_TRANSFER_PAYMENT_CONFIRM",
+                }
+                else "goods_transfer_detail"
+            )
+        )
+        return f"/pages/stock/{page}/{page}?transfer_id={transfer_id}"
     if workitem.type == "ORDER_PLAN_MATCHING" and payload.get("order_plan_id"):
         return (
             "/pages/sales/matching_confirm/matching_confirm"
@@ -75,10 +121,7 @@ def _resolved_link(task):
 
 def _collaboration_data(task):
     workitem = task.workitem
-    if workitem.type not in {
-        "ORDER_PLAN_SUPPLIER_PREPARE",
-        "ORDER_PLAN_SUPPLIER_CONFIRMED",
-    }:
+    if workitem.type not in SUPPLIER_COLLABORATION_TYPES:
         return None
     payload = workitem.payload if isinstance(workitem.payload, dict) else {}
     scopes = payload.get("recipient_scopes", {})
@@ -118,7 +161,7 @@ def _collaboration_data(task):
         "state": state,
         "state_name": state_name,
         "can_confirm": (
-            workitem.type == "ORDER_PLAN_SUPPLIER_PREPARE"
+            workitem.type in SUPPLIER_ACTION_TYPES
             and workitem.status == "OPEN"
             and task.state != "DONE"
             and task.need_action
@@ -210,6 +253,133 @@ def _factory_return_scope(workitem):
     return ""
 
 
+def _positive_id(value):
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+    raw = str(value).strip()
+    if not raw.isascii() or not raw.isdigit() or len(raw) > 19:
+        return None
+    number = int(raw)
+    return number if 0 < number <= 9223372036854775807 else None
+
+
+def _goods_transfer_id(workitem):
+    """Resolve one immutable transfer id, never a counterparty/account id.
+
+    Current publishers all carry goods_transfer_id. The other anchored
+    references support older rows without rewriting their payload/history.
+    Conflicting concrete ids stay separate for review instead of choosing a
+    shipment arbitrarily. Neither merchant names nor account ids are a key.
+    Restrict this to goods-flow types: factory-return processing and order
+    plan tasks have their own existing grouping semantics.
+    """
+
+    if not workitem.type.startswith(GOODS_TRANSFER_TYPE_PREFIX):
+        return None
+    payload = workitem.payload if isinstance(workitem.payload, dict) else {}
+    references = set()
+    transfer_id = _positive_id(payload.get("goods_transfer_id"))
+    if transfer_id:
+        references.add(transfer_id)
+    match = re.fullmatch(
+        r"(?:apps\.)?(?:lifecycle\.)?GoodsTransfer:([0-9]+)",
+        workitem.biz_ref or "",
+    )
+    if match:
+        transfer_id = _positive_id(match.group(1))
+        if transfer_id:
+            references.add(transfer_id)
+    try:
+        link = urlsplit(workitem.link or "")
+        if re.fullmatch(
+            r"/pages/stock/(goods_transfer_detail|goods_transfer_settlement|goods_transfer_accounts)/\1",
+            link.path,
+        ):
+            values = parse_qs(link.query).get("transfer_id", [])
+            if len(values) == 1:
+                transfer_id = _positive_id(values[0])
+                if transfer_id:
+                    references.add(transfer_id)
+    except ValueError:
+        pass
+    match = re.match(
+        r"^lifecycle:goods-transfer:([0-9]+):", workitem.uniq_key or ""
+    )
+    if match:
+        transfer_id = _positive_id(match.group(1))
+        if transfer_id:
+            references.add(transfer_id)
+    if len(references) > 1:
+        workitem._inbox_goods_transfer_conflict = True
+        return None
+    if references:
+        return references.pop()
+    if getattr(workitem, "_inbox_goods_transfer_conflict", False):
+        return None
+    return getattr(workitem, "_inbox_goods_transfer_id", None)
+
+
+def _prime_goods_transfer_scopes(tasks):
+    """Batch-resolve legacy ledger/flow references for one account's inbox.
+
+    The usual path (explicit transfer id, biz_ref or detail link) issues no
+    queries. An unresolvable historical row remains a separate task rather
+    than accidentally merging two shipments to the same merchant.
+    """
+
+    unresolved = [
+        task.workitem for task in tasks
+        if task.workitem.type.startswith(GOODS_TRANSFER_TYPE_PREFIX)
+        and not _goods_transfer_id(task.workitem)
+        and not getattr(task.workitem, "_inbox_goods_transfer_conflict", False)
+    ]
+    if not unresolved:
+        return
+    from lifecycle.models import (
+        GoodsTransfer, GoodsTransferAccountCase, GoodsTransferAccountPayment,
+        GoodsTransferPayment, GoodsTransferSettlement,
+    )
+    flow_refs = {}
+    ledger_refs = {}
+    for workitem in unresolved:
+        payload = workitem.payload if isinstance(workitem.payload, dict) else {}
+        flow_no = payload.get("flow_no") or workitem.biz_id
+        if isinstance(flow_no, str) and flow_no and len(flow_no) <= 64:
+            flow_refs[workitem.pk] = flow_no
+        account_flow = workitem.type.startswith("GOODS_TRANSFER_ACCOUNT_")
+        for field, kind in (
+            ("account_case_id", "case"),
+            ("settlement_id", "settlement"),
+            ("payment_id", "account_payment" if account_flow else "payment"),
+        ):
+            ref_id = _positive_id(payload.get(field))
+            if ref_id:
+                ledger_refs.setdefault(kind, {})[workitem.pk] = ref_id
+    resolved = {}
+    for kind, model, transfer_field in (
+        ("case", GoodsTransferAccountCase, "transfer_id"),
+        ("settlement", GoodsTransferSettlement, "transfer_id"),
+        ("payment", GoodsTransferPayment, "settlement__transfer_id"),
+        ("account_payment", GoodsTransferAccountPayment, "account_case__transfer_id"),
+    ):
+        references = ledger_refs.get(kind, {})
+        if not references:
+            continue
+        mapping = dict(model.objects.filter(pk__in=set(references.values())).values_list("pk", transfer_field))
+        for work_id, ref_id in references.items():
+            if ref_id in mapping:
+                resolved.setdefault(work_id, set()).add(mapping[ref_id])
+    if flow_refs:
+        mapping = dict(GoodsTransfer.objects.filter(flow_no__in=set(flow_refs.values())).values_list("flow_no", "pk"))
+        for work_id, flow_no in flow_refs.items():
+            if flow_no in mapping:
+                resolved.setdefault(work_id, set()).add(mapping[flow_no])
+    for workitem in unresolved:
+        references = resolved.get(workitem.pk, set())
+        workitem._inbox_goods_transfer_conflict = len(references) > 1
+        workitem._inbox_goods_transfer_id = next(iter(references)) if len(references) == 1 else None
+
+
 def _task_group_scope(task):
     workitem = task.workitem
     payload = workitem.payload if isinstance(workitem.payload, dict) else {}
@@ -219,6 +389,12 @@ def _task_group_scope(task):
     # historical rows whose explicit key used to contain an organization id.
     if workitem.type.startswith(QUALITY_RECALL_TYPE_PREFIX) and workitem.biz_id:
         return f"quality-recall:campaign:{workitem.biz_id}"
+
+    transfer_id = _goods_transfer_id(workitem)
+    if transfer_id:
+        return f"goods-transfer:transfer:{transfer_id}"
+    if getattr(workitem, "_inbox_goods_transfer_conflict", False):
+        return f"task:{task.pk}"
 
     explicit_scope = payload.get("inbox_group_key")
     if explicit_scope:
@@ -247,7 +423,7 @@ def _group_metadata(scope, tasks):
         if isinstance(representative.workitem.payload, dict)
         else {}
     )
-    is_aftersales = (
+    is_aftersales = not scope.startswith("goods-transfer:transfer:") and (
         scope.startswith("explicit:aftersales:")
         or payload.get("inbox_group_kind") == "AFTERSALES"
     )
@@ -264,6 +440,22 @@ def _group_metadata(scope, tasks):
             "group_label": "召回任务",
             "is_workorder": False,
         }
+    if scope.startswith("goods-transfer:transfer:"):
+        transfer_id = int(scope.rsplit(":", 1)[1])
+        flow_no = next((
+            (task.workitem.payload or {}).get("flow_no") or task.workitem.biz_id
+            for task in tasks
+            if isinstance(task.workitem.payload, dict)
+            and ((task.workitem.payload or {}).get("flow_no") or task.workitem.biz_id)
+        ), "")
+        return {
+            "group_kind": "GOODS_TRANSFER",
+            "group_label": f"商品流转：{flow_no}" if flow_no else f"商品流转单：{transfer_id}",
+            "is_workorder": False,
+            "single_business_card": True,
+            "goods_transfer_id": transfer_id,
+            "flow_no": flow_no,
+        }
     return {
         "group_kind": payload.get("inbox_group_kind") or "",
         "group_label": payload.get("inbox_group_label") or "同一业务任务",
@@ -271,13 +463,36 @@ def _group_metadata(scope, tasks):
     }
 
 
-def _compose_group_title(tasks):
+def _uses_card_level_badge(scope, tasks):
+    """Whether a grouped inbox projection contributes one badge unit.
+
+    Recall has always used campaign-level badges.  Material-stock V2 order
+    plans follow the same rule: a plan can have several independent auditable
+    tasks, but it must present one task-card badge instead of inflating the
+    user's pending count.  Inspect all children so a historical row lacking
+    metadata cannot accidentally make a correctly grouped V2 card regress.
+    """
+
+    if scope.startswith(("quality-recall:campaign:", "goods-transfer:transfer:")):
+        return True
+    for task in tasks:
+        payload = (
+            task.workitem.payload
+            if isinstance(task.workitem.payload, dict)
+            else {}
+        )
+        if payload.get("inbox_group_kind") == "ORDER_PLAN":
+            return True
+    return False
+
+
+def _compose_group_title(tasks, *, prefer_action=False):
     unread = [task for task in tasks if task.state == "NEW"]
     pending_action = [
         task for task in tasks
         if task.need_action and task.state != "DONE"
     ]
-    candidates = unread or pending_action or tasks
+    candidates = (pending_action or unread or tasks) if prefer_action else (unread or pending_action or tasks)
 
     titles = []
     for task in candidates:
@@ -331,7 +546,9 @@ def _serialize_group(scope, tasks, *, include_children=False):
     metadata = _group_metadata(scope, tasks)
     entry_task = _entry_task(
         tasks,
-        prefer_action=metadata["group_kind"] == "QUALITY_RECALL",
+        prefer_action=(
+            metadata["group_kind"] in ACTION_PREFERRED_GROUP_KINDS
+        ),
     )
     child_items = [_serialize_task(task) for task in tasks]
     entry_item = _serialize_task(entry_task)
@@ -340,13 +557,13 @@ def _serialize_group(scope, tasks, *, include_children=False):
     child_action_pending_count = sum(
         task.need_action and task.state != "DONE" for task in tasks
     )
-    is_quality_recall = metadata["group_kind"] == "QUALITY_RECALL"
+    uses_card_level_badge = _uses_card_level_badge(scope, tasks)
     unread_count = (
-        int(bool(child_unread_count)) if is_quality_recall
+        int(bool(child_unread_count)) if uses_card_level_badge
         else child_unread_count
     )
     action_pending_count = (
-        int(bool(child_action_pending_count)) if is_quality_recall
+        int(bool(child_action_pending_count)) if uses_card_level_badge
         else child_action_pending_count
     )
     completed_count = sum(task.state == "DONE" for task in tasks)
@@ -362,6 +579,7 @@ def _serialize_group(scope, tasks, *, include_children=False):
         # using id/link/collaboration unchanged.
         **entry_item,
         "group_id": _group_id(scope),
+        "card_id": _group_id(scope),
         "entry_task_id": entry_task.pk,
         "entry_task_type": entry_task.workitem.type,
         "grouped": len(tasks) > 1,
@@ -380,7 +598,7 @@ def _serialize_group(scope, tasks, *, include_children=False):
         "title": (
             _task_title(representative)
             if metadata["is_workorder"] or metadata["group_kind"] == "QUALITY_RECALL"
-            else _compose_group_title(tasks)
+            else _compose_group_title(tasks, prefer_action=metadata["group_kind"] in ACTION_PREFERRED_GROUP_KINDS)
         ),
         "summary": (
             _task_summary(representative)
@@ -409,7 +627,23 @@ def _serialize_group(scope, tasks, *, include_children=False):
             else entry_link
         ),
     }
-    if is_quality_recall:
+    if metadata["group_kind"] == "GOODS_TRANSFER":
+        # One transfer stays one card through documents, physical receipt and
+        # independent payment rounds. Keep the actionable stage visible even
+        # if a newer knowledge update arrived; without actions show the latest
+        # stage instead of concatenating already-completed historical titles.
+        group["title"] = (
+            _compose_group_title(tasks, prefer_action=True)
+            if child_action_pending_count else _task_title(representative)
+        )
+        group["summary"] = _task_summary(entry_task)
+        if entry_link:
+            group["link"] = _append_query(entry_link, {
+                "task_group_id": _group_id(scope),
+                "task_id": entry_task.pk,
+                "from_task": 1,
+            })
+    if metadata["group_kind"] == "QUALITY_RECALL":
         _recall_display(group, entry_task)
     context = getattr(entry_task, "_recall_scope_context", None)
     if context:
@@ -487,6 +721,7 @@ def _task_groups(openid):
         .filter(to_openid=openid, badge_group="MY")
         .order_by("-cursor_time", "-id")
     )
+    _prime_goods_transfer_scopes(tasks)
     grouped = {}
     for task in tasks:
         scope = _task_group_scope(task)
@@ -536,7 +771,7 @@ def get_task_summary(openid):
         group_action = sum(
             task.need_action and task.state != "DONE" for task in tasks
         )
-        if scope.startswith("quality-recall:campaign:"):
+        if _uses_card_level_badge(scope, tasks):
             unread_count += int(bool(group_unread))
             action_pending_count += int(bool(group_action))
             attention_count += int(bool(group_unread or group_action))
@@ -584,7 +819,7 @@ def get_task_list(openid, limit=50):
 
     unread_count = sum(
         int(any(task.state == "NEW" for task in tasks))
-        if scope.startswith("quality-recall:campaign:")
+        if _uses_card_level_badge(scope, tasks)
         else sum(task.state == "NEW" for task in tasks)
         for scope, tasks in groups.items()
     )

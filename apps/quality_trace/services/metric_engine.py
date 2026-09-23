@@ -52,6 +52,31 @@ def _target_rows(version):
     target_ids = set(scope.get("target_ids") or [])
     usages = _usage_queryset(factory_id)
 
+    if target_type == "MATERIAL_CONTEXT":
+        material = Material.objects.filter(pk=scope.get("material_id")).first()
+        if not material:
+            return []
+        snapshot = {
+            "material_id": material.pk,
+            "material_code": material.code,
+            "material_name": material.name,
+            "product_category_id": scope.get("product_category_id"),
+            "product_model_id": scope.get("product_model_id"),
+            "material_spec_id": scope.get("material_spec_id"),
+            "supplier_id": scope.get("supplier_id"),
+            "supplier_batch_id": scope.get("supplier_batch_id"),
+        }
+        key = ":".join(str(snapshot.get(name) or "*") for name in (
+            "material_id", "product_category_id", "product_model_id",
+            "material_spec_id", "supplier_id", "supplier_batch_id",
+        ))
+        return [{
+            "type": target_type,
+            "id": material.pk,
+            "key": f"material-context:{key}",
+            "snapshot": snapshot,
+        }]
+
     if target_type == "SUPPLIER_BATCH":
         ids = usages.values_list("supplier_material_batch_id", flat=True).distinct()
         queryset = SupplierMaterialBatch.objects.filter(pk__in=ids)
@@ -124,9 +149,36 @@ def _target_rows(version):
     } for row in queryset]
 
 
-def _candidate_devices(factory_id, target):
+def _material_context_devices(factory_id, snapshot):
+    usages = _usage_queryset(factory_id).filter(
+        supplier_material_batch__material_id=snapshot["material_id"],
+    )
+    filters = {
+        "order_plan_item__product_model__category_id": snapshot.get("product_category_id"),
+        "order_plan_item__product_model_id": snapshot.get("product_model_id"),
+        "supplier_material_batch__material_spec_id": snapshot.get("material_spec_id"),
+        "supplier_material_batch__supplier_id": snapshot.get("supplier_id"),
+        "supplier_material_batch_id": snapshot.get("supplier_batch_id"),
+    }
+    for field, value in filters.items():
+        if value:
+            usages = usages.filter(**{field: value})
+    batch_codes = usages.values_list("order_plan_item__order_batch_code", flat=True).distinct()
+    return Device.objects.filter(
+        batch__manufacturer_id=factory_id,
+        batch__batch_no__in=batch_codes,
+    ).select_related("batch", "product_model")
+
+
+def _candidate_devices(factory_id, target, *, excluded_contexts=None):
     target_type = target["type"]
     target_id = target["id"]
+    if target_type == "MATERIAL_CONTEXT":
+        queryset = _material_context_devices(factory_id, target["snapshot"])
+        excluded_ids = set()
+        for scope in excluded_contexts or []:
+            excluded_ids.update(_material_context_devices(factory_id, scope).values_list("pk", flat=True))
+        return queryset.exclude(pk__in=excluded_ids)
     if target_type == "PRODUCT_MODEL":
         return Device.objects.filter(
             batch__manufacturer_id=factory_id,
@@ -163,6 +215,16 @@ def _material_matches(target, rows):
                 and row.get("supplier_id") == snapshot.get("supplier_id")
             ):
                 return True
+        elif target["type"] == "MATERIAL_CONTEXT":
+            if row.get("material_id") != snapshot.get("material_id"):
+                continue
+            if snapshot.get("material_spec_id") and row.get("material_spec_id") != snapshot.get("material_spec_id"):
+                continue
+            if snapshot.get("supplier_id") and row.get("supplier_id") != snapshot.get("supplier_id"):
+                continue
+            if snapshot.get("supplier_batch_id") and row.get("supplier_batch_id") != snapshot.get("supplier_batch_id"):
+                continue
+            return True
         elif target["type"] == "SUPPLIER" and row.get("supplier_id") == target["id"]:
             return True
         elif target["type"] == "MATERIAL" and row.get("material_id") == target["id"]:
@@ -188,12 +250,33 @@ def _fault_record_matches(target, record):
             record.material_id == snapshot.get("material_id")
             and record.supplier_id == snapshot.get("supplier_id")
         )
+    if target["type"] == "MATERIAL_CONTEXT":
+        snapshot = target["snapshot"]
+        return (
+            record.material_id == snapshot.get("material_id")
+            and (not snapshot.get("material_spec_id") or record.material_spec_id == snapshot.get("material_spec_id"))
+            and (not snapshot.get("supplier_id") or record.supplier_id == snapshot.get("supplier_id"))
+        )
     field = {
         "SUPPLIER": record.supplier_id,
         "MATERIAL": record.material_id,
         "MATERIAL_SPEC": record.material_spec_id,
     }[target["type"]]
     return field == target["id"]
+
+
+def _root_cause_matches(policy, material):
+    ids = set(policy.get("root_cause_ids") or [])
+    grades = set(policy.get("root_cause_grades") or [])
+    if not ids and not grades:
+        return True
+    cause_id = material.get("root_cause_id")
+    cause_grade = str(material.get("root_cause_grade") or "").upper()
+    if ids and cause_id not in ids:
+        return False
+    if grades and cause_grade not in grades:
+        return False
+    return True
 
 
 def _fault_occurrences(version, target, device_ids, window_start, window_end):
@@ -215,7 +298,14 @@ def _fault_occurrences(version, target, device_ids, window_start, window_end):
             applications = applications.filter(repair_material_replaced=True)
         for row in applications:
             materials = row.final_fault_materials or row.repair_materials or []
-            if _material_matches(target, materials):
+            has_cause_filter = bool(policy.get("root_cause_ids") or policy.get("root_cause_grades"))
+            matches = (
+                target["type"] == "PRODUCT_MODEL" and not has_cause_filter
+            ) or any(
+                _material_matches(target, [material]) and _root_cause_matches(policy, material)
+                for material in materials if isinstance(material, dict)
+            )
+            if matches:
                 occurrences[row.device_id].append({
                     "source": "AFTERSALES_CLOSED",
                     "source_id": row.pk,
@@ -255,11 +345,11 @@ def _severity(version, metric_value, exposure_count, fault_count):
     return severity
 
 
-def calculate_target_metric(version, target, *, at=None):
+def calculate_target_metric(version, target, *, at=None, excluded_contexts=None):
     at = at or timezone.now()
     window_start = at - timedelta(days=version.window_days)
     candidates = list(_candidate_devices(
-        version.rule.factory_organization_id, target,
+        version.rule.factory_organization_id, target, excluded_contexts=excluded_contexts,
     ).distinct())
     candidate_ids = [row.pk for row in candidates]
     denominator = version.denominator_policy_snapshot or {}
@@ -446,11 +536,11 @@ def _save_result(version, target, result, source):
     return snapshot, alert
 
 
-def evaluate_rule_version(version, *, source, at=None):
+def evaluate_rule_version(version, *, source, at=None, excluded_contexts=None):
     at = at or timezone.now()
     results = []
     for target in _target_rows(version):
-        result = calculate_target_metric(version, target, at=at)
+        result = calculate_target_metric(version, target, at=at, excluded_contexts=excluded_contexts)
         snapshot, alert = _save_result(version, target, result, source)
         results.append({
             "target_type": target["type"],
@@ -485,14 +575,30 @@ def active_rule_versions(*, factory_id=None, rule_id=None, at=None):
     return versions
 
 
+def _is_narrower_material_context(broad, candidate):
+    names = ("product_category_id", "product_model_id", "material_spec_id", "supplier_id", "supplier_batch_id")
+    if broad.get("material_id") != candidate.get("material_id"):
+        return False
+    strictly_narrower = False
+    for name in names:
+        broad_value, candidate_value = broad.get(name), candidate.get(name)
+        if broad_value and broad_value != candidate_value:
+            return False
+        if not broad_value and candidate_value:
+            strictly_narrower = True
+    return strictly_narrower
+
+
 def evaluate_active_rules(*, source, factory_id=None, rule_id=None, at=None):
+    versions = active_rule_versions(factory_id=factory_id, rule_id=rule_id, at=at)
     results = []
-    for version in active_rule_versions(
-        factory_id=factory_id, rule_id=rule_id, at=at,
-    ):
+    contexts = [version.scope_snapshot for version in versions if (version.scope_snapshot or {}).get("target_type") == "MATERIAL_CONTEXT"]
+    for version in versions:
+        scope = version.scope_snapshot or {}
+        excluded_contexts = [item for item in contexts if _is_narrower_material_context(scope, item)] if scope.get("target_type") == "MATERIAL_CONTEXT" else []
         results.append({
             "rule_id": version.rule_id,
             "rule_version_id": version.pk,
-            "targets": evaluate_rule_version(version, source=source, at=at),
+            "targets": evaluate_rule_version(version, source=source, at=at, excluded_contexts=excluded_contexts),
         })
     return results

@@ -35,13 +35,11 @@ class Material(models.Model):
     )
 
 
-    product_category = models.ForeignKey(
+    product_categories = models.ManyToManyField(
         "product.ProductCategory",
-        on_delete=models.PROTECT,
-        null=True,
         blank=True,
         related_name="materials",
-        verbose_name="所属产品分类"
+        verbose_name="适用产品品类",
     )
 
 
@@ -83,6 +81,53 @@ class Material(models.Model):
     def __str__(self):
 
         return f"{self.code}-{self.name}"
+
+
+class MaterialFaultCause(models.Model):
+    """Factory-independent fault-cause dictionary owned by one key material.
+
+    A cause is a controlled quality fact, not a free-text service conclusion.
+    The quality-rule version and every confirmed fault preserve a snapshot so
+    later dictionary edits never rewrite historic quality evidence.
+    """
+
+    class Grade(models.TextChoices):
+        A = "A", "A 级"
+        B = "B", "B 级"
+        C = "C", "C 级"
+
+    material = models.ForeignKey(
+        Material,
+        on_delete=models.PROTECT,
+        related_name="fault_causes",
+        verbose_name="所属关键物料",
+    )
+    code = models.CharField(max_length=64, verbose_name="根因编码")
+    name = models.CharField(max_length=128, verbose_name="根因名称")
+    grade = models.CharField(max_length=1, choices=Grade.choices, verbose_name="根因等级")
+    description = models.TextField(blank=True, default="", verbose_name="根因说明")
+    is_active = models.BooleanField(default=True, verbose_name="启用")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "关键物料故障根因"
+        verbose_name_plural = "关键物料故障根因"
+        ordering = ("material_id", "grade", "code")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("material", "code"),
+                name="supply_unique_material_fault_cause_code",
+            ),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.material_id and not self.material.is_key_part:
+            raise ValidationError({"material": "普通件不建立故障根因字典。"})
+
+    def __str__(self):
+        return f"{self.material.name}-{self.code}-{self.name}"
 
 
 
@@ -377,18 +422,17 @@ class SupplierMaterialBatch(models.Model):
 
 
 class SupplierResponsibilityScope(models.TextChoices):
-    """供应商销售经理责任范围的两种配置粒度。"""
+    """供应商销售经理责任范围。"""
 
-    CATEGORY = "CATEGORY", "按产品品类"
-    MATERIAL = "MATERIAL", "按物料名称"
+    MATERIAL = "MATERIAL", "按物料类型"
 
 
 class SupplierSalesResponsibility(models.Model):
     """
-    供应商负责人对本组织销售经理划分的物料责任范围。
+    多名销售经理时，供应商负责人按物料类型指定唯一责任人。
 
-    同一品类或同一物料在一个供应商组织内只有一个直接责任销售经理。
-    当品类范围与具体物料范围重叠时，具体物料配置优先。
+    只有一名销售经理时不创建记录，该销售经理默认负责全部物料；
+    没有销售经理时由供应商负责人独自负责全部物料。
     """
 
     supplier = models.ForeignKey(
@@ -409,18 +453,8 @@ class SupplierSalesResponsibility(models.Model):
         db_index=True,
         verbose_name="责任范围类型",
     )
-    product_category = models.ForeignKey(
-        "product.ProductCategory",
-        null=True,
-        blank=True,
-        on_delete=models.PROTECT,
-        related_name="supplier_sales_responsibilities",
-        verbose_name="负责产品品类",
-    )
     material = models.ForeignKey(
         Material,
-        null=True,
-        blank=True,
         on_delete=models.PROTECT,
         related_name="supplier_sales_responsibilities",
         verbose_name="负责物料",
@@ -436,33 +470,12 @@ class SupplierSalesResponsibility(models.Model):
     updated_at = models.DateTimeField(auto_now=True, verbose_name="更新时间")
 
     class Meta:
-        ordering = ("supplier_id", "scope_type", "id")
+        ordering = ("supplier_id", "material_id", "id")
         verbose_name = "供应商销售责任范围"
         verbose_name_plural = "供应商销售责任范围"
         constraints = [
-            models.CheckConstraint(
-                condition=(
-                    Q(
-                        scope_type=SupplierResponsibilityScope.CATEGORY,
-                        product_category__isnull=False,
-                        material__isnull=True,
-                    )
-                    | Q(
-                        scope_type=SupplierResponsibilityScope.MATERIAL,
-                        product_category__isnull=True,
-                        material__isnull=False,
-                    )
-                ),
-                name="supply_chain_supplier_responsibility_scope_consistent",
-            ),
-            models.UniqueConstraint(
-                fields=("supplier", "product_category"),
-                condition=Q(scope_type=SupplierResponsibilityScope.CATEGORY),
-                name="supply_chain_unique_supplier_category_responsibility",
-            ),
             models.UniqueConstraint(
                 fields=("supplier", "material"),
-                condition=Q(scope_type=SupplierResponsibilityScope.MATERIAL),
                 name="supply_chain_unique_supplier_material_responsibility",
             ),
         ]
@@ -489,17 +502,19 @@ class SupplierSalesResponsibility(models.Model):
                 errors["sales_identity"] = "销售经理必须属于当前供应商组织。"
             elif sales_identity.role.code != "supplier_sales":
                 errors["sales_identity"] = "只能给供应商销售经理分配责任范围。"
-        if self.scope_type == SupplierResponsibilityScope.CATEGORY:
-            if not self.product_category_id or self.material_id:
-                errors["scope_type"] = "按品类分配时必须且只能选择产品品类。"
-        elif self.scope_type == SupplierResponsibilityScope.MATERIAL:
-            if not self.material_id or self.product_category_id:
-                errors["scope_type"] = "按物料分配时必须且只能选择物料。"
-        else:
-            errors["scope_type"] = "责任范围类型无效。"
+        if self.scope_type != SupplierResponsibilityScope.MATERIAL:
+            errors["scope_type"] = "责任范围类型只能是按物料类型。"
+        if not self.material_id:
+            errors["material"] = "必须选择负责物料。"
         if errors:
             raise ValidationError(errors)
 
     def __str__(self):
-        target = self.product_category or self.material
-        return f"{self.supplier}-{self.sales_identity.user}-{target}"
+        return f"{self.supplier}-{self.sales_identity.user}-{self.material}"
+
+
+# Physical warehouse stock is separate from supplier production-batch metadata.
+from .material_inventory_models import (  # noqa: E402,F401
+    FactoryMaterialStock, FactoryMaterialLot, MaterialWarrantyCase,
+    MaterialWarehouseDocument,
+)

@@ -4,12 +4,22 @@ import requests
 from django.conf import settings
 from django.core import signing
 from django.core.signing import BadSignature, SignatureExpired
+from django.utils.crypto import constant_time_compare, salted_hmac
 
 from account.models import User, UserOrganization
 
 
 ACCESS_TOKEN_SALT = "account.api-access.v1"
 DEFAULT_ACCESS_TOKEN_MAX_AGE = 7 * 24 * 60 * 60
+WECHAT_BINDING_SALT = "account.api-access.wechat-binding.v1"
+
+# The approved 2026-09-15 handovers keep the database user/identity IDs
+# while exchanging their WeChat bindings. Preserve the earlier four-slot guard
+# and include the six slots in the subsequent child-merchant handover, the
+# dedicated tourist accounts and the factory material-stock handovers.
+# Legacy tokens contain only user_id, so affected IDs must sign in again;
+# unrelated legacy sessions remain valid. New tokens are binding-aware.
+LEGACY_TOKEN_RELOGIN_USER_IDS = frozenset({2, 4, 7, 8, 9, 26, 35, 49, 51, 55, 57, 59})
 
 
 class ApiAuthenticationError(Exception):
@@ -57,11 +67,20 @@ def get_or_create_wechat_user(openid: str) -> User:
     return user
 
 
+def _wechat_token_binding(user: User) -> str:
+    """Bind the token without exposing a raw OpenID or an unkeyed fingerprint."""
+
+    value = f"{user.pk}:{user.wx_openid or ''}"
+    return salted_hmac(
+        WECHAT_BINDING_SALT, value, algorithm="sha256"
+    ).hexdigest()
+
+
 def issue_access_token(user: User) -> str:
     """签发可跨Gunicorn进程验证的服务端签名令牌。"""
 
     return signing.dumps(
-        {"user_id": user.pk},
+        {"user_id": user.pk, "wechat_binding": _wechat_token_binding(user)},
         salt=ACCESS_TOKEN_SALT,
         compress=True,
     )
@@ -103,10 +122,30 @@ def authenticate_request(request) -> User:
     except BadSignature as exc:
         raise ApiAuthenticationError("登录状态无效，请重新登录") from exc
 
+    if not isinstance(payload, dict):
+        raise ApiAuthenticationError("登录状态无效，请重新登录")
+
     user_id = payload.get("user_id")
+    # Reject bool, containers, strings and out-of-range IDs before ORM lookup.
+    if type(user_id) is not int or not (0 < user_id <= 9223372036854775807):
+        raise ApiAuthenticationError("登录状态无效，请重新登录")
+
     user = User.objects.filter(pk=user_id, is_active=True).first()
     if not user:
         raise ApiAuthenticationError("账号不存在或已停用")
+
+    if "wechat_binding" not in payload:
+        if user.pk in LEGACY_TOKEN_RELOGIN_USER_IDS:
+            raise ApiAuthenticationError("微信身份已更新，请重新登录")
+    else:
+        binding = payload["wechat_binding"]
+        if (
+            not user.wx_openid
+            or not isinstance(binding, str)
+            or len(binding) != 64
+            or not constant_time_compare(binding, _wechat_token_binding(user))
+        ):
+            raise ApiAuthenticationError("微信身份已更新，请重新登录")
 
     return user
 

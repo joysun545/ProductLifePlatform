@@ -1,5 +1,6 @@
 from django.db import models
 from django.db.models import Q
+from django.utils import timezone
 
 from lifecycle.private_storage import goods_transfer_private_storage
 
@@ -221,3 +222,93 @@ class GoodsTransferPayment(models.Model):
 
     def __str__(self):
         return f"{self.settlement.transfer.flow_no}-第{self.sequence_no}笔付款"
+
+
+class GoodsTransferReceivableAccount(models.Model):
+    """The payment entry for one directed seller/buyer shipment relationship.
+
+    Invoice amounts remain on their original settlements. This row serializes
+    allocations and points to the newest priced shipment carrying the payment
+    task, without replacing or merging any original transfer.
+    """
+
+    seller_organization = models.ForeignKey(
+        "account.Organization",
+        on_delete=models.PROTECT,
+        related_name="goods_receivable_accounts_as_seller",
+        verbose_name="发货方组织",
+    )
+    buyer_organization = models.ForeignKey(
+        "account.Organization",
+        on_delete=models.PROTECT,
+        related_name="goods_receivable_accounts_as_buyer",
+        verbose_name="收货方组织",
+    )
+    active_settlement = models.ForeignKey(
+        GoodsTransferSettlement,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="active_receivable_accounts",
+        verbose_name="当前付款任务所属发货单",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="更新时间")
+
+    class Meta:
+        ordering = ("seller_organization_id", "buyer_organization_id")
+        verbose_name = "商品发货累计往来账"
+        verbose_name_plural = "商品发货累计往来账"
+        constraints = (
+            models.UniqueConstraint(
+                fields=("seller_organization", "buyer_organization"),
+                name="lifecycle_gt_receivable_pair",
+            ),
+            models.CheckConstraint(
+                condition=~Q(seller_organization=models.F("buyer_organization")),
+                name="lifecycle_gt_receivable_orgs",
+            ),
+        )
+
+
+class GoodsTransferPaymentAllocation(models.Model):
+    """An immutable portion of a confirmed payment applied to an invoice.
+
+    Payment vouchers keep their original settlement. Explicit allocations let
+    payments entered on the latest shipment clear older invoices first, while
+    making both the original proof and invoice-level balance traceable.
+    """
+
+    payment = models.ForeignKey(
+        GoodsTransferPayment,
+        on_delete=models.PROTECT,
+        related_name="allocations",
+        verbose_name="实际到账记录",
+    )
+    settlement = models.ForeignKey(
+        GoodsTransferSettlement,
+        on_delete=models.PROTECT,
+        related_name="payment_allocations",
+        verbose_name="抵扣的原始发货应收",
+    )
+    amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        verbose_name="本次抵扣金额",
+    )
+    allocated_at = models.DateTimeField(default=timezone.now, verbose_name="分配时间")
+
+    class Meta:
+        ordering = ("allocated_at", "id")
+        verbose_name = "商品发货收款分配明细"
+        verbose_name_plural = "商品发货收款分配明细"
+        constraints = (
+            models.UniqueConstraint(
+                fields=("payment", "settlement"),
+                name="lifecycle_gt_payment_invoice",
+            ),
+            models.CheckConstraint(
+                condition=Q(amount__gt=0),
+                name="lifecycle_gt_allocation_positive",
+            ),
+        )

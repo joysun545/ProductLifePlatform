@@ -1,8 +1,11 @@
-from django.db.models import Count, Sum
+from django.db.models import Count, Q, Sum
+from django.utils import timezone
 
 from lifecycle.models import DeviceMaterialFaultRecord
 from sales.models import OrderPlanItemMaterialBatch
 from supply_chain.models import SupplierMaterialBatch
+from supply_chain.models import FactoryMaterialLot
+from supply_chain.services.material_inventory_service import quantity_text
 
 
 def _usage_scope(identity):
@@ -69,3 +72,47 @@ def build_material_statistics(identity):
             "material_fault_distribution": fault_rows,
         },
     }
+
+
+def build_factory_material_lot_catalog(identity, *, query="", cursor=None):
+    """Historical factory lots belong to the warehouse keeper's statistics view.
+
+    The material warehouse page is for operations and targeted lookup. This
+    read-only catalog is the only routine place to browse all historical lots.
+    """
+    if identity.role.code != "factory_material_stock" or identity.organization_type != "OWNER":
+        raise PermissionError("当前岗位无权查看厂家物料批次清单。")
+    rows = FactoryMaterialLot.objects.select_related(
+        "stock__supplier", "stock__material_spec__material",
+    ).filter(stock__factory=identity.organization)
+    query = str(query).strip()[:100]
+    if query:
+        rows = rows.filter(
+            Q(batch_code__icontains=query)
+            | Q(supplier_batch_code__icontains=query)
+            | Q(stock__supplier__name__icontains=query)
+            | Q(stock__material_spec__material__name__icontains=query)
+            | Q(stock__material_spec__code__icontains=query)
+            | Q(stock__material_spec__name__icontains=query)
+        )
+    if cursor:
+        if not str(cursor).isdigit() or int(cursor) <= 0:
+            raise ValueError("分页位置无效")
+        rows = rows.filter(pk__lt=int(cursor))
+    entries = list(rows.order_by("-pk")[:31])
+    items = []
+    for lot in entries[:30]:
+        available = lot.on_hand_milli - lot.reserved_milli
+        items.append({
+            "id": lot.pk, "stock_id": lot.stock_id, "batch_code": lot.batch_code,
+            "supplier_batch_code": lot.supplier_batch_code,
+            "supplier_name": lot.stock.supplier.name,
+            "material_name": lot.stock.material_spec.material.name,
+            "spec_name": lot.stock.material_spec.name, "spec_code": lot.stock.material_spec.code,
+            "unit": lot.stock.unit, "received": quantity_text(lot.received_milli),
+            "on_hand": quantity_text(lot.on_hand_milli), "reserved": quantity_text(lot.reserved_milli),
+            "available": quantity_text(available),
+            "received_at": timezone.localtime(lot.received_at).strftime("%Y-%m-%d %H:%M"),
+            "status": "有结余" if lot.on_hand_milli else "已用完或已退完",
+        })
+    return {"items": items, "next_cursor": entries[29].pk if len(entries) > 30 else None}

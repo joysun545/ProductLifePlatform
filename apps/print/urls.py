@@ -1,62 +1,15 @@
-# apps/print/urls.py
-
 from django.urls import path
-
-from .views import (
-    PrintCenterPage,
-    PrintCenterDataAPI,
-    PrintQRCodeAPI,
-    PrintConfirmAPI,
-)
-
+# The deployed URL tree imports apps.print.urls, while INSTALLED_APPS uses
+# print. Always use the registered application's canonical module path.
+from print import views
 
 app_name = "print"
-
-
 urlpatterns = [
-
-    # ==========================
-    # 打印中心首页
-    # ==========================
-
-    path(
-        "",
-        PrintCenterPage.as_view(),
-        name="print_center"
-    ),
-
-
-    path(
-        "generate/",
-        PrintCenterPage.as_view(),
-        name="generate"
-    ),
-
-
-    # ==========================
-    # 数据接口
-    # ==========================
-
-    path(
-        "api/data/",
-        PrintCenterDataAPI.as_view(),
-        name="data"
-    ),
-
-
-    # ==========================
-    # 打印二维码接口
-    # ==========================
-
-    path(
-        "api/print/",
-        PrintQRCodeAPI.as_view(),
-        name="print_qrcode"
-    ),
-    path(
-        "api/print/confirm/",
-        PrintConfirmAPI.as_view(),
-        name="print_confirm",
-    ),
-
+    path("", views.print_center, name="center"),
+    path("api/login/start/", views.login_start, name="login_start"),
+    path("api/login/approve/", views.login_approve, name="login_approve"),
+    path("api/login/status/", views.login_status, name="login_status"),
+    path("api/logout/", views.logout, name="logout"),
+    path("api/prepare/", views.prepare_qrcodes, name="prepare"),
+    path("api/confirm/", views.confirm_print, name="confirm"),
 ]

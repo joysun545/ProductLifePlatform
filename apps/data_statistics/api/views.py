@@ -3,6 +3,7 @@ from django.http import JsonResponse
 from account.services.auth_service import ApiAuthenticationError, authenticate_request
 from data_statistics.models import DailyMetricSnapshot, MetricDefinition
 from data_statistics.services import StatisticsAccessError, build_dashboard, get_statistics_identity
+from data_statistics.services.material_service import build_factory_material_lot_catalog
 
 
 def _error(message, code=1, status=200):
@@ -48,6 +49,22 @@ def _domain(request, code):
 
 def material(request):
     return _domain(request, "MATERIAL")
+
+
+def material_warehouse_lots(request):
+    error = _get_only(request)
+    if error:
+        return error
+    identity, error = _identity(request)
+    if error:
+        return error
+    try:
+        data = build_factory_material_lot_catalog(
+            identity, query=request.GET.get("q", ""), cursor=request.GET.get("cursor"),
+        )
+    except (PermissionError, ValueError) as exc:
+        return _error(exc)
+    return JsonResponse({"code": 0, "msg": "", "data": data})
 
 
 def flow(request):

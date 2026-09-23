@@ -19,7 +19,7 @@ from lifecycle.models import (
     LifecycleEvent,
 )
 from lifecycle.services.customer_service import CustomerDeviceService
-from supply_chain.models import MaterialSpecSupplier
+from supply_chain.models import MaterialFaultCause, MaterialSpecSupplier
 from supply_chain.services.supplier_responsibility_service import (
     get_supplier_task_recipients,
 )
@@ -546,7 +546,7 @@ class AfterSalesService:
             "solution_types": cls._option_rows(
                 AfterSalesApplication.SolutionType.choices
             ),
-            "final_material_options": cls._material_options(application, key_only=True),
+            "final_material_options": cls._final_material_options(application),
         }
 
     @classmethod
@@ -1183,6 +1183,31 @@ class AfterSalesService:
         )
         if fault_type == cls.FINAL_COMPONENT_FAULT and not materials:
             raise AfterSalesError("疑似关键配套物料故障时，至少选择一项关键BOM物料")
+        selected_causes = data.get("final_fault_causes") or {}
+        if not isinstance(selected_causes, dict):
+            raise AfterSalesError("最终故障根因格式无效")
+        for material in materials:
+            material_id = material.get("material_id")
+            raw_cause_id = selected_causes.get(str(material_id), selected_causes.get(material_id))
+            if raw_cause_id in (None, ""):
+                if MaterialFaultCause.objects.filter(material_id=material_id, is_active=True).exists():
+                    raise AfterSalesError("该关键物料已维护根因列表，请选择具体故障根因")
+                continue
+            try:
+                cause_id = int(raw_cause_id)
+            except (TypeError, ValueError) as exc:
+                raise AfterSalesError("最终故障根因格式无效") from exc
+            cause = MaterialFaultCause.objects.filter(
+                pk=cause_id, material_id=material_id, is_active=True,
+            ).first()
+            if not cause:
+                raise AfterSalesError("所选根因不属于对应关键物料或已停用")
+            material.update({
+                "root_cause_id": cause.pk,
+                "root_cause_code": cause.code,
+                "root_cause_name": cause.name,
+                "root_cause_grade": cause.grade,
+            })
         solution_type = cls._valid_choice(
             data.get("final_solution_type"),
             AfterSalesApplication.SolutionType.choices,
@@ -1192,6 +1217,24 @@ class AfterSalesService:
         if not solution_note:
             raise AfterSalesError("请填写最终解决方案说明")
         return fault_type, materials, solution_type, solution_note
+
+    @classmethod
+    def _final_material_options(cls, application):
+        """Key BOM materials with their controlled root-cause choices."""
+        rows = cls._material_options(application, key_only=True)
+        causes = MaterialFaultCause.objects.filter(
+            material_id__in=[row.get("material_id") for row in rows],
+            is_active=True,
+        ).order_by("material_id", "grade", "code")
+        by_material = {}
+        for cause in causes:
+            by_material.setdefault(cause.material_id, []).append({
+                "id": cause.pk, "code": cause.code, "name": cause.name,
+                "grade": cause.grade, "label": f"{cause.grade}级 · {cause.name}",
+            })
+        for row in rows:
+            row["fault_causes"] = by_material.get(row.get("material_id"), [])
+        return rows
 
     @classmethod
     def _third_party_snapshot(cls, data):
@@ -2691,9 +2734,7 @@ class AfterSalesService:
         data["solution_types"] = cls._option_rows(
             AfterSalesApplication.SolutionType.choices
         )
-        data["final_material_options"] = cls._material_options(
-            application, key_only=True
-        )
+        data["final_material_options"] = cls._final_material_options(application)
         data["history"] = cls._history(application)
         data["lifecycle_history"] = cls._lifecycle_history(application)
         if data["actions"]["can_triage"]:

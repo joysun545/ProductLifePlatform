@@ -1,5 +1,6 @@
 from django.db import models
 from django.db.models import Q
+from django.utils import timezone
 
 from sales.private_storage import order_finance_private_storage
 
@@ -162,3 +163,66 @@ class OrderPlanPayment(models.Model):
 
     def __str__(self):
         return f"{self.finance.order_plan.plan_code}-第{self.sequence_no}笔付款"
+
+
+class OrderPlanReceivableAccount(models.Model):
+    """Cumulative order receivables for one directed factory/merchant pair."""
+
+    factory_organization = models.ForeignKey(
+        "account.Organization", on_delete=models.PROTECT,
+        related_name="order_receivable_accounts_as_factory", verbose_name="厂家组织",
+    )
+    merchant_organization = models.ForeignKey(
+        "account.Organization", on_delete=models.PROTECT,
+        related_name="order_receivable_accounts_as_merchant", verbose_name="商家组织",
+    )
+    active_finance = models.ForeignKey(
+        OrderPlanFinance, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="active_receivable_accounts", verbose_name="当前付款任务所属订单",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="更新时间")
+
+    class Meta:
+        ordering = ("factory_organization_id", "merchant_organization_id")
+        verbose_name = "订单累计往来账"
+        verbose_name_plural = verbose_name
+        constraints = [
+            models.UniqueConstraint(
+                fields=("factory_organization", "merchant_organization"),
+                name="sales_receivable_pair_unique",
+            ),
+            models.CheckConstraint(
+                condition=~Q(factory_organization=models.F("merchant_organization")),
+                name="sales_receivable_distinct_orgs",
+            ),
+        ]
+
+
+class OrderPlanPaymentAllocation(models.Model):
+    """Cash allocated to an invoice; cancellation releases retain their history."""
+
+    payment = models.ForeignKey(
+        OrderPlanPayment, on_delete=models.PROTECT, related_name="allocations",
+        verbose_name="实际到账记录",
+    )
+    finance = models.ForeignKey(
+        OrderPlanFinance, on_delete=models.PROTECT, related_name="payment_allocations",
+        verbose_name="抵扣的原始订单应收",
+    )
+    amount = models.DecimalField(max_digits=14, decimal_places=2, verbose_name="分配金额")
+    allocated_at = models.DateTimeField(default=timezone.now, verbose_name="分配时间")
+    released_at = models.DateTimeField(null=True, blank=True, db_index=True, verbose_name="解除分配时间")
+    release_reason = models.CharField(max_length=64, blank=True, default="", verbose_name="解除分配原因")
+
+    class Meta:
+        ordering = ("allocated_at", "id")
+        verbose_name = "订单收款分配明细"
+        verbose_name_plural = verbose_name
+        constraints = [
+            models.UniqueConstraint(
+                fields=("payment", "finance"), condition=Q(released_at__isnull=True),
+                name="sales_active_payment_invoice",
+            ),
+            models.CheckConstraint(condition=Q(amount__gt=0), name="sales_allocation_positive"),
+        ]

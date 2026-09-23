@@ -23,6 +23,7 @@ from lifecycle.models import (
 )
 from workflow.models import WorkItem
 from workflow.services.workflow_service import publish_workitem
+from .goods_transfer_receivable_service import financial_write_errors
 
 
 class GoodsTransferAccountError(Exception):
@@ -573,9 +574,8 @@ def _case_outstanding(case):
 
 
 def _shipment_received_total(settlement):
-    return settlement.payments.filter(
-        status=GoodsTransferPayment.Status.CONFIRMED
-    ).aggregate(total=Sum("confirmed_amount"))["total"] or Decimal("0.00")
+    from .goods_transfer_receivable_service import invoice_totals
+    return invoice_totals(settlement)["received_amount"]
 
 
 def _shipment_credit_total(settlement):
@@ -1007,6 +1007,7 @@ def confirm_goods_transfer_account_case(
     return get_goods_transfer_accounts(user=user, transfer_id=transfer_id)
 
 
+@financial_write_errors(GoodsTransferAccountError)
 @transaction.atomic
 def allocate_goods_transfer_credit(
     *, user, transfer_id, case_id, target_kind, target_id, amount
@@ -1027,13 +1028,16 @@ def allocate_goods_transfer_credit(
     target_id = int(target_id)
     defaults = {"amount": allocation_amount, "allocated_by": user}
     if target_kind == "SHIPMENT":
-        target = GoodsTransferSettlement.objects.select_for_update().select_related("transfer").filter(
+        target = GoodsTransferSettlement.objects.select_related("transfer").filter(
             pk=target_id,
             transfer__from_organization_id=case.upper_organization_id,
             transfer__to_organization_id=case.lower_organization_id,
         ).first()
         if not target:
             raise GoodsTransferAccountError("原发货应收批次不存在或不属于该上下级关系。")
+        from .goods_transfer_receivable_service import lock_receivable_account
+        lock_receivable_account(target.transfer)
+        target = GoodsTransferSettlement.objects.select_for_update().select_related("transfer").get(pk=target.pk)
         outstanding = _shipment_outstanding(target)
         if outstanding is None or allocation_amount > outstanding:
             raise GoodsTransferAccountError("冲抵金额超过该发货批次应收余额。")
@@ -1064,6 +1068,9 @@ def allocate_goods_transfer_credit(
         raise GoodsTransferAccountError("请选择有效的应收批次。")
     if not created:
         raise GoodsTransferAccountError("该退货额度已经关联过此应收批次。")
+    if target_kind == "SHIPMENT":
+        from .goods_transfer_receivable_task_service import reconcile_receivable_tasks
+        reconcile_receivable_tasks(target, user.wx_openid or "")
     _publish_notice(
         case,
         case.lower_organization,

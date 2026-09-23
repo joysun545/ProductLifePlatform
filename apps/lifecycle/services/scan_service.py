@@ -48,7 +48,6 @@ class ScanService:
     def _qrcode_queryset():
         return QRCode.objects.select_related(
             "device__product_model__category",
-            "device__product_model__brand",
             "device__batch__bom",
             "device__batch__manufacturer__organization_type",
             "device__state__current_organization__organization_type",
@@ -153,7 +152,6 @@ class ScanService:
                 "code": product_model.code,
                 "name": product_model.name,
                 "category": product_model.category.name,
-                "brand": product_model.brand.name if product_model.brand else "",
             },
             "status_summary": {
                 "status": state.status if state else "CREATED",

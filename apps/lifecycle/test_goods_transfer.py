@@ -190,9 +190,9 @@ class GoodsTransferApiTests(TestCase):
         cls.fault_material = Material.objects.create(
             code="FLOW-CONTROL-MODULE",
             name="流转测试控制模块",
-            product_category=category,
             is_key_part=True,
         )
+        cls.fault_material.product_categories.add(category)
         cls.fault_material_spec = MaterialSpec.objects.create(
             material=cls.fault_material,
             code="FLOW-CONTROL-MODULE-24V",

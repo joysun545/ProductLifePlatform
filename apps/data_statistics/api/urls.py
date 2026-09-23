@@ -8,6 +8,7 @@ app_name = "data_statistics"
 urlpatterns = [
     path("dashboard/", views.dashboard, name="dashboard"),
     path("material/", views.material, name="material"),
+    path("material-warehouse-lots/", views.material_warehouse_lots, name="material_warehouse_lots"),
     path("flow/", views.flow, name="flow"),
     path("aftersales/", views.aftersales, name="aftersales"),
     path("quality/", views.quality, name="quality"),

@@ -11,7 +11,7 @@ from .gate_service import (
     quality_gate_atomic,
 )
 from .impact_trace_service import QualityImpactTraceError, trace_supplier_batch_impact
-from .rule_service import QualityRuleError, list_rules, publish_rule_version
+from .rule_service import QualityRuleError, list_rules, publish_rule_version, simulate_rule
 from .metric_engine import QualityMetricError, evaluate_active_rules, evaluate_rule_version
 from .case_service import (
     QualityCaseError,
@@ -87,6 +87,7 @@ __all__ = [
     "QualityRuleError",
     "list_rules",
     "publish_rule_version",
+    "simulate_rule",
     "QualityMetricError",
     "evaluate_active_rules",
     "evaluate_rule_version",
