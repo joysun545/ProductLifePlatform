@@ -3,12 +3,34 @@
 from django.urls import path
 
 from . import views
+from .after_sales_station_views import (
+    AfterSalesServiceStationApplicationAPI,
+    AfterSalesServiceStationOrganizationBadgeAPI,
+    AfterSalesServiceStationReviewAPI,
+)
 
 
 app_name = "lifecycle"
 
 
 urlpatterns = [
+
+    path(
+        "after-sales/service-station/organization-badge/",
+        AfterSalesServiceStationOrganizationBadgeAPI.as_view(),
+        name="after_sales_service_station_organization_badge",
+    ),
+
+    path(
+        "after-sales/service-station/application/",
+        AfterSalesServiceStationApplicationAPI.as_view(),
+        name="after_sales_service_station_application",
+    ),
+    path(
+        "after-sales/service-station/applications/<int:application_id>/review/",
+        AfterSalesServiceStationReviewAPI.as_view(),
+        name="after_sales_service_station_review",
+    ),
 
     # Canonical after-sales chain.  All task payloads and pages use
     # AfterSalesApplication.application_id; the retired AfterSalesCase routes
@@ -136,6 +158,12 @@ urlpatterns = [
         "goods-transfers/<int:transfer_id>/scan/",
         views.GoodsTransferScanAPI.as_view(),
         name="goods_transfer_scan",
+    ),
+
+    path(
+        "goods-transfers/<int:transfer_id>/release-scan/",
+        views.GoodsTransferScanReleaseAPI.as_view(),
+        name="goods_transfer_scan_release",
     ),
 
     path(

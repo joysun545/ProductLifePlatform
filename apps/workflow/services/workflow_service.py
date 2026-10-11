@@ -6,7 +6,7 @@ from typing import Iterable, Optional, Dict, Any
 from django.db import transaction
 from django.utils import timezone
 
-from account.models import UserOrganization
+from account.models import SeniorManagerProfile, UserOrganization
 from workflow.models import WorkItem, UserTask
 
 
@@ -23,6 +23,54 @@ def get_role_snapshot(openid):
         .first()
     )
     return identity.role.code if identity else ""
+
+
+def _add_delegated_senior_manager_recipients(receivers):
+    """Copy a role task to active senior managers of that same organization."""
+
+    expanded = list(receivers)
+    seen = set(expanded)
+    role_recipients = list(
+        UserOrganization.objects.select_related("organization", "role")
+        .filter(
+            user__wx_openid__in=receivers,
+            user__is_active=True,
+            is_active=True,
+            organization__is_active=True,
+            role__is_active=True,
+        )
+    )
+    for recipient in role_recipients:
+        # The senior manager invited the role holder whose task is being
+        # copied.  This prevents one manager from receiving a peer manager's
+        # tasks merely because both were assigned the same role code.
+        if not recipient.inviter_id:
+            continue
+        if recipient.role.code in {
+            "factory_senior_manager",
+            "merchant_senior_manager",
+        }:
+            continue
+        managers = SeniorManagerProfile.objects.filter(
+            identity__user_id=recipient.inviter_id,
+            identity__organization_id=recipient.organization_id,
+            identity__organization__is_active=True,
+            identity__is_active=True,
+            identity__role__is_active=True,
+            identity__role__code__in=(
+                "factory_senior_manager",
+                "merchant_senior_manager",
+            ),
+            identity__user__is_active=True,
+            identity__user__wx_openid__isnull=False,
+            managed_roles=recipient.role,
+        ).values_list("identity__user__wx_openid", flat=True)
+        for openid in managers:
+            openid = (openid or "").strip()
+            if openid and openid not in seen:
+                seen.add(openid)
+                expanded.append(openid)
+    return expanded
 
 
 
@@ -157,6 +205,8 @@ def publish_workitem(
             seen.add(oid)
 
             receivers.append(oid)
+
+    receivers = _add_delegated_senior_manager_recipients(receivers)
 
 
 

@@ -13,6 +13,13 @@ from account.models import (
 )
 from quality_trace.models import QualityAlertRule, QualityAlertRuleVersion
 from quality_trace.services import QualityTraceAccessError, get_quality_trace_identity
+from quality_trace.services.case_service import (
+    QualityCaseError,
+    assess_alert,
+    open_case_from_alert,
+    place_temporary_hold,
+)
+from quality_trace.services.rule_service import QualityRuleError, publish_rule_version
 
 
 class QualityTraceFoundationTests(TestCase):
@@ -29,6 +36,9 @@ class QualityTraceFoundationTests(TestCase):
         cls.factory_role = OrganizationRole.objects.get(
             organization_type=cls.factory_type, code="factory_chief_engineer",
         )
+        cls.factory_admin_role = OrganizationRole.objects.get(
+            organization_type=cls.factory_type, code="factory_admin",
+        )
         cls.merchant_role = OrganizationRole.objects.get(
             organization_type=cls.merchant_type, code="merchant_owner",
         )
@@ -38,16 +48,50 @@ class QualityTraceFoundationTests(TestCase):
         cls.merchant_user = User.objects.create_user(
             username="quality-merchant-user", wx_openid="quality-merchant-openid",
         )
+        cls.factory_admin_user = User.objects.create_user(
+            username="quality-factory-admin", wx_openid="quality-factory-admin-openid",
+        )
         UserOrganization.objects.create(
             user=cls.factory_user, organization=cls.factory, role=cls.factory_role,
         )
         UserOrganization.objects.create(
             user=cls.merchant_user, organization=cls.merchant, role=cls.merchant_role,
         )
+        UserOrganization.objects.create(
+            user=cls.factory_admin_user,
+            organization=cls.factory,
+            role=cls.factory_admin_role,
+        )
 
     def test_factory_identity_can_access_foundation(self):
         identity = get_quality_trace_identity(self.factory_user)
         self.assertEqual(identity.organization, self.factory)
+
+    def test_factory_owner_can_read_quality_but_not_execute_chief_actions(self):
+        identity = get_quality_trace_identity(self.factory_admin_user)
+        self.assertEqual(identity.organization, self.factory)
+        with self.assertRaisesMessage(QualityRuleError, "当前岗位无权发布"):
+            publish_rule_version(user=self.factory_admin_user, data={})
+        with self.assertRaisesMessage(QualityCaseError, "当前岗位无权执行"):
+            assess_alert(
+                user=self.factory_admin_user,
+                alert_id=999999,
+                conclusion="CONFIRMED_DEFECT",
+                reason="权限边界测试",
+            )
+        with self.assertRaisesMessage(QualityCaseError, "当前岗位无权执行"):
+            open_case_from_alert(
+                user=self.factory_admin_user,
+                alert_id=999999,
+                reason="权限边界测试",
+            )
+        with self.assertRaisesMessage(QualityCaseError, "当前岗位无权执行"):
+            place_temporary_hold(
+                user=self.factory_admin_user,
+                case_id=999999,
+                reason="权限边界测试",
+                duration_hours=1,
+            )
 
     def test_merchant_identity_is_rejected(self):
         with self.assertRaisesMessage(QualityTraceAccessError, "无权访问"):

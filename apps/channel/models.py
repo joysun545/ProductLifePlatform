@@ -54,3 +54,109 @@ class MerchantChannelAssignment(models.Model):
             f"{self.relation.target_organization.name}-"
             f"{self.brand.name}-{self.region}"
         )
+
+
+class MerchantProductCategoryScope(models.Model):
+    """A brand/category pair explicitly authorized on one merchant link.
+
+    Product models are stored separately so an authorized category remains
+    visible even when a merchant receives only some of its models. After-sales
+    service is category-scoped and therefore reads these rows, not the model
+    grants below.
+    """
+
+    relation = models.ForeignKey(
+        "account.OrganizationRelation",
+        on_delete=models.PROTECT,
+        related_name="merchant_product_category_scopes",
+        verbose_name="经销组织关系",
+    )
+    brand = models.ForeignKey(
+        "product.Brand",
+        on_delete=models.PROTECT,
+        related_name="merchant_product_category_scopes",
+        verbose_name="授权品牌",
+    )
+    category = models.ForeignKey(
+        "product.ProductCategory",
+        on_delete=models.PROTECT,
+        related_name="merchant_product_category_scopes",
+        verbose_name="经营品类",
+    )
+    assigned_by = models.ForeignKey(
+        "account.User",
+        on_delete=models.PROTECT,
+        related_name="assigned_merchant_product_scopes",
+        verbose_name="授权人",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="更新时间")
+
+    class Meta:
+        ordering = (
+            "relation__target_organization__name",
+            "brand__code",
+            "category__code",
+        )
+        constraints = [
+            models.UniqueConstraint(
+                fields=("relation", "brand", "category"),
+                name="channel_unique_merchant_brand_category_scope",
+            ),
+        ]
+        verbose_name = "商家品牌品类范围"
+        verbose_name_plural = "商家品牌品类范围"
+
+    def clean(self):
+        super().clean()
+        if self.relation_id and self.relation.relation_type != "DISTRIBUTION":
+            raise ValidationError({"relation": "产品经营范围只能配置在经销关系上。"})
+
+    def __str__(self):
+        return (
+            f"{self.relation.target_organization.name}-"
+            f"{self.brand.name}-{self.category.name}"
+        )
+
+
+class MerchantProductModelScope(models.Model):
+    """A concrete product model within an authorized brand/category pair."""
+
+    category_scope = models.ForeignKey(
+        MerchantProductCategoryScope,
+        on_delete=models.CASCADE,
+        related_name="model_scopes",
+        verbose_name="品牌品类范围",
+    )
+    product_model = models.ForeignKey(
+        "product.ProductModel",
+        on_delete=models.PROTECT,
+        related_name="merchant_scope_grants",
+        verbose_name="授权产品型号",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
+
+    class Meta:
+        ordering = ("product_model__code", "id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("category_scope", "product_model"),
+                name="channel_unique_merchant_product_model_scope",
+            ),
+        ]
+        verbose_name = "商家授权产品型号"
+        verbose_name_plural = "商家授权产品型号"
+
+    def clean(self):
+        super().clean()
+        if (
+            self.category_scope_id
+            and self.product_model_id
+            and self.category_scope.category_id != self.product_model.category_id
+        ):
+            raise ValidationError(
+                {"product_model": "授权型号必须属于已授权品类。"}
+            )
+
+    def __str__(self):
+        return f"{self.category_scope} · {self.product_model}"

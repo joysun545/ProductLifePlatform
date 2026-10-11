@@ -23,9 +23,9 @@ class QualityCaseError(Exception):
     pass
 
 
-ASSESSOR_ROLES = {"factory_admin", "factory_chief_engineer"}
-CASE_MANAGER_ROLES = {"factory_admin", "factory_chief_engineer"}
-CONTROL_MANAGER_ROLES = {"factory_admin", "factory_chief_engineer"}
+ASSESSOR_ROLES = {"factory_chief_engineer"}
+CASE_MANAGER_ROLES = {"factory_chief_engineer"}
+CONTROL_MANAGER_ROLES = {"factory_chief_engineer"}
 # Recall control is distinct from other quality-case management permissions.
 RECALL_MANAGER_ROLES = {"factory_chief_engineer"}
 MAX_TEMPORARY_HOLD_HOURS = 168

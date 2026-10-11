@@ -101,7 +101,7 @@ def evidence_upload(request):
         return error
     identity = _identity(user)
     from quality_trace.services.recall_access_service import FACTORY_RECALL_OBSERVER_ROLES
-    if identity.role.code in FACTORY_RECALL_OBSERVER_ROLES:
+    if RecallViewer(user).has_role(FACTORY_RECALL_OBSERVER_ROLES):
         return _error("本岗位仅接收召回知晓通知，无凭证上传权限。")
     uploaded = request.FILES.get("file")
     if not uploaded:
@@ -152,18 +152,30 @@ def _handover(row, user=None):
     if not handover:
         return None
     identity = _identity(user) if user else None
-    role = identity.role.code if identity else ""
     organization_id = identity.organization_id if identity else None
     viewer = RecallViewer(user) if user else None
     active = row.campaign.status == "ACTIVE" and handover.status != "CANCELLED"
     customer_actor = bool(viewer and viewer.customer_actor(row))
+    merchant_task = bool(
+        viewer and viewer.has_action_task_copy((
+            f"quality-recall-merchant-return:{row.pk}:org:{handover.merchant_organization_id}",
+            f"quality-recall:{row.campaign_id}:org:{handover.merchant_organization_id}",
+        ))
+    )
+    factory_pickup_task = bool(
+        viewer and viewer.has_action_task_copy(
+            (f"quality-recall-pickup:{handover.pk}",),
+        )
+    )
     merchant_actor = bool(viewer and viewer.kind == "MERCHANT"
-                          and role in MERCHANT_RECALL_ROLES
-                          and organization_id == handover.merchant_organization_id)
+                          and viewer.has_role(MERCHANT_RECALL_ROLES)
+                          and organization_id == handover.merchant_organization_id
+                          and merchant_task)
     factory_pickup_actor = bool(
-        identity
+        viewer
         and organization_id == handover.campaign.factory_organization_id
-        and role in {"factory_chief_engineer", "factory_logistics"}
+        and viewer.has_role({"factory_chief_engineer", "factory_logistics"})
+        and factory_pickup_task
     )
     latest_leg = latest_transport(row)
     return {
@@ -289,6 +301,10 @@ def _device(row, user=None):
     latest_leg = latest_transport(row)
     viewer = RecallViewer(user) if user else None
     viewer_identity = viewer.identity if viewer else None
+    def has_action_task_copy(uniq_key):
+        return bool(
+            viewer and viewer.has_action_task_copy(uniq_key)
+        )
     stage = row_stage(row, viewer) if viewer else {"code": "", "label": "", "next_step": ""}
     current_stage, current_stage_label = stage["code"], stage["label"]
     factory_actor = bool(viewer and viewer.factory(row.campaign) and row.campaign.status == "ACTIVE")
@@ -361,25 +377,34 @@ def _device(row, user=None):
                     )
                 ),
                 "matching_confirm": bool(
-                    factory_actor and viewer_identity.role.code == "factory_matching"
+                    factory_actor and viewer.has_role("factory_matching")
                     and post_disposition.execution_stage == "WAITING_MATCHING"
+                    and has_action_task_copy(
+                        f"quality-recall:disposition:{post_disposition.pk}:matching",
+                    )
                 ),
                 "production_complete": bool(
-                    factory_actor and viewer_identity.role.code == "factory_production"
+                    factory_actor and viewer.has_role("factory_production")
                     and post_disposition.execution_stage in {
                         "WAITING_PRODUCTION", "WAITING_PRODUCTION_COMPLETION",
                     }
+                    and has_action_task_copy(
+                        f"quality-recall:disposition:{post_disposition.pk}:production",
+                    )
                 ),
                 "chief_confirm": bool(
-                    factory_actor and viewer_identity.role.code == "factory_chief_engineer"
+                    factory_actor and viewer.has_role("factory_chief_engineer")
                     and post_disposition.execution_stage == "WAITING_CHIEF_CONFIRMATION"
+                    and has_action_task_copy(
+                        f"quality-recall:disposition:{post_disposition.pk}:chief",
+                    )
                 ),
             } if viewer_identity else {}),
         } if post_disposition else None),
     }
 
 
-def _campaign(row, include_devices=False, *, device_count=None, scope_label=""):
+def _campaign(row, include_devices=False, *, device_count=None, scope_label="", viewer=None):
     data = {
         "id": row.pk,
         "recall_no": row.recall_no,
@@ -431,10 +456,18 @@ def _campaign(row, include_devices=False, *, device_count=None, scope_label=""):
         ),
         "can_start": bool(
             confirmation and disposition_count < eligible_disposition_count
+            and viewer and viewer.has_role("factory_chief_engineer")
+            and viewer.has_action_task_copy(
+                (f"quality-recall:{row.pk}:post-recall-disposition",),
+            )
         ),
         "can_complete_campaign": bool(
             confirmation and disposition_count == eligible_disposition_count
             and completed_disposition_count == eligible_disposition_count
+            and viewer and viewer.has_role("factory_chief_engineer")
+            and viewer.has_action_task_copy(
+                (f"quality-recall:{row.pk}:post-recall-disposition",),
+            )
         ),
     }
     latest = row.progress_snapshots.order_by("-calculated_at", "-id").first()
@@ -453,7 +486,10 @@ def _campaign(row, include_devices=False, *, device_count=None, scope_label=""):
 
 def _scoped_campaign(campaign, rows, viewer):
     context = campaign_context(campaign, rows, viewer)
-    data = _campaign(campaign, device_count=len(rows), scope_label=context["scope_label"])
+    data = _campaign(
+        campaign, device_count=len(rows), scope_label=context["scope_label"],
+        viewer=viewer,
+    )
     data["viewer"] = {**viewer.payload, "full_campaign_access": viewer.full_campaign(campaign),
                       "observer_only": viewer.observer(campaign)}
     data.update(campaign_text(campaign, viewer))
@@ -524,7 +560,7 @@ def campaigns(request):
     viewer = RecallViewer(user)
     rows = recall_campaign_queryset()
     if viewer.kind == "OWNER":
-        if viewer.role not in FACTORY_RECALL_VIEW_ROLES:
+        if not viewer.has_role(FACTORY_RECALL_VIEW_ROLES):
             return _error("当前岗位无权访问厂家质量追溯数据。")
         rows = rows.filter(factory_organization_id=viewer.organization_id)
     else:
@@ -585,7 +621,7 @@ def _post(request, callback):
         return error
     try:
         from quality_trace.services.recall_access_service import FACTORY_RECALL_OBSERVER_ROLES
-        if RecallViewer(user).role in FACTORY_RECALL_OBSERVER_ROLES:
+        if RecallViewer(user).has_role(FACTORY_RECALL_OBSERVER_ROLES):
             raise QualityRecallError("本岗位仅接收召回知晓通知，无召回操作权限。")
         return callback(user, _data(request))
     except (QualityCaseError, QualityRecallError, TypeError, ValueError) as exc:
@@ -825,7 +861,7 @@ def merchant_transfer_accept(request):
             return _error("临时召回流转码已失效，请让用户刷新交付方式。")
         viewer = RecallViewer(user)
         if (not viewer.valid or viewer.kind != "MERCHANT"
-                or viewer.role not in MERCHANT_RECALL_ROLES
+                or not viewer.has_role(MERCHANT_RECALL_ROLES)
                 or viewer.organization_id != handover.merchant_organization_id):
             return _error("只有设备来源商家的授权岗位可以查看并接管此设备。")
         received = handover.status == "MERCHANT_RECEIVED"

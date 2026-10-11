@@ -39,6 +39,14 @@ from django.utils import timezone
 
 from account.models import UserOrganization
 from account.services.auth_service import get_active_identity
+from account.services.role_delegation_service import (
+    SENIOR_MANAGER_ROLE_CODES,
+    delegated_role_user_ids,
+    effective_role_codes,
+    identity_can_perform_shared_operation,
+    identity_has_role,
+    shared_operation_recipient_role_codes,
+)
 from channel.models import MerchantChannelAssignment
 from lifecycle.models import (
     Device,
@@ -123,6 +131,11 @@ class OrderPlanMaterialFlowError(ValueError):
 
 FLOW_KIND = "ORDER_PLAN"
 ALGORITHM_VERSION = "stock-lot-v2"
+FACTORY_PLAN_VIEW_ROLES = frozenset({
+    "factory_admin", "factory_manager", "factory_sales", "factory_matching",
+    "factory_material_stock", "factory_production", "factory_stock",
+    "factory_sales_assistant", "factory_logistics", "factory_chief_engineer",
+})
 V2_LINK = "/pages/sales/order_plan_detail/order_plan_detail?order_plan_id={plan_id}"
 # Production policy historically used 10:00 / 22:00 dispatch windows.  Keep
 # the setting and the dispatcher for later re-enablement, but freeze that
@@ -233,7 +246,7 @@ def _factory_identity(user, role_codes, *, message):
     identity = get_active_identity(user) if user and user.is_active else None
     if (
         not identity
-        or identity.role.code not in set(role_codes)
+        or not identity_has_role(identity, role_codes)
         or identity.organization.organization_type.code != "OWNER"
     ):
         raise OrderPlanMaterialFlowError(message)
@@ -261,6 +274,24 @@ def _sales_identity(user):
         return _get_sales_identity(user)
     except Exception as exc:  # keep the public V2 error type stable
         raise OrderPlanMaterialFlowError(str(exc)) from exc
+
+
+def _sales_task_identity(user):
+    """Allow a delegated senior manager to handle its invited sales task."""
+
+    return _factory_identity(
+        user,
+        {"factory_sales"},
+        message="只有厂家销售经理或获授权的高级经理可以处理该销售任务。",
+    )
+
+
+def _sales_actor_user_ids(identity):
+    if identity.role.code in {"factory_senior_manager", "merchant_senior_manager"}:
+        return delegated_role_user_ids(identity, "factory_sales")
+    if identity.role.code == "factory_sales":
+        return {identity.user_id}
+    return set()
 
 
 def _plan_queryset(*, lock=False):
@@ -356,7 +387,9 @@ def _new_workitem(
     )
 
 
-def _complete_workitem_anyone(workitem, user, *, actor_title=None, peer_title=None):
+def _complete_workitem_anyone(
+    workitem, user, *, actor_title=None, peer_title=None, allow_no_task=False
+):
     """Complete one shared action task with a compare-and-set style update."""
 
     now = timezone.now()
@@ -367,7 +400,7 @@ def _complete_workitem_anyone(workitem, user, *, actor_title=None, peer_title=No
         to_openid=actor_openid,
         need_action=True,
     ).exclude(state="DONE").first()
-    if not task:
+    if not task and not allow_no_task:
         raise OrderPlanMaterialFlowError("当前账号不是这项任务的处理人。")
     if workitem.status == "DONE":
         return False
@@ -1824,11 +1857,13 @@ def _publish_shipment_outbound_task(*, plan, shipment, actor_openid):
 def _publish_shipment_merchant_receipt_task(*, plan, shipment, actor_openid):
     recipients = _role_openids(
         plan.merchant_organization,
-        {"merchant_owner", "merchant_sales", "merchant_stock"},
+        shared_operation_recipient_role_codes(
+            plan.merchant_organization_id, "goods_transfer_receipt"
+        ),
     )
     if not recipients:
         raise OrderPlanMaterialFlowError(
-            "接收商家尚未配置负责人、销售经理或库管，不能下达本批入库任务。"
+            "接收商家尚未配置负责人或库管，不能下达本批入库任务。"
         )
     payload = _shipment_payload(shipment)
     return _new_workitem(
@@ -1838,7 +1873,7 @@ def _publish_shipment_merchant_receipt_task(*, plan, shipment, actor_openid):
         title=f"{payload['shipment_label']}待到货入库",
         summary=(
             f"{plan.factory_organization.name}｜{plan.brand.name}｜"
-            f"本批{payload['quantity']}台已发货，实际收货后由负责人、销售经理或库管任一人确认入库。"
+            f"本批{payload['quantity']}台已发货，实际收货后请由具备权限的负责人或库管确认入库。"
         ),
         recipients=recipients,
         need_action=True,
@@ -3073,10 +3108,11 @@ def _merchant_receipt_identity(user):
     if (
         not identity
         or identity.organization.organization_type.code != "MERCHANT"
-        or identity.role.code
-        not in {"merchant_owner", "merchant_sales", "merchant_stock"}
+        or not identity_can_perform_shared_operation(
+            identity, "goods_transfer_receipt"
+        )
     ):
-        raise OrderPlanMaterialFlowError("只有接收商家的负责人、销售经理或库管可以确认入库。")
+        raise OrderPlanMaterialFlowError("当前岗位没有接收商家入库权限。")
     return identity
 
 
@@ -3218,9 +3254,9 @@ def create_material_flow_shipment(
     without inventing a third order or merging child plans.
     """
 
-    identity = _sales_identity(user)
+    identity = _sales_task_identity(user)
     plan = _v2_plan_for_factory(identity, plan_id, lock=True)
-    if plan.created_by_id != user.pk:
+    if plan.created_by_id not in _sales_actor_user_ids(identity):
         raise OrderPlanMaterialFlowError("只有创建该订单的厂家销售经理可以拆分发货批次。")
     if plan.status in {OrderPlan.Status.CANCELLED, OrderPlan.Status.RECEIVED}:
         raise OrderPlanMaterialFlowError("当前订单状态不能再拆分发货批次。")
@@ -3628,9 +3664,9 @@ def _refresh_subplan_progress(*, plan, now):
 
 @transaction.atomic
 def authorize_material_flow_shipment(*, user, plan_id, shipment_id):
-    identity = _sales_identity(user)
+    identity = _sales_task_identity(user)
     plan = _v2_plan_for_factory(identity, plan_id, lock=True)
-    if plan.created_by_id != user.pk:
+    if plan.created_by_id not in _sales_actor_user_ids(identity):
         raise OrderPlanMaterialFlowError("只有创建该订单的厂家销售经理可以确认发货。")
     _assert_shipment_path_open(plan)
     shipment = _shipment_for_plan(plan=plan, shipment_id=shipment_id, lock=True)
@@ -4179,6 +4215,12 @@ def confirm_material_flow_merchant_receipt(*, user, plan_id, shipment_id):
         user,
         actor_title=f"{_shipment_label(shipment)}商家已入库",
         peer_title=f"{_display_name(user)}已完成{_shipment_label(shipment)}商家入库",
+        allow_no_task=(
+            identity.role.code in SENIOR_MANAGER_ROLE_CODES
+            and identity_can_perform_shared_operation(
+                identity, "goods_transfer_receipt"
+            )
+        ),
     )
     for mapping in mappings:
         event = _shipment_event(
@@ -4589,15 +4631,15 @@ def _cancel_material_flow_finance_tasks(*, plan, user):
 @financial_write_errors(OrderPlanMaterialFlowError)
 @transaction.atomic
 def cancel_material_flow_order_plan(*, user, plan_id, assembly_started_offline=None, reason=""):
-    identity = _sales_identity(user)
+    identity = _sales_task_identity(user)
     plan = _v2_plan_for_factory(identity, plan_id)
-    if plan.created_by_id != user.pk:
+    if plan.created_by_id not in _sales_actor_user_ids(identity):
         raise OrderPlanMaterialFlowError("只有创建该订单的厂家销售经理可以取消。")
     # Match statement/payment lock ordering: reserve the directed account pair
     # before any order row, including on SQLite where row locks are not enough.
     lock_receivable_account(plan)
     plan = _v2_plan_for_factory(identity, plan_id, lock=True)
-    if plan.created_by_id != user.pk:
+    if plan.created_by_id not in _sales_actor_user_ids(identity):
         raise OrderPlanMaterialFlowError("只有创建该订单的厂家销售经理可以取消。")
     material_plan = OrderPlanMaterialPlan.objects.select_for_update().filter(order_plan=plan).first()
     if not material_plan:
@@ -4848,20 +4890,25 @@ def _supplier_sales_material_scope_for_plan(identity, plan):
 
 
 def _can_view_plan(identity, plan, *, supplier_sales_scope=None):
-    role = identity.role.code
+    roles = effective_role_codes(identity)
     org_id = identity.organization_id
     if identity.organization.organization_type.code == "OWNER" and org_id == plan.factory_organization_id:
-        return role in {
-            "factory_admin", "factory_manager", "factory_sales", "factory_matching",
-            "factory_material_stock", "factory_production", "factory_stock",
-            "factory_sales_assistant", "factory_logistics", "factory_chief_engineer",
-        }
-    if identity.organization.organization_type.code == "SUPPLIER" and role in {"supplier_owner", "supplier_sales"}:
+        if not roles & FACTORY_PLAN_VIEW_ROLES:
+            return False
+        if "factory_sales" in roles and not (roles & (FACTORY_PLAN_VIEW_ROLES - {"factory_sales"})):
+            sales_user_ids = (
+                delegated_role_user_ids(identity, "factory_sales")
+                if identity.role.code in {"factory_senior_manager", "merchant_senior_manager"}
+                else {identity.user_id}
+            )
+            return plan.created_by_id in sales_user_ids
+        return True
+    if identity.organization.organization_type.code == "SUPPLIER" and roles & {"supplier_owner", "supplier_sales"}:
         deliveries = OrderPlanSupplyDelivery.objects.filter(
             material_plan__order_plan=plan,
             supplier_id=org_id,
         )
-        if role == "supplier_sales":
+        if "supplier_sales" in roles:
             # A sales manager normally uses the current responsibility map.
             # Once a V2 delivery task is open, however, only its immutable
             # task snapshot can grant access.  That keeps the original task
@@ -4880,7 +4927,7 @@ def _can_view_plan(identity, plan, *, supplier_sales_scope=None):
             )
         return deliveries.exists()
     if identity.organization.organization_type.code == "MERCHANT" and org_id == plan.merchant_organization_id:
-        return role in {"merchant_owner", "merchant_senior_manager", "merchant_sales", "merchant_stock"}
+        return bool(roles & {"merchant_owner", "merchant_sales", "merchant_stock"})
     return False
 
 
@@ -5298,12 +5345,17 @@ def _shipment_actions(plan, shipment, identity):
     if _shipment_path_has_pending_cancellation(plan):
         return []
 
-    role = identity.role.code
+    roles = effective_role_codes(identity)
+    sales_actor_ids = (
+        delegated_role_user_ids(identity, "factory_sales")
+        if identity.role.code in {"factory_senior_manager", "merchant_senior_manager"}
+        else {identity.user_id} if "factory_sales" in roles else set()
+    )
     actions = []
     if (
-        role == "factory_sales"
+        "factory_sales" in roles
         and identity.organization_id == plan.factory_organization_id
-        and plan.created_by_id == identity.user_id
+        and plan.created_by_id in sales_actor_ids
         and shipment.status == OrderPlanShipment.Status.PLANNED
         and _has_open_shipment_task(
             plan=plan,
@@ -5339,7 +5391,7 @@ def _shipment_actions(plan, shipment, identity):
                 "confirm_text": "授权后由成品库管打印贴包，物流经理确认出库，再由成品库管确认实际发货。",
             }
         )
-    if role == "factory_stock" and identity.organization_id == plan.factory_organization_id:
+    if "factory_stock" in roles and identity.organization_id == plan.factory_organization_id:
         if (
             shipment.status == OrderPlanShipment.Status.AUTHORIZED
             and not shipment.qrcode_printed_at
@@ -5382,7 +5434,7 @@ def _shipment_actions(plan, shipment, identity):
                 }
             )
     if (
-        role == "factory_logistics"
+        "factory_logistics" in roles
         and identity.organization_id == plan.factory_organization_id
         and shipment.status == OrderPlanShipment.Status.AUTHORIZED
         and shipment.qrcode_printed_at
@@ -5420,17 +5472,28 @@ def _shipment_actions(plan, shipment, identity):
                 "confirm_text": "物流信息及可选凭证将分别保存在选中批次，确认已线下出库后由成品库管确认发货。",
             }
         )
+    merchant_receipt_manager = bool(
+        identity.role.code in {"merchant_senior_manager", "factory_senior_manager"}
+        and identity_can_perform_shared_operation(
+            identity, "goods_transfer_receipt"
+        )
+    )
     if (
         identity.organization.organization_type.code == "MERCHANT"
         and identity.organization_id == plan.merchant_organization_id
-        and role in {"merchant_owner", "merchant_sales", "merchant_stock"}
+        and identity_can_perform_shared_operation(
+            identity, "goods_transfer_receipt"
+        )
         and shipment.status == OrderPlanShipment.Status.SHIPPED
-        and _has_open_shipment_task(
-            plan=plan,
-            shipment=shipment,
-            identity=identity,
-            work_type="ORDER_PLAN_V2_MERCHANT_RECEIPT",
-            stage_key="merchant-receipt",
+        and (
+            merchant_receipt_manager
+            or _has_open_shipment_task(
+                plan=plan,
+                shipment=shipment,
+                identity=identity,
+                work_type="ORDER_PLAN_V2_MERCHANT_RECEIPT",
+                stage_key="merchant-receipt",
+            )
         )
     ):
         actions.append(
@@ -5695,9 +5758,14 @@ def _serialize_subplans(material_plan):
 
 
 def _available_actions(plan, material_plan, identity):
-    role = identity.role.code
+    roles = effective_role_codes(identity)
+    sales_actor_ids = (
+        delegated_role_user_ids(identity, "factory_sales")
+        if identity.role.code in {"factory_senior_manager", "merchant_senior_manager"}
+        else {identity.user_id} if "factory_sales" in roles else set()
+    )
     actions = []
-    if role == "factory_material_stock" and identity.organization_id == plan.factory_organization_id:
+    if "factory_material_stock" in roles and identity.organization_id == plan.factory_organization_id:
         if material_plan.status == OrderPlanMaterialPlan.Status.WAITING_WAREHOUSE_REVIEW:
             actions.append({
                 "code": "warehouse-review", "label": "核对物料与配送计划",
@@ -5719,7 +5787,7 @@ def _available_actions(plan, material_plan, identity):
                 "code": "material-ready", "label": "所需物料全部到位，推送生产",
                 "confirm_title": "确认物料全部到位", "confirm_text": "请确认线下物料已核对齐套，随后将推送生产经理。",
             })
-    if role in {"supplier_owner", "supplier_sales"} and identity.organization.organization_type.code == "SUPPLIER":
+    if roles & {"supplier_owner", "supplier_sales"} and identity.organization.organization_type.code == "SUPPLIER":
         deliveries = OrderPlanSupplyDelivery.objects.filter(
             material_plan=material_plan,
             supplier_id=identity.organization_id,
@@ -5745,7 +5813,7 @@ def _available_actions(plan, material_plan, identity):
                     "confirm_title": "确认线下配送", "confirm_text": "确认后等待厂家物料库独立入库。",
                 })
                 break
-    if role == "factory_production" and identity.organization_id == plan.factory_organization_id:
+    if "factory_production" in roles and identity.organization_id == plan.factory_organization_id:
         subplan = material_plan.production_subplans.filter(
             status=OrderPlanProductionSubplan.Status.PRODUCTION_PENDING,
         ).order_by("sequence_no").first()
@@ -5761,7 +5829,7 @@ def _available_actions(plan, material_plan, identity):
                     "confirm_title": "确认生产完成", "confirm_text": "请确认本型号生产计划已在线下完成装配。",
                 })
     if (
-        role == "factory_sales_assistant"
+        "factory_sales_assistant" in roles
         and identity.organization_id == plan.factory_organization_id
         and plan.status == OrderPlan.Status.RECEIVED
         and not plan.accounted_at
@@ -5781,8 +5849,8 @@ def _available_actions(plan, material_plan, identity):
     production_released = bool(material_plan.material_ready_at)
     cancellation_audit = OrderPlanCancellationAudit.objects.filter(order_plan=plan).first()
     if (
-        role == "factory_sales"
-        and plan.created_by_id == identity.user_id
+        "factory_sales" in roles
+        and plan.created_by_id in sales_actor_ids
         and not has_started_shipment
         and plan.status not in {
             OrderPlan.Status.CANCELLED,

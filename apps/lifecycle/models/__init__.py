@@ -52,7 +52,13 @@ from .factory_return import (
     FactoryReturnWarrantyDispatch,
     FactoryReturnWarrantyDispatchItem,
 )
-from .aftersales import AfterSalesApplication, AfterSalesEvent, AfterSalesMedia
+from .aftersales import (
+    AfterSalesApplication,
+    AfterSalesEvent,
+    AfterSalesMedia,
+    AfterSalesServiceStationApplication,
+    AfterSalesServiceStationLiaison,
+)
 
 
 __all__ = [
@@ -110,6 +116,10 @@ __all__ = [
     "AfterSalesEvent",
 
     "AfterSalesMedia",
+
+    "AfterSalesServiceStationApplication",
+
+    "AfterSalesServiceStationLiaison",
 
     "FactoryReturnMaterialReturnRecord",
 

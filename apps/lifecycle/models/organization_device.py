@@ -1,8 +1,36 @@
 # apps/lifecycle/models/organization_device.py
 
 
+from django.core.exceptions import ValidationError
 from django.db import models
 
+
+
+class OrganizationDeviceQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        target_org = kwargs.get("organization")
+        target_org_id = kwargs.get("organization_id")
+        if target_org is not None:
+            target_org_id = getattr(target_org, "pk", target_org)
+        if target_org_id is not None:
+            organization_model = self.model._meta.get_field("organization").remote_field.model
+            organization = (
+                target_org
+                if hasattr(target_org, "get_factory_root")
+                else organization_model.objects.get(pk=target_org_id)
+            )
+            organization_root = organization.get_factory_root()
+            if not organization_root:
+                raise ValidationError("库存组织尚未明确所属厂家根组织。")
+            for record in self.select_related("device__batch__manufacturer"):
+                device_root = record.device.batch.manufacturer.get_factory_root()
+                if not device_root or device_root.pk != organization_root.pk:
+                    raise ValidationError("设备库存不能登记到其他厂家根组织。")
+        return super().update(**kwargs)
+
+
+class OrganizationDeviceManager(models.Manager.from_queryset(OrganizationDeviceQuerySet)):
+    pass
 
 
 class OrganizationDevice(models.Model):
@@ -94,6 +122,9 @@ class OrganizationDevice(models.Model):
 
     ]
 
+
+
+    objects = OrganizationDeviceManager()
 
 
     device = models.OneToOneField(
@@ -190,6 +221,25 @@ class OrganizationDevice(models.Model):
         ]
 
 
+
+    def _validate_factory_boundary(self):
+        if not self.device_id or not self.organization_id:
+            return
+        manufacturer = self.device.batch.manufacturer
+        factory_root = manufacturer.get_factory_root()
+        organization_root = self.organization.get_factory_root()
+        if not factory_root or not organization_root:
+            raise ValidationError("设备和库存组织都必须明确所属厂家根组织。")
+        if factory_root.pk != organization_root.pk:
+            raise ValidationError("设备库存不能登记到其他厂家根组织。")
+
+    def clean(self):
+        super().clean()
+        self._validate_factory_boundary()
+
+    def save(self, *args, **kwargs):
+        self._validate_factory_boundary()
+        super().save(*args, **kwargs)
 
     def __str__(self):
 

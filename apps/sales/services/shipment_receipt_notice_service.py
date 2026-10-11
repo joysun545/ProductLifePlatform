@@ -3,6 +3,7 @@
 from django.db import transaction
 from django.utils import timezone
 
+from account.models import UserOrganization
 from sales.models import OrderPlanShipment
 from workflow.models import UserTask, WorkItem
 
@@ -14,14 +15,20 @@ def pending_received_shipment_notices(shipment):
     if shipment.status != OrderPlanShipment.Status.RECEIVED or not shipment.received_at:
         return UserTask.objects.none()
     prefix = f"sales:order-plan:{shipment.order_plan_id}:shipment:{shipment.pk}"
-    # The receipt task is the dispatch-time roster, including the verified
-    # inbox binding repairs after login-slot changes. Never infer recipients
-    # from today's factory/merchant role membership alone.
-    recipients = UserTask.objects.filter(
-        workitem__uniq_key=f"{prefix}:merchant-receipt",
-        workitem__type="ORDER_PLAN_V2_MERCHANT_RECEIPT",
-        to_role_snapshot__in=MERCHANT_RECEIPT_ROLES,
-    ).values("to_openid")
+    merchant_openids = UserOrganization.objects.filter(
+        organization_id=shipment.order_plan.merchant_organization_id,
+        role__code__in=MERCHANT_RECEIPT_ROLES,
+        role__is_active=True,
+        user__is_active=True,
+        is_active=True,
+    ).exclude(
+        user__wx_openid__isnull=True,
+    ).exclude(
+        user__wx_openid="",
+    ).values_list("user__wx_openid", flat=True)
+    # Shipped notices are awareness-only and include sales staff who do not
+    # hold the actionable receipt permission. Close the whole merchant notice
+    # audience when the batch is received; the action roster is narrower.
     notices = WorkItem.objects.filter(
         uniq_key=f"{prefix}:shipped-notice",
         type="ORDER_PLAN_V2_SHIPPED_NOTICE",
@@ -29,7 +36,8 @@ def pending_received_shipment_notices(shipment):
         payload__shipment_id=shipment.pk,
     )
     return UserTask.objects.filter(
-        workitem__in=notices, to_openid__in=recipients,
+        workitem__in=notices,
+        to_openid__in=merchant_openids,
         to_role_snapshot__in=MERCHANT_RECEIPT_ROLES,
         need_action=False, state__in=("NEW", "READ"),
     )

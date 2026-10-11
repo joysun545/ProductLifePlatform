@@ -10,6 +10,7 @@ from django.utils import timezone
 
 from account.models import OrganizationRelation
 from account.services.auth_service import get_active_identity
+from account.services.role_delegation_service import identity_has_role
 from supply_chain.models import (
     FactoryMaterialLot, FactoryMaterialStock, MaterialSpecSupplier,
     MaterialWarehouseDocument, MaterialWarrantyCase,
@@ -57,8 +58,8 @@ def inventory_identity(user, *, write=False):
     identity = get_active_identity(user) if user.is_active else None
     if not identity:
         raise MaterialInventoryPermissionError("账号没有有效岗位，请重新登录")
-    keeper = identity.role.code == "factory_material_stock" and identity.organization.organization_type.code == "OWNER"
-    supplier = identity.role.code in {"supplier_owner", "supplier_sales"} and identity.organization.organization_type.code == "SUPPLIER"
+    keeper = identity_has_role(identity, "factory_material_stock") and identity.organization.organization_type.code == "OWNER"
+    supplier = identity_has_role(identity, {"supplier_owner", "supplier_sales"}) and identity.organization.organization_type.code == "SUPPLIER"
     if not keeper and (write or not supplier):
         raise MaterialInventoryPermissionError("仅厂家物料库管可办理出入库，供应商负责人和负责该物料的销售经理可查看库存")
     return identity, keeper
@@ -69,7 +70,7 @@ def _stocks(identity, keeper):
     if keeper:
         return rows.filter(factory_id=identity.organization_id)
     rows = rows.filter(supplier_id=identity.organization_id)
-    if identity.role.code == "supplier_sales":
+    if identity_has_role(identity, "supplier_sales"):
         rows = rows.filter(material_spec__material_id__in=get_responsible_material_ids(sales_identity=identity))
     return rows
 

@@ -10,7 +10,11 @@ from lifecycle.models import Device, InstallationInvitation
 
 def descendant_organization_ids(organization, *, include_self=True):
     """返回经销链路下全部组织ID，供统计查询和任务路由复用。"""
+    factory_root = organization.get_factory_root()
+    if not factory_root:
+        return set()
 
+    root_id = factory_root.pk
     discovered = {organization.pk} if include_self else set()
     frontier = {organization.pk}
 
@@ -21,6 +25,8 @@ def descendant_organization_ids(organization, *, include_self=True):
                 relation_type=OrganizationRelationType.DISTRIBUTION,
                 is_active=True,
                 target_organization__is_active=True,
+                source_organization__factory_root_id=root_id,
+                target_organization__factory_root_id=root_id,
             ).values_list("target_organization_id", flat=True)
         )
         child_ids -= discovered
@@ -48,11 +54,20 @@ def devices_under_organization(organization):
 
 
 def devices_under_account(identity):
+    factory_root = identity.organization.get_factory_root()
+    if not factory_root:
+        return Device.objects.none()
+
+    root_id = factory_root.pk
     direct_child_ids = set(
         OrganizationRelation.objects.filter(
             created_by_invitation__inviter_id=identity.user_id,
+            source_organization_id=identity.organization_id,
             relation_type=OrganizationRelationType.DISTRIBUTION,
             is_active=True,
+            source_organization__factory_root_id=root_id,
+            target_organization__factory_root_id=root_id,
+            target_organization__is_active=True,
         ).values_list("target_organization_id", flat=True)
     )
 
@@ -69,11 +84,16 @@ def devices_under_account(identity):
         source_organization_id=identity.organization_id,
         status=InstallationInvitation.Status.ACCEPTED,
         target_organization__is_active=True,
+        source_organization__factory_root_id=root_id,
+        target_organization__factory_root_id=root_id,
+        device__batch__manufacturer__factory_root_id=root_id,
     ).values_list("device_id", flat=True)
 
     return Device.objects.filter(
         Q(organization_record__organization_id__in=organization_ids)
         | Q(id__in=installation_device_ids)
+    ).filter(
+        batch__manufacturer__factory_root_id=root_id
     ).distinct()
 
 

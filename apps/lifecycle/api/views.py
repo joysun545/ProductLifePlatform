@@ -58,9 +58,11 @@ from lifecycle.services.goods_transfer_service import (
     GoodsTransferError,
     confirm_goods_transfer_receipt,
     create_goods_transfer,
+    delete_goods_transfer_scan_draft,
     get_goods_transfer_detail,
     get_goods_transfer_list,
     get_goods_transfer_options,
+    release_goods_transfer_scan_draft,
     scan_goods_transfer_device,
     submit_goods_transfer,
 )
@@ -116,7 +118,7 @@ def _authenticated_flow_user(request):
 
 def _goods_transfer_error(exc):
     return Response(
-        {"code": 1, "msg": str(exc), "data": {}},
+        {"code": 1, "msg": str(exc), "data": getattr(exc, "data", {})},
         status=status.HTTP_409_CONFLICT,
     )
 
@@ -198,6 +200,21 @@ class GoodsTransferDetailAPI(APIView):
             return _goods_transfer_error(exc)
         return Response({"code": 0, "msg": "success", "data": data})
 
+    def delete(self, request, transfer_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            data = delete_goods_transfer_scan_draft(
+                user=user,
+                transfer_id=transfer_id,
+            )
+        except GoodsTransferError as exc:
+            return _goods_transfer_error(exc)
+        return Response(
+            {"code": 0, "msg": "未提交的商品流转草稿已删除", "data": data}
+        )
+
 
 class GoodsTransferScanAPI(APIView):
     authentication_classes = []
@@ -218,6 +235,28 @@ class GoodsTransferScanAPI(APIView):
         except GoodsTransferError as exc:
             return _goods_transfer_error(exc)
         return Response({"code": 0, "msg": "设备已加入流转", "data": data})
+
+
+class GoodsTransferScanReleaseAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, transfer_id):
+        user, error = _authenticated_flow_user(request)
+        if error:
+            return error
+        try:
+            data = release_goods_transfer_scan_draft(
+                user=user,
+                transfer_id=transfer_id,
+            )
+        except GoodsTransferError as exc:
+            return _goods_transfer_error(exc)
+        return Response({
+            "code": 0,
+            "msg": "未提交的扫码设备已释放，草稿已保留",
+            "data": data,
+        })
 
 
 class GoodsTransferSubmitAPI(APIView):

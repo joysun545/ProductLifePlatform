@@ -3,6 +3,7 @@ from uuid import uuid4
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 from django.db.models import Q
+from django.db.models.deletion import ProtectedError
 from django.utils import timezone
 
 from account.models import (
@@ -12,6 +13,12 @@ from account.models import (
     UserOrganization,
 )
 from account.services.auth_service import get_active_identity
+from account.services.role_delegation_service import (
+    SENIOR_MANAGER_ROLE_CODES,
+    identity_can_perform_shared_operation,
+    identity_has_role,
+    shared_operation_recipient_role_codes,
+)
 from lifecycle.models import (
     DeviceState,
     FactoryReturnDocument,
@@ -32,10 +39,6 @@ MERCHANT_FLOW_ROLES = {
     "merchant_sales",
     "merchant_stock",
 }
-TRANSFER_OPERATOR_ROLES = {
-    "merchant_owner",
-    "merchant_sales",
-}
 FACTORY_RECEIPT_ROLES = {"factory_stock"}
 FLOW_VIEW_ROLES = MERCHANT_FLOW_ROLES | FACTORY_RECEIPT_ROLES | {
     "factory_sales",
@@ -49,7 +52,9 @@ NOTICE_WORK_TYPE = "GOODS_TRANSFER_NOTICE"
 
 
 class GoodsTransferError(Exception):
-    pass
+    def __init__(self, message, *, data=None):
+        super().__init__(message)
+        self.data = data or {}
 
 
 def _quality_gate_operation(transfer):
@@ -95,9 +100,22 @@ def _identity(user, allowed_roles=None):
         "OWNER",
     }:
         raise GoodsTransferError("当前账号没有商品流转权限。")
-    if allowed_roles and identity.role.code not in allowed_roles:
+    if allowed_roles and not identity_has_role(identity, allowed_roles):
         raise GoodsTransferError("当前岗位不能执行该商品流转操作。")
     return identity
+
+
+def _available_merchant_flow_types(identity):
+    if not identity or identity.organization.organization_type.code != "MERCHANT":
+        return []
+    available = []
+    if identity_can_perform_shared_operation(
+        identity, "goods_transfer_coordination"
+    ):
+        available.extend((GoodsTransfer.FlowType.SHIPMENT, GoodsTransfer.FlowType.RETURN))
+    if identity_can_perform_shared_operation(identity, "goods_transfer_routing"):
+        available.append(GoodsTransfer.FlowType.TRANSFER)
+    return available
 
 
 def _account_payload(user, organization, relation):
@@ -208,7 +226,13 @@ def _upstream_accounts(organization):
 def get_goods_transfer_options(*, user, flow_type):
     identity = _identity(user, MERCHANT_FLOW_ROLES)
     flow_type = str(flow_type or "").upper()
+    if flow_type == "CAPABILITIES":
+        return {"available_flow_types": _available_merchant_flow_types(identity)}
     if flow_type == GoodsTransfer.FlowType.SHIPMENT:
+        if not identity_can_perform_shared_operation(
+            identity, "goods_transfer_coordination"
+        ):
+            raise GoodsTransferError("当前岗位不能发起本组织的商品发货。")
         return {
             "flow_type": flow_type,
             "source_organization": {
@@ -218,6 +242,10 @@ def get_goods_transfer_options(*, user, flow_type):
             "targets": _downstream_accounts(identity.organization),
         }
     if flow_type == GoodsTransfer.FlowType.RETURN:
+        if not identity_can_perform_shared_operation(
+            identity, "goods_transfer_coordination"
+        ):
+            raise GoodsTransferError("当前岗位不能发起本组织的商品退回。")
         return {
             "flow_type": flow_type,
             "source_organization": {
@@ -227,7 +255,9 @@ def get_goods_transfer_options(*, user, flow_type):
             "targets": _upstream_accounts(identity.organization),
         }
     if flow_type == GoodsTransfer.FlowType.TRANSFER:
-        if identity.role.code not in TRANSFER_OPERATOR_ROLES:
+        if not identity_can_perform_shared_operation(
+            identity, "goods_transfer_routing"
+        ):
             raise GoodsTransferError("只有上级商家负责人或销售经理可以调货。")
         children = _downstream_accounts(identity.organization)
         return {
@@ -278,6 +308,19 @@ def create_goods_transfer(
         return serialize_goods_transfer(existing, identity), False
 
     flow_type = str(flow_type or "").upper()
+    if flow_type in {
+        GoodsTransfer.FlowType.SHIPMENT,
+        GoodsTransfer.FlowType.RETURN,
+    }:
+        if not identity_can_perform_shared_operation(
+            identity, "goods_transfer_coordination"
+        ):
+            raise GoodsTransferError("当前岗位不能发起本组织的商品流转。")
+    elif flow_type == GoodsTransfer.FlowType.TRANSFER:
+        if not identity_can_perform_shared_operation(
+            identity, "goods_transfer_routing"
+        ):
+            raise GoodsTransferError("当前岗位不能发起本组织的调拨。")
     if flow_type == GoodsTransfer.FlowType.SHIPMENT:
         candidate = _candidate_by_user(
             _downstream_accounts(identity.organization),
@@ -299,8 +342,6 @@ def create_goods_transfer(
         from_org_id = identity.organization_id
         to_org_id = candidate["organization_id"]
     elif flow_type == GoodsTransfer.FlowType.TRANSFER:
-        if identity.role.code not in TRANSFER_OPERATOR_ROLES:
-            raise GoodsTransferError("只有上级商家负责人或销售经理可以调货。")
         children = _downstream_accounts(identity.organization)
         source = _candidate_by_user(children, source_account_id, "调出商家负责人")
         target = _candidate_by_user(children, target_account_id, "调入商家负责人")
@@ -383,7 +424,7 @@ def scan_goods_transfer_device(*, user, transfer_id, qr_text):
     )
     if GoodsTransferItem.objects.filter(transfer=transfer, device=device).exists():
         raise GoodsTransferError("该设备已经加入本次商品流转。")
-    if GoodsTransferItem.objects.filter(
+    conflicting_item = GoodsTransferItem.objects.select_related("transfer").filter(
         device=device,
         transfer__status__in=(
             GoodsTransfer.Status.SCANNING,
@@ -391,8 +432,30 @@ def scan_goods_transfer_device(*, user, transfer_id, qr_text):
             GoodsTransfer.Status.PENDING_FACTORY_PICKUP,
             GoodsTransfer.Status.PENDING_FACTORY_POSTING,
         ),
-    ).exists():
-        raise GoodsTransferError("该设备正在其他未完成的商品流转中。")
+    ).exclude(transfer=transfer).order_by("transfer__created_at", "id").first()
+    if conflicting_item:
+        conflict_transfer = conflicting_item.transfer
+        conflict_data = {
+            "reason_code": "DEVICE_IN_UNFINISHED_GOODS_TRANSFER",
+        }
+        # Only expose a resumable link when the current user owns the scanning
+        # draft in this same organization. Other users' transfer details stay
+        # private and cannot be resumed by this account.
+        if (
+            conflict_transfer.status == GoodsTransfer.Status.SCANNING
+            and conflict_transfer.initiated_by_id == user.pk
+            and conflict_transfer.instruction_organization_id
+            == identity.organization_id
+        ):
+            conflict_data["conflict_transfer"] = {
+                "id": conflict_transfer.pk,
+                "flow_no": conflict_transfer.flow_no,
+                "can_continue": True,
+            }
+        raise GoodsTransferError(
+            "此设备已在未完成的商品流转中，请先继续处理该流转。",
+            data=conflict_data,
+        )
     item = GoodsTransferItem.objects.create(
         transfer=transfer,
         device=device,
@@ -401,6 +464,78 @@ def scan_goods_transfer_device(*, user, transfer_id, qr_text):
     return {
         "item": _serialize_item(item),
         "item_count": transfer.items.count(),
+    }
+
+
+@transaction.atomic
+def release_goods_transfer_scan_draft(*, user, transfer_id):
+    """Release device associations from an unsubmitted scan draft.
+
+    The draft itself remains available to the initiator. Only untouched scan
+    rows are removed; inventory ownership, device state, and lifecycle events
+    are deliberately left unchanged.
+    """
+    identity = _identity(user, MERCHANT_FLOW_ROLES)
+    transfer = GoodsTransfer.objects.select_for_update().filter(
+        pk=transfer_id,
+        initiated_by=user,
+        instruction_organization=identity.organization,
+    ).first()
+    if not transfer:
+        raise GoodsTransferError("商品流转草稿不存在或不属于当前账号。")
+    if transfer.status != GoodsTransfer.Status.SCANNING:
+        raise GoodsTransferError("只能释放尚未提交的扫码草稿。")
+
+    scanned_items = GoodsTransferItem.objects.select_for_update().filter(
+        transfer=transfer,
+        status=GoodsTransferItem.Status.SCANNED,
+        lifecycle_event__isnull=True,
+        receipt_event__isnull=True,
+    )
+    released_count = scanned_items.count()
+    if released_count:
+        scanned_items.delete()
+
+    return {
+        "transfer_id": transfer.pk,
+        "released_count": released_count,
+        "item_count": transfer.items.count(),
+        "status": transfer.status,
+    }
+
+
+@transaction.atomic
+def delete_goods_transfer_scan_draft(*, user, transfer_id):
+    """Delete only the caller's unsubmitted scan draft and untouched rows."""
+    identity = _identity(user, MERCHANT_FLOW_ROLES)
+    transfer = GoodsTransfer.objects.select_for_update().filter(
+        pk=transfer_id,
+        initiated_by=user,
+        instruction_organization=identity.organization,
+    ).first()
+    if not transfer:
+        raise GoodsTransferError("商品流转草稿不存在或不属于当前账号。")
+    if transfer.status != GoodsTransfer.Status.SCANNING:
+        raise GoodsTransferError("只能删除尚未提交的商品流转草稿。")
+
+    items = GoodsTransferItem.objects.select_for_update().filter(transfer=transfer)
+    if items.exclude(
+        status=GoodsTransferItem.Status.SCANNED,
+        lifecycle_event__isnull=True,
+        receipt_event__isnull=True,
+    ).exists():
+        raise GoodsTransferError("该草稿已进入实际流转，不能删除。")
+
+    deleted_item_count = items.count()
+    try:
+        transfer.delete()
+    except ProtectedError as exc:
+        raise GoodsTransferError("该草稿已关联其他业务记录，不能删除。") from exc
+
+    return {
+        "transfer_id": int(transfer_id),
+        "deleted_item_count": deleted_item_count,
+        "deleted": True,
     }
 
 
@@ -423,7 +558,17 @@ def _role_openids(organization, role_codes):
 def _receipt_roles(organization):
     if organization.organization_type.code == "OWNER":
         return FACTORY_RECEIPT_ROLES
-    return MERCHANT_FLOW_ROLES
+    return shared_operation_recipient_role_codes(
+        organization.pk, "goods_transfer_receipt"
+    )
+
+
+def _identity_can_confirm_receipt(identity, organization):
+    if organization.organization_type.code == "MERCHANT":
+        return identity_can_perform_shared_operation(
+            identity, "goods_transfer_receipt"
+        )
+    return identity_has_role(identity, _receipt_roles(organization))
 
 
 def _task_payload(transfer):
@@ -735,7 +880,7 @@ def submit_goods_transfer(
     return serialize_goods_transfer(transfer, identity), True
 
 
-def _complete_receipt_workitem(transfer, user, now):
+def _complete_receipt_workitem(transfer, user, now, *, allow_manager_without_task=False):
     workitem = WorkItem.objects.select_for_update().filter(
         type=RECEIPT_WORK_TYPE,
         uniq_key=f"lifecycle:goods-transfer:{transfer.pk}:receipt",
@@ -746,7 +891,7 @@ def _complete_receipt_workitem(transfer, user, now):
         to_openid=user.wx_openid,
         need_action=True,
     ).exclude(state="DONE").first()
-    if not task:
+    if not task and not allow_manager_without_task:
         raise GoodsTransferError("当前账号不是该确认入库任务的处理人。")
     if workitem.status != "OPEN":
         raise GoodsTransferError("该入库任务已经由其他账号完成。")
@@ -802,7 +947,7 @@ def confirm_goods_transfer_receipt(*, user, transfer_id):
     )
     if not transfer:
         raise GoodsTransferError("商品流转单不存在或不属于当前收货组织。")
-    if identity.role.code not in _receipt_roles(transfer.to_organization):
+    if not _identity_can_confirm_receipt(identity, transfer.to_organization):
         raise GoodsTransferError("当前岗位不能确认本次商品入库。")
     if transfer.status == GoodsTransfer.Status.COMPLETED:
         return serialize_goods_transfer(transfer, identity), False
@@ -889,7 +1034,18 @@ def confirm_goods_transfer_receipt(*, user, transfer_id):
                 "updated_at",
             )
         )
-    _complete_receipt_workitem(transfer, user, now)
+    _complete_receipt_workitem(
+        transfer,
+        user,
+        now,
+        allow_manager_without_task=(
+            identity.role.code in SENIOR_MANAGER_ROLE_CODES
+            and transfer.to_organization.organization_type.code == "MERCHANT"
+            and identity_can_perform_shared_operation(
+                identity, "goods_transfer_receipt"
+            )
+        ),
+    )
     transfer.status = GoodsTransfer.Status.COMPLETED
     transfer.received_by = user
     transfer.received_at = now
@@ -957,8 +1113,20 @@ def serialize_goods_transfer(transfer, identity=None):
     if identity and transfer.status == GoodsTransfer.Status.PENDING_RECEIPT:
         can_receive = bool(
             identity.organization_id == transfer.to_organization_id
-            and identity.role.code in _receipt_roles(transfer.to_organization)
+            and _identity_can_confirm_receipt(identity, transfer.to_organization)
         )
+    can_delete = bool(
+        identity
+        and transfer.status == GoodsTransfer.Status.SCANNING
+        and transfer.initiated_by_id == identity.user_id
+        and transfer.instruction_organization_id == identity.organization_id
+        and all(
+            item.status == GoodsTransferItem.Status.SCANNED
+            and item.lifecycle_event_id is None
+            and item.receipt_event_id is None
+            for item in items
+        )
+    )
     can_view_factory_return_process = bool(
         identity
         and transfer.status
@@ -970,15 +1138,14 @@ def serialize_goods_transfer(transfer, identity=None):
         and transfer.flow_type == GoodsTransfer.FlowType.RETURN
         and transfer.to_organization.organization_type.code == "OWNER"
         and identity.organization_id == transfer.to_organization_id
-        and identity.role.code
-        in {
+        and identity_has_role(identity, {
             "factory_stock",
             "factory_sales",
             "factory_logistics",
             "factory_sales_assistant",
             "factory_matching",
             "factory_production",
-        }
+        })
     )
     logistics_documents = []
     goods_list_documents = []
@@ -1076,6 +1243,7 @@ def serialize_goods_transfer(transfer, identity=None):
                 and transfer.initiated_by_id == identity.user_id
                 and items
             ),
+            "can_delete": can_delete,
             "can_receive": can_receive,
             "can_view_factory_return_process": can_view_factory_return_process,
             "can_view_factory_return_logistics_documents": (
@@ -1186,6 +1354,11 @@ def get_goods_transfer_list(*, user, limit=50):
             "role_name": identity.role.name,
             "organization_id": identity.organization_id,
             "organization_name": identity.organization.name,
+            "can_create": bool(
+                identity.organization.organization_type.code == "MERCHANT"
+                and _available_merchant_flow_types(identity)
+            ),
+            "available_flow_types": _available_merchant_flow_types(identity),
         },
         "items": [serialize_goods_transfer(row, identity) for row in transfers],
     }

@@ -178,11 +178,16 @@ class ShipmentWorkflowV2Tests(V2OrderPlanFixture):
                 self.merchant_owner, self.merchant_sales, self.merchant_stock_1, self.merchant_stock_2
             )
         }
+        merchant_receipt_openids = {
+            user.wx_openid for user in (
+                self.merchant_owner, self.merchant_stock_1, self.merchant_stock_2
+            )
+        }
         self.assertSetEqual(set(notice.user_tasks.values_list("to_openid", flat=True)), merchant_openids | {self.sales_user.wx_openid})
         self.assertFalse(notice.user_tasks.filter(need_action=True).exists())
         receipt = self._workitem(plan, shipment, "merchant-receipt")
         self.assertEqual(receipt.action_mode, "ANYONE_DO")
-        self.assertSetEqual(set(receipt.user_tasks.filter(need_action=True).values_list("to_openid", flat=True)), merchant_openids)
+        self.assertSetEqual(set(receipt.user_tasks.filter(need_action=True).values_list("to_openid", flat=True)), merchant_receipt_openids)
         self.assertSetEqual(set(UserTask.objects.filter(
             to_openid__in=[self.factory_assistant_1.wx_openid, self.factory_assistant_2.wx_openid],
             workitem__biz_ref=f"sales.OrderPlan:{plan.pk}", need_action=True,
@@ -221,7 +226,9 @@ class ShipmentWorkflowV2Tests(V2OrderPlanFixture):
         second_devices = set(second.device_allocations.values_list("device_id", flat=True))
         self.assertFalse(first_devices & second_devices)
         self.assertEqual(len(first_devices | second_devices), 5)
-        self._receipt(plan, first, self.merchant_sales)
+        with self.assertRaises(flow.OrderPlanMaterialFlowError):
+            self._receipt(plan, first, self.merchant_sales)
+        self._receipt(plan, first, self.merchant_stock_1)
         second.refresh_from_db()
         self.assertEqual(second.status, OrderPlanShipment.Status.SHIPPED)
         self.assertFalse(OrganizationDevice.objects.filter(device_id__in=second_devices, organization=self.merchant).exists())

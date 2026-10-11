@@ -1,6 +1,7 @@
 # apps/lifecycle/models/event.py
 
 
+from django.core.exceptions import ValidationError
 from django.db import models
 
 
@@ -305,6 +306,31 @@ class LifecycleEvent(models.Model):
         ]
 
 
+
+    def _validate_factory_boundary(self):
+        if not self.device_id:
+            return
+        manufacturer = self.device.batch.manufacturer
+        factory_root = manufacturer.get_factory_root()
+        if not factory_root:
+            raise ValidationError("设备没有明确的厂家根组织，不能写入生命周期事件。")
+        for field_name in ("organization", "from_organization", "to_organization"):
+            organization = getattr(self, field_name, None)
+            if not organization:
+                continue
+            participant_root = organization.get_factory_root()
+            if not participant_root:
+                raise ValidationError({field_name: "事件组织尚未明确所属厂家根组织。"})
+            if participant_root.pk != factory_root.pk:
+                raise ValidationError({field_name: "生命周期事件不能跨越不同的厂家根组织。"})
+
+    def clean(self):
+        super().clean()
+        self._validate_factory_boundary()
+
+    def save(self, *args, **kwargs):
+        self._validate_factory_boundary()
+        super().save(*args, **kwargs)
 
     def __str__(self):
 

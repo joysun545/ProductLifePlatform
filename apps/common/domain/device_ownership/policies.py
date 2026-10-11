@@ -1,11 +1,14 @@
 from django.core.exceptions import ObjectDoesNotExist
 
+from account.services.role_delegation_service import (
+    identity_can_perform_shared_operation,
+)
+
 from .types import DeviceAccessDecision
 
 
 INSTALLER_ROLE_CODES = {
     "merchant_owner",
-    "merchant_sales",
     "merchant_electrician",
 }
 
@@ -50,7 +53,9 @@ def evaluate_device_access(*, device, identity, ownership):
     installation = _related_object(device, "installation")
     role_code = identity.role.code
 
-    has_installer_role = role_code in INSTALLER_ROLE_CODES
+    has_installer_role = identity_can_perform_shared_operation(
+        identity, "install_device"
+    )
     is_direct_inventory = bool(
         ownership.is_direct_owner
         and organization_record

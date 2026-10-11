@@ -1,4 +1,5 @@
 from account.services.auth_service import get_active_identity
+from account.services.role_delegation_service import identity_has_role
 
 
 class QualityTraceAccessError(Exception):
@@ -25,12 +26,12 @@ def get_quality_trace_identity(user):
     organization_type = identity.organization.organization_type.code
     if (
         organization_type == FACTORY_ORGANIZATION_TYPE
-        and identity.role.code in FACTORY_QUALITY_ROLES
+        and identity_has_role(identity, FACTORY_QUALITY_ROLES)
     ):
         return identity
     if (
         organization_type == SUPPLIER_ORGANIZATION_TYPE
-        and identity.role.code in SUPPLIER_ALLOWED_ROLES
+        and identity_has_role(identity, SUPPLIER_ALLOWED_ROLES)
     ):
         return identity
     raise QualityTraceAccessError("当前岗位无权访问质量追溯数据。")

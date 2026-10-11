@@ -7,6 +7,10 @@ from django.db import transaction
 from django.utils import timezone
 
 from account.services.auth_service import get_active_identity
+from account.services.role_delegation_service import (
+    has_open_action_task_copy,
+    identity_has_role,
+)
 from quality_trace.models import (
     QualityRecallBatchOperation, QualityRecallCampaign, QualityRecallDevice,
     QualityRecallIsolationReceipt, QualityRecallTransportLeg, QualityTraceEvent,
@@ -47,9 +51,9 @@ def _identity(user):
 def _allowed(identity):
     kind = identity.organization.organization_type.code
     return (
-        kind == "MERCHANT" and identity.role.code in MERCHANT_ROLES
+        kind == "MERCHANT" and identity_has_role(identity, MERCHANT_ROLES)
     ) or (
-        kind == "OWNER" and identity.role.code in {"factory_logistics", "factory_sales_assistant"}
+        kind == "OWNER" and identity_has_role(identity, {"factory_logistics", "factory_sales_assistant"})
     )
 
 
@@ -68,9 +72,9 @@ def _candidate(row, identity):
         return None
     legs = [leg for leg in row.transport_legs.all() if leg.status != "CANCELLED"]
     leg = legs[-1] if legs else None
-    org_id, role = identity.organization_id, identity.role.code
+    org_id = identity.organization_id
     if leg and leg.status == "IN_TRANSIT":
-        allowed = role == "factory_logistics" if leg.is_factory_destination else role in MERCHANT_ROLES
+        allowed = identity_has_role(identity, {"factory_logistics"}) if leg.is_factory_destination else identity_has_role(identity, MERCHANT_ROLES)
         if leg.to_organization_id != org_id or not allowed:
             return None
         shipment = (leg.relation_snapshot or {}).get("dispatch_batch_operation_id")
@@ -87,14 +91,14 @@ def _candidate(row, identity):
             "leg_id": leg.pk,
         }
     if leg and leg.status == "RECEIVED" and leg.is_factory_destination:
-        if org_id != row.campaign.factory_organization_id or role != "factory_sales_assistant":
+        if org_id != row.campaign.factory_organization_id or not identity_has_role(identity, {"factory_sales_assistant"}):
             return None
         return {
             "key": f"isolate:{org_id}", "action": "ISOLATE", "title": "厂家已收货，待隔离入账",
             "from_organization": None, "to_organization": _snapshot(leg.to_organization),
             "leg_id": leg.pk,
         }
-    if role not in MERCHANT_ROLES:
+    if not identity_has_role(identity, MERCHANT_ROLES):
         return None
     if leg and leg.status == "PREPARING":
         if leg.from_organization_id != org_id:
@@ -117,6 +121,27 @@ def _candidate(row, identity):
     }
 
 
+def _manager_has_candidate_task(identity, row, candidate):
+    if candidate["action"] == "RECEIVE":
+        keys = (f"quality-recall-transport:{candidate['leg_id']}:receive",)
+        return has_open_action_task_copy(identity, keys)
+    if candidate["action"] == "ISOLATE":
+        keys = (f"quality-recall-transport:{candidate['leg_id']}:inventory-posting",)
+        return has_open_action_task_copy(identity, keys)
+
+    organization_id = identity.organization_id
+    handover = getattr(row, "customer_handover", None)
+    keys = [f"quality-recall:{row.campaign_id}:org:{organization_id}"]
+    if handover and handover.merchant_organization_id == organization_id:
+        keys.append(
+            f"quality-recall-merchant-return:{row.pk}:org:{organization_id}"
+        )
+    workitem_ids = (row.responsibility_snapshot or {}).get("workitem_ids", [])
+    return has_open_action_task_copy(
+        identity, keys, workitem_ids=workitem_ids,
+    )
+
+
 def get_recall_batch_groups(*, user, campaign, rows=None):
     identity = get_active_identity(user)
     if not identity or not identity.organization.is_active or campaign.status != "ACTIVE" or not _allowed(identity):
@@ -135,6 +160,8 @@ def get_recall_batch_groups(*, user, campaign, rows=None):
                 blocked.append({"recall_device_id": row.pk, "sn": row.sn_snapshot, "reason": str(exc)})
             continue
         if not candidate:
+            continue
+        if not _manager_has_candidate_task(identity, row, candidate):
             continue
         group = groups.setdefault(candidate["key"], {
             **{key: value for key, value in candidate.items() if key != "leg_id"},
@@ -325,7 +352,11 @@ def execute_recall_batch(
     candidates = []
     for row in rows:
         candidate = _candidate(row, identity)
-        if not candidate or candidate["action"] != action:
+        if (
+            not candidate
+            or candidate["action"] != action
+            or not _manager_has_candidate_task(identity, row, candidate)
+        ):
             raise QualityRecallError(f"设备{row.sn_snapshot}当前不属于您的本阶段待办，请刷新清单。")
         candidates.append(candidate)
     if len({candidate["key"] for candidate in candidates}) != 1:

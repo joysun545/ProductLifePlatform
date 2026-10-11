@@ -6,7 +6,11 @@ from django.core import signing
 from django.core.signing import BadSignature, SignatureExpired
 from django.utils.crypto import constant_time_compare, salted_hmac
 
-from account.models import User, UserOrganization
+from account.models import OrganizationRole, SeniorManagerProfile, User, UserOrganization
+from account.services.role_delegation_service import (
+    SENIOR_MANAGER_ROLE_CODES,
+    delegated_role_codes,
+)
 
 
 ACCESS_TOKEN_SALT = "account.api-access.v1"
@@ -19,7 +23,7 @@ WECHAT_BINDING_SALT = "account.api-access.wechat-binding.v1"
 # dedicated tourist accounts and the factory material-stock handovers.
 # Legacy tokens contain only user_id, so affected IDs must sign in again;
 # unrelated legacy sessions remain valid. New tokens are binding-aware.
-LEGACY_TOKEN_RELOGIN_USER_IDS = frozenset({2, 4, 7, 8, 9, 26, 35, 49, 51, 55, 57, 59})
+LEGACY_TOKEN_RELOGIN_USER_IDS = frozenset({2, 3, 4, 7, 8, 9, 26, 33, 35, 49, 51, 55, 57, 59})
 
 
 class ApiAuthenticationError(Exception):
@@ -152,11 +156,11 @@ def authenticate_request(request) -> User:
 
 def get_active_identity(user: User):
     """返回账号唯一且有效的组织身份；游客返回None。"""
-
-    return (
+    identity = (
         UserOrganization.objects.select_related(
             "organization",
             "organization__organization_type",
+            "organization__factory_root",
             "role",
         )
         .filter(
@@ -168,6 +172,11 @@ def get_active_identity(user: User):
         )
         .first()
     )
+    # Legacy organizations with an ambiguous or missing factory root are
+    # deliberately fail-closed until an administrator reviews and assigns one.
+    if identity and not identity.organization.get_factory_root():
+        return None
+    return identity
 
 
 def build_user_payload(user: User) -> dict:
@@ -177,6 +186,7 @@ def build_user_payload(user: User) -> dict:
 
     if identity:
         organization = identity.organization
+        factory_root = organization.get_factory_root()
         role = identity.role
         organization_type = organization.organization_type
 
@@ -188,6 +198,8 @@ def build_user_payload(user: User) -> dict:
         organization_code = organization.code
         organization_type_code = organization_type.code
         organization_type_name = organization_type.name
+        factory_root_id = factory_root.pk if factory_root else None
+        factory_root_name = factory_root.name if factory_root else ""
     else:
         role_code = "tourist"
         role_name = "游客"
@@ -197,6 +209,29 @@ def build_user_payload(user: User) -> dict:
         organization_code = ""
         organization_type_code = ""
         organization_type_name = ""
+        factory_root_id = None
+        factory_root_name = ""
+
+    manager_title = ""
+    delegated_codes = []
+    delegated_names = []
+    if identity and role_code in SENIOR_MANAGER_ROLE_CODES:
+        delegated_codes = sorted(delegated_role_codes(identity))
+        manager_profile = SeniorManagerProfile.objects.filter(
+            identity=identity
+        ).first()
+        manager_title = manager_profile.job_title if manager_profile else ""
+        delegated_names = list(
+            OrganizationRole.objects.filter(
+                organization_type_id=identity.role.organization_type_id,
+                code__in=delegated_codes,
+                is_active=True,
+            )
+            .order_by("id")
+            .values_list("name", flat=True)
+        )
+
+    from account.services.appearance_service import serialize_appearance
 
     return {
         "openid": user.wx_openid or "",
@@ -207,12 +242,20 @@ def build_user_payload(user: User) -> dict:
         "real_name": "",
         "phone": user.phone or "",
         "company_name": company_name,
+        "organization_name": company_name,
         "region": region,
         "organization_id": organization_id,
+        "factory_root_id": factory_root_id,
+        "factory_root_name": factory_root_name,
         "organization_code": organization_code,
         "organization_type": organization_type_code,
         "organization_type_name": organization_type_name,
+        "senior_manager_job_title": manager_title,
+        "delegated_role_codes": delegated_codes,
+        "delegated_role_names": delegated_names,
         "brand": "",
         "brand_id": "",
         "category_id": "",
+        "is_platform_admin": bool(user.is_active and user.is_superuser),
+        "appearance": serialize_appearance(identity),
     }

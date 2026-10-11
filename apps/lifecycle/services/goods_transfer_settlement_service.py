@@ -9,6 +9,11 @@ from django.utils import timezone
 
 from account.models import UserOrganization
 from account.services.auth_service import get_active_identity
+from account.services.role_delegation_service import (
+    SENIOR_MANAGER_ROLE_CODES,
+    has_open_action_task_copy,
+    identity_has_role,
+)
 from lifecycle.models import (
     GoodsTransferCreditAllocation,
     GoodsTransfer,
@@ -61,11 +66,29 @@ def _identity(user):
     identity = get_active_identity(user)
     if (
         not identity
-        or identity.role.code not in SETTLEMENT_ROLES
+        or not identity_has_role(identity, SETTLEMENT_ROLES)
         or identity.organization.organization_type.code != "MERCHANT"
     ):
         raise GoodsTransferSettlementError("当前岗位无权查看商品流转资金信息。")
     return identity
+
+
+def _require_manager_task_copy(identity, workitem):
+    """Keep non-proactive settlement mutations tied to the manager's task."""
+
+    if (
+        identity.role.code in SENIOR_MANAGER_ROLE_CODES
+        and (
+            not workitem
+            or not has_open_action_task_copy(
+                identity,
+                workitem_ids=(workitem.pk,),
+            )
+        )
+    ):
+        raise GoodsTransferSettlementError(
+            "高级经理只能通过本人收到的待办办理该项资金业务。"
+        )
 
 
 def _authorized_transfer(user, transfer_id, *, lock=False):
@@ -635,6 +658,12 @@ def submit_goods_transfer_statement(
         raise GoodsTransferSettlementError("该货品清单已经提交。")
     if settlement.payments.exists():
         raise GoodsTransferSettlementError("已有付款记录，不能重新提交清单。")
+    document_workitem = WorkItem.objects.select_for_update().filter(
+        type=DOCUMENT_WORK_TYPE,
+        uniq_key=_document_key(transfer),
+        status="OPEN",
+    ).first()
+    _require_manager_task_copy(identity, document_workitem)
     amount = _parse_amount(receivable_amount, "货品应收金额")
     suffix, original_name, _content_type = _validate_image(image, "货品清单图片")
     settlement.statement_image.save(
@@ -676,6 +705,12 @@ def upload_goods_transfer_logistics_document(
     ).first()
     if existing:
         return _serialize(settlement, user, identity, side), False
+    document_workitem = WorkItem.objects.select_for_update().filter(
+        type=DOCUMENT_WORK_TYPE,
+        uniq_key=_document_key(transfer),
+        status="OPEN",
+    ).first()
+    _require_manager_task_copy(identity, document_workitem)
     suffix, original_name, content_type, file_type = _validate_logistics_document(
         document
     )

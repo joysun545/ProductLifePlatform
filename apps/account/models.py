@@ -4,7 +4,7 @@ import uuid
 
 from django.contrib.auth.models import AbstractUser
 from django.core.exceptions import ValidationError
-from django.db import models
+from django.db import models, transaction
 from django.db.models import F, Q
 
 
@@ -22,6 +22,22 @@ class OrganizationRelationType(models.TextChoices):
     DISTRIBUTION = "DISTRIBUTION", "经销关系"
     SERVICE = "SERVICE", "服务关系"
     OEM = "OEM", "OEM关系"
+
+
+class UIColorScheme(models.TextChoices):
+    """The three operator-selectable brand colour systems."""
+
+    JADE = "jade", "翡翠绿"
+    OCEAN = "ocean", "深海蓝"
+    AMBER = "amber", "琥珀金"
+
+
+class UIStyleScheme(models.TextChoices):
+    """The three operator-selectable page/header design languages."""
+
+    FLOW = "flow", "柔和流线"
+    ORDER = "order", "专业秩序"
+    LAYER = "layer", "层叠质感"
 
 
 class User(AbstractUser):
@@ -133,6 +149,15 @@ class Organization(models.Model):
         related_name="organizations",
         verbose_name="组织类型",
     )
+    factory_root = models.ForeignKey(
+        "self",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="tenant_organizations",
+        verbose_name="所属厂家根组织",
+        help_text="厂家负责人组织以自身为根；其他组织沿邀请链路归属唯一厂家。",
+    )
     region = models.CharField(
         max_length=255,
         blank=True,
@@ -144,6 +169,27 @@ class Organization(models.Model):
         blank=True,
         default="",
         verbose_name="详细地址",
+    )
+    provides_after_sales = models.BooleanField(
+        default=False,
+        verbose_name="是否提供售后服务",
+        help_text="由有权管理该商家组织的上级在管理下级用户时设置。",
+    )
+    ui_color_scheme = models.CharField(
+        max_length=16,
+        choices=UIColorScheme.choices,
+        blank=True,
+        default="",
+        verbose_name="小程序全局色系",
+        help_text="仅系统运营业主设置；留空时使用翡翠绿。",
+    )
+    ui_style_scheme = models.CharField(
+        max_length=16,
+        choices=UIStyleScheme.choices,
+        blank=True,
+        default="",
+        verbose_name="小程序全局页面风格",
+        help_text="仅系统运营业主设置；留空时使用柔和流线。",
     )
     is_active = models.BooleanField(
         default=True,
@@ -162,6 +208,90 @@ class Organization(models.Model):
         ordering = ("name", "id")
         verbose_name = "组织"
         verbose_name_plural = "组织"
+
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    Q(ui_color_scheme="")
+                    | Q(ui_color_scheme__in=[choice[0] for choice in UIColorScheme.choices])
+                ),
+                name="account_organization_valid_ui_color",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(ui_style_scheme="")
+                    | Q(ui_style_scheme__in=[choice[0] for choice in UIStyleScheme.choices])
+                ),
+                name="account_organization_valid_ui_style",
+            ),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.organization_type_id and self.organization_type.code == "OWNER":
+            if self.factory_root_id and self.pk and self.factory_root_id != self.pk:
+                raise ValidationError({"factory_root": "厂家负责人组织必须以自身为根。"})
+        elif self.factory_root_id:
+            root = self.factory_root
+            if (
+                root.organization_type.code != "OWNER"
+                or root.factory_root_id != root.pk
+                or (self.is_active and not root.is_active)
+            ):
+                raise ValidationError({"factory_root": "所属厂家根必须是厂家负责人组织。"})
+        elif self.organization_type_id and self.is_active:
+            raise ValidationError({"factory_root": "有效业务组织必须明确所属厂家根组织。"})
+        if (
+            self.provides_after_sales
+            and self.organization_type_id
+            and self.organization_type.code != "MERCHANT"
+        ):
+            raise ValidationError("只有商家组织可以设置为提供售后服务。")
+        if (
+            (self.ui_color_scheme or self.ui_style_scheme)
+            and self.organization_type_id
+            and self.organization_type.code != "OWNER"
+        ):
+            raise ValidationError(
+                "小程序全局主题只能配置在系统运营业主（厂家）组织上。"
+            )
+
+    @transaction.atomic
+    def save(self, *args, **kwargs):
+        is_factory_root = bool(
+            self.organization_type_id
+            and self.organization_type.code == "OWNER"
+        )
+        if self.pk:
+            persisted_root_id = (
+                type(self).objects.filter(pk=self.pk)
+                .values_list("factory_root_id", flat=True)
+                .first()
+            )
+            if persisted_root_id and persisted_root_id != self.factory_root_id:
+                raise ValidationError(
+                    "组织一旦归属厂家根组织，就不能迁移到另一条厂家链路。"
+                )
+        if is_factory_root and self.pk:
+            if self.factory_root_id not in (None, self.pk):
+                raise ValidationError("厂家负责人组织必须以自身为根。")
+            root_was_unset = self.factory_root_id is None
+            self.factory_root_id = self.pk
+            if root_was_unset and kwargs.get("update_fields") is not None:
+                kwargs["update_fields"] = tuple(
+                    set(kwargs["update_fields"]) | {"factory_root"}
+                )
+        super().save(*args, **kwargs)
+        # The primary key is allocated by the first insert, then the root FK
+        # points back to this same row. Keep this invariant on admin edits too.
+        if is_factory_root and self.factory_root_id != self.pk:
+            type(self).objects.filter(pk=self.pk).update(factory_root_id=self.pk)
+            self.factory_root_id = self.pk
+
+    def get_factory_root(self):
+        if self.organization_type_id and self.organization_type.code == "OWNER":
+            return self
+        return self.factory_root
 
     def __str__(self):
         return self.name
@@ -231,7 +361,7 @@ class RoleInvitationRule(models.Model):
     factory_sales -> merchant_owner / 跨组织 / DISTRIBUTION
     merchant_senior_manager -> merchant_owner / 跨组织 / DISTRIBUTION
 
-    同组织邀请规则只允许负责人岗位作为邀请方。
+    同组织邀请规则由负责人或已获授权的高级经理岗位作为邀请方。
     """
 
     inviter_role = models.ForeignKey(
@@ -307,9 +437,12 @@ class RoleInvitationRule(models.Model):
             return
 
         if self.scope == InvitationScope.SAME_ORGANIZATION:
-            if not self.inviter_role.is_owner_role:
+            if not self.inviter_role.is_owner_role and self.inviter_role.code not in {
+                "factory_senior_manager",
+                "merchant_senior_manager",
+            }:
                 raise ValidationError(
-                    {"inviter_role": "同组织邀请只能由负责人角色发起。"}
+                    {"inviter_role": "同组织邀请只能由负责人或高级经理角色发起。"}
                 )
 
             if (
@@ -395,6 +528,13 @@ class UserOrganization(models.Model):
     def clean(self):
         super().clean()
 
+        if self.is_active and self.organization_id:
+            factory_root = self.organization.get_factory_root()
+            if not factory_root:
+                raise ValidationError(
+                    {"organization": "有效角色槽位必须归属一个明确的厂家根组织。"}
+                )
+
         if (
             self.organization_id
             and self.role_id
@@ -412,6 +552,50 @@ class UserOrganization(models.Model):
 
     def __str__(self):
         return f"{self.user}-{self.organization}-{self.role.name}"
+
+
+class SeniorManagerProfile(models.Model):
+    """Informational title and the explicit system roles delegated to a manager."""
+
+    identity = models.OneToOneField(
+        UserOrganization,
+        on_delete=models.CASCADE,
+        related_name="senior_manager_profile",
+        verbose_name="高级经理组织身份",
+    )
+    job_title = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        verbose_name="分管职位名称",
+        help_text="仅供链路信息展示，不作为额外权限来源。",
+    )
+    managed_roles = models.ManyToManyField(
+        OrganizationRole,
+        related_name="senior_manager_profiles",
+        blank=True,
+        verbose_name="分管系统岗位",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="更新时间")
+
+    class Meta:
+        verbose_name = "高级经理分管岗位"
+        verbose_name_plural = "高级经理分管岗位"
+
+    def clean(self):
+        super().clean()
+        if not self.identity_id:
+            return
+        identity = self.identity
+        if identity.role.code not in {
+            "factory_senior_manager",
+            "merchant_senior_manager",
+        }:
+            raise ValidationError({"identity": "只有高级经理身份可以设置分管岗位。"})
+
+    def __str__(self):
+        return f"{self.identity.user}-{self.job_title or self.identity.role.name}"
 
 
 class InvitationRecord(models.Model):
@@ -465,6 +649,18 @@ class InvitationRecord(models.Model):
         related_name="invitations_targeting_role",
         verbose_name="指定的目标岗位",
     )
+    senior_manager_job_title = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        verbose_name="高级经理分管职位名称",
+    )
+    senior_manager_managed_role_codes = models.JSONField(
+        default=list,
+        blank=True,
+        verbose_name="高级经理分管岗位编码快照",
+        help_text="邀请创建时的授权快照；接受后写入高级经理分管岗位。",
+    )
     target_organization = models.ForeignKey(
         Organization,
         null=True,
@@ -472,6 +668,12 @@ class InvitationRecord(models.Model):
         on_delete=models.PROTECT,
         related_name="incoming_invitations",
         verbose_name="目标组织",
+    )
+    target_organization_provides_after_sales = models.BooleanField(
+        default=False,
+        editable=False,
+        verbose_name="旧版邀请售后资格标记",
+        help_text="仅为兼容历史邀请保留；新邀请流程不再使用此字段。",
     )
     invitee = models.ForeignKey(
         User,
@@ -564,6 +766,98 @@ class InvitationRecord(models.Model):
     def clean(self):
         super().clean()
 
+        is_senior_manager_invitation = bool(
+            self.target_role_id
+            and self.target_role.code in {
+                "factory_senior_manager",
+                "merchant_senior_manager",
+            }
+        )
+        selected_managed_role_codes = self.senior_manager_managed_role_codes
+        if not isinstance(selected_managed_role_codes, list) or any(
+            not isinstance(code, str) or not code.strip()
+            for code in selected_managed_role_codes
+        ):
+            raise ValidationError(
+                {"senior_manager_managed_role_codes": "高级经理分管岗位数据无效。"}
+            )
+        if len(set(selected_managed_role_codes)) != len(selected_managed_role_codes):
+            raise ValidationError(
+                {"senior_manager_managed_role_codes": "分管岗位不能重复。"}
+            )
+        if is_senior_manager_invitation:
+            if self.scope != InvitationScope.SAME_ORGANIZATION:
+                raise ValidationError({"scope": "高级经理必须加入邀请方组织。"})
+            if not selected_managed_role_codes:
+                raise ValidationError(
+                    {"senior_manager_managed_role_codes": "请至少选择一个分管系统岗位。"}
+                )
+            roles = OrganizationRole.objects.filter(
+                code__in=selected_managed_role_codes,
+                organization_type_id=self.target_role.organization_type_id,
+                is_active=True,
+                is_owner_role=False,
+            )
+            valid_codes = set(roles.values_list("code", flat=True))
+            if valid_codes != set(selected_managed_role_codes) or valid_codes.intersection(
+                {"factory_senior_manager", "merchant_senior_manager"}
+            ):
+                raise ValidationError(
+                    {"senior_manager_managed_role_codes": "只能选择本组织类型下有效的普通系统岗位。"}
+                )
+        elif selected_managed_role_codes or self.senior_manager_job_title:
+            raise ValidationError(
+                {"senior_manager_managed_role_codes": "只有邀请高级经理时才能填写分管信息。"}
+            )
+
+        if self.target_organization_provides_after_sales:
+            if (
+                self.scope != InvitationScope.CROSS_ORGANIZATION
+                or not self.target_role_id
+                or self.target_role.code != "merchant_owner"
+                or self.target_role.organization_type.code != "MERCHANT"
+            ):
+                raise ValidationError(
+                    {
+                        "target_organization_provides_after_sales":
+                            "该选项仅适用于邀请建立新的商家组织。"
+                    }
+                )
+
+            if self.status == self.Status.ACCEPTED:
+                if not self.target_organization_id:
+                    raise ValidationError(
+                        {
+                            "target_organization_provides_after_sales":
+                                "已接受的售后服务资格邀请必须关联新建的商家组织。"
+                        }
+                    )
+
+                source_root = (
+                    self.source_organization.get_factory_root()
+                    if self.source_organization_id
+                    else None
+                )
+                target_root = self.target_organization.get_factory_root()
+                if (
+                    not source_root
+                    or not target_root
+                    or source_root.pk != target_root.pk
+                ):
+                    raise ValidationError(
+                        {
+                            "target_organization":
+                                "目标商家必须属于邀请方的厂家根链路。"
+                        }
+                    )
+            elif self.target_organization_id is not None:
+                raise ValidationError(
+                    {
+                        "target_organization_provides_after_sales":
+                            "待接受的售后服务资格邀请不能预先关联目标组织。"
+                    }
+                )
+
         if (
             self.source_organization_id
             and self.inviter_role_id
@@ -620,6 +914,76 @@ class InvitationRecord(models.Model):
 
     def __str__(self):
         return f"{self.inviter} -> {self.target_role.name} ({self.status})"
+
+
+class PlatformFactoryInvitation(models.Model):
+    """A project-admin invitation that creates one independent factory root."""
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "待接受"
+        ACCEPTED = "accepted", "已接受"
+        CANCELLED = "cancelled", "已取消"
+        EXPIRED = "expired", "已过期"
+
+    token = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    inviter = models.ForeignKey(
+        User, on_delete=models.PROTECT, related_name="platform_factory_invitations_sent"
+    )
+    organization_name = models.CharField(max_length=128, verbose_name="厂家组织名称")
+    region = models.CharField(max_length=255, blank=True, default="")
+    address = models.CharField(max_length=255, blank=True, default="")
+    target_role = models.ForeignKey(
+        OrganizationRole,
+        on_delete=models.PROTECT,
+        related_name="platform_factory_invitations",
+    )
+    invitee = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="received_platform_factory_invitations",
+    )
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING, db_index=True)
+    expires_at = models.DateTimeField(db_index=True)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("-created_at", "-id")
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    ~Q(status="accepted")
+                    | (Q(invitee__isnull=False) & Q(accepted_at__isnull=False))
+                ),
+                name="account_platform_invite_accepted_fields",
+            ),
+            models.CheckConstraint(
+                condition=Q(invitee__isnull=True) | ~Q(invitee=F("inviter")),
+                name="account_platform_invite_not_self",
+            ),
+        ]
+        verbose_name = "平台厂家负责人邀请"
+        verbose_name_plural = "平台厂家负责人邀请"
+
+    def clean(self):
+        super().clean()
+        if self.target_role_id and (
+            self.target_role.code != "factory_admin"
+            or self.target_role.organization_type.code != "OWNER"
+            or not self.target_role.is_owner_role
+        ):
+            raise ValidationError({"target_role": "平台邀请只能指定厂家负责人岗位。"})
+        self.organization_name = (self.organization_name or "").strip()
+        if not self.organization_name:
+            raise ValidationError({"organization_name": "请填写厂家组织名称。"})
+        if self.inviter_id and self.invitee_id == self.inviter_id:
+            raise ValidationError({"invitee": "邀请人不能接受自己发出的邀请。"})
+
+    def __str__(self):
+        return f"{self.organization_name} -> {self.target_role.name} ({self.status})"
 
 
 class OrganizationRelation(models.Model):
@@ -696,3 +1060,33 @@ class OrganizationRelation(models.Model):
             f"{self.source_organization} -{self.relation_type}-> "
             f"{self.target_organization}"
         )
+
+    def clean(self):
+        super().clean()
+        if not self.source_organization_id or not self.target_organization_id:
+            return
+        source_root = self.source_organization.get_factory_root()
+        target_root = self.target_organization.get_factory_root()
+        if not source_root or not target_root:
+            raise ValidationError("组织关系双方都必须明确所属厂家根组织。")
+        if source_root.pk != target_root.pk:
+            raise ValidationError("组织关系不能跨越不同的厂家根组织。")
+
+    @transaction.atomic
+    def save(self, *args, **kwargs):
+        if self.source_organization_id and self.target_organization_id:
+            source = self.source_organization
+            target = self.target_organization
+            source_root = source.get_factory_root()
+            target_root = target.get_factory_root()
+            if not source_root:
+                raise ValidationError("邀请方组织尚未明确所属厂家，不能建立新链路。")
+            if target.organization_type.code == "OWNER":
+                if target.pk != source_root.pk:
+                    raise ValidationError("组织关系不能连接不同的厂家根组织。")
+            elif target_root and target_root.pk != source_root.pk:
+                raise ValidationError("组织关系不能跨越不同的厂家根组织。")
+            elif not target_root:
+                target.factory_root = source_root
+                target.save(update_fields=("factory_root", "updated_at"))
+        super().save(*args, **kwargs)

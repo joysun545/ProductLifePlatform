@@ -1,6 +1,7 @@
 # apps/manufacturing/models.py
 
 
+from django.core.exceptions import ValidationError
 from django.db import models
 
 
@@ -102,26 +103,36 @@ class ProductionBatch(models.Model):
             "batch_no"
         ]
 
-
         indexes = [
-
             models.Index(
-                fields=[
-                    "product_model",
-                    "production_date"
-                ]
+                fields=["product_model", "production_date"]
             ),
-
             models.Index(
-                fields=[
-                    "manufacturer",
-                    "production_date"
-                ]
+                fields=["manufacturer", "production_date"]
             ),
-
         ]
 
+    def _validate_manufacturer_root(self):
+        if not self.manufacturer_id:
+            return
+        manufacturer = self.manufacturer
+        root = manufacturer.get_factory_root()
+        if (
+            manufacturer.organization_type.code != "OWNER"
+            or not root
+            or root.pk != manufacturer.pk
+        ):
+            raise ValidationError(
+                {"manufacturer": "生产批次必须归属厂家负责人根组织。"}
+            )
 
+    def clean(self):
+        super().clean()
+        self._validate_manufacturer_root()
+
+    def save(self, *args, **kwargs):
+        self._validate_manufacturer_root()
+        super().save(*args, **kwargs)
 
     def __str__(self):
 

@@ -16,6 +16,7 @@ from account.models import (
     OrganizationRole,
     OrganizationType,
     RoleInvitationRule,
+    SeniorManagerProfile,
     User,
     UserOrganization,
 )
@@ -44,6 +45,8 @@ from lifecycle.services.aftersales_service import AfterSalesService
 from lifecycle.services.goods_transfer_service import (
     GoodsTransferError,
     create_goods_transfer,
+    confirm_goods_transfer_receipt,
+    get_goods_transfer_options,
     scan_goods_transfer_device,
     submit_goods_transfer,
 )
@@ -107,6 +110,16 @@ class ScanOwnershipAndInstallationTests(TestCase):
             organization_type=merchant_type,
             code="merchant_sales",
             defaults={"name": "商家销售经理", "is_active": True},
+        )
+        cls.merchant_stock_role, _ = OrganizationRole.objects.update_or_create(
+            organization_type=merchant_type,
+            code="merchant_stock",
+            defaults={"name": "商家库管", "is_active": True},
+        )
+        cls.merchant_senior_manager_role, _ = OrganizationRole.objects.update_or_create(
+            organization_type=merchant_type,
+            code="merchant_senior_manager",
+            defaults={"name": "商家高级经理", "is_active": True},
         )
         cls.merchant_manager_role, _ = OrganizationRole.objects.update_or_create(
             organization_type=merchant_type,
@@ -253,8 +266,8 @@ class ScanOwnershipAndInstallationTests(TestCase):
         cls.material = Material.objects.create(
             code="GEN-CTRL",
             name="控制器",
-            product_category=category,
         )
+        cls.material.product_categories.add(category)
         spec = MaterialSpec.objects.create(
             material=cls.material,
             code="GEN-CTRL-01",
@@ -490,8 +503,167 @@ class ScanOwnershipAndInstallationTests(TestCase):
         electrician_data = self.resolve(
             self.direct_electrician_user
         ).json()["data"]
-        self.assertIn("install_device", sales_data["capabilities"])
+        self.assertNotIn("install_device", sales_data["capabilities"])
         self.assertIn("install_device", electrician_data["capabilities"])
+        sales_install = self.client.post(
+            self.install_endpoint,
+            {"device_id": self.device.id, "location": "重庆市渝北区"},
+            **self.auth(self.direct_sales_user),
+        )
+        self.assertEqual(sales_install.status_code, 403, sales_install.json())
+        self.assertFalse(InstallationRecord.objects.filter(device=self.device).exists())
+
+    def test_authorized_senior_manager_takes_over_owner_installation_capability(self):
+        manager = self._user_identity(
+            "merchant_install_senior_manager",
+            self.direct_merchant,
+            self.merchant_senior_manager_role,
+        )
+        manager_identity = UserOrganization.objects.get(user=manager)
+        profile = SeniorManagerProfile.objects.create(identity=manager_identity)
+        profile.managed_roles.add(self.merchant_electrician_role)
+
+        manager_data = self.resolve(manager).json()["data"]
+        owner_data = self.resolve(self.direct_owner_user).json()["data"]
+        sales_data = self.resolve(self.direct_sales_user).json()["data"]
+        electrician_data = self.resolve(self.direct_electrician_user).json()["data"]
+
+        self.assertIn("install_device", manager_data["capabilities"])
+        self.assertNotIn("install_device", owner_data["capabilities"])
+        self.assertNotIn("install_device", sales_data["capabilities"])
+        self.assertIn("install_device", electrician_data["capabilities"])
+
+    def test_authorized_senior_manager_can_install_without_a_task(self):
+        manager = self._user_identity(
+            "merchant_install_senior_manager_action",
+            self.direct_merchant,
+            self.merchant_senior_manager_role,
+        )
+        profile = SeniorManagerProfile.objects.create(
+            identity=manager.organization_identity
+        )
+        profile.managed_roles.add(self.merchant_electrician_role)
+
+        response = self.client.post(
+            self.install_endpoint,
+            {"device_id": self.device.id, "location": "重庆市渝北区"},
+            **self.auth(manager),
+        )
+
+        self.assertEqual(response.status_code, 201, response.json())
+        self.assertEqual(
+            InstallationRecord.objects.get(device=self.device).operator_id,
+            manager.pk,
+        )
+
+    def test_stock_senior_manager_can_start_shipping_without_an_inbox_task(self):
+        manager = self._user_identity(
+            "merchant_shipping_senior_manager",
+            self.direct_merchant,
+            self.merchant_senior_manager_role,
+        )
+        manager_identity = UserOrganization.objects.get(user=manager)
+        profile = SeniorManagerProfile.objects.create(identity=manager_identity)
+        profile.managed_roles.add(self.merchant_stock_role)
+
+        target_org = Organization.objects.create(
+            code="MERCHANT-SENIOR-SHIP-TARGET",
+            name="高级经理主动发货目标商家",
+            organization_type=self.direct_merchant.organization_type,
+        )
+        target_owner = self._user_identity(
+            "merchant_senior_ship_target_owner",
+            target_org,
+            self.merchant_owner_role,
+        )
+        self._create_distribution_relation(
+            inviter_user=self.direct_owner_user,
+            inviter_role=self.merchant_owner_role,
+            target_user=target_owner,
+            target_org=target_org,
+        )
+
+        with self.assertRaises(GoodsTransferError):
+            get_goods_transfer_options(
+                user=self.direct_owner_user,
+                flow_type=GoodsTransfer.FlowType.SHIPMENT,
+            )
+        options = get_goods_transfer_options(
+            user=manager,
+            flow_type=GoodsTransfer.FlowType.SHIPMENT,
+        )
+        self.assertEqual(options["targets"][0]["user_id"], target_owner.pk)
+
+        result, created = create_goods_transfer(
+            user=manager,
+            flow_type=GoodsTransfer.FlowType.SHIPMENT,
+            client_request_id="merchant-senior-manager-proactive-shipment",
+            target_account_id=target_owner.pk,
+        )
+        self.assertTrue(created)
+        transfer = GoodsTransfer.objects.get(pk=result["id"])
+        self.assertEqual(transfer.initiated_by_id, manager.pk)
+
+    def test_stock_senior_manager_can_confirm_receipt_without_task_and_replaces_owner(self):
+        manager = self._user_identity(
+            "merchant_receipt_senior_manager",
+            self.direct_merchant,
+            self.merchant_senior_manager_role,
+        )
+        profile = SeniorManagerProfile.objects.create(
+            identity=manager.organization_identity
+        )
+        profile.managed_roles.add(self.merchant_stock_role)
+
+        OrganizationDevice.objects.filter(device=self.device).update(
+            organization=self.regional_merchant,
+            status="IN_STOCK",
+        )
+        DeviceState.objects.filter(device=self.device).update(
+            current_organization=self.regional_merchant,
+            status="IN_STOCK",
+        )
+        result, created = create_goods_transfer(
+            user=self.regional_owner_user,
+            flow_type=GoodsTransfer.FlowType.SHIPMENT,
+            client_request_id="merchant-senior-manager-receipt-no-task",
+            target_account_id=self.direct_owner_user.pk,
+        )
+        self.assertTrue(created)
+        transfer = GoodsTransfer.objects.get(pk=result["id"])
+        scan_goods_transfer_device(
+            user=self.regional_owner_user,
+            transfer_id=transfer.pk,
+            qr_text=self.device.qrcode.code,
+        )
+        submit_goods_transfer(
+            user=self.regional_owner_user,
+            transfer_id=transfer.pk,
+        )
+        receipt_workitem = WorkItem.objects.get(
+            type="GOODS_TRANSFER_RECEIPT_CONFIRM",
+            uniq_key=f"lifecycle:goods-transfer:{transfer.pk}:receipt",
+        )
+        self.assertFalse(
+            receipt_workitem.user_tasks.filter(
+                to_openid=manager.wx_openid,
+                need_action=True,
+            ).exists()
+        )
+
+        with self.assertRaises(GoodsTransferError):
+            confirm_goods_transfer_receipt(
+                user=self.direct_owner_user,
+                transfer_id=transfer.pk,
+            )
+
+        _result, changed = confirm_goods_transfer_receipt(
+            user=manager,
+            transfer_id=transfer.pk,
+        )
+        self.assertTrue(changed)
+        transfer.refresh_from_db()
+        self.assertEqual(transfer.received_by_id, manager.pk)
 
     def test_account_and_organization_upstream_owners_are_distinguished(self):
         sales_data = self.resolve(self.regional_sales_user).json()["data"]
@@ -1425,6 +1597,39 @@ class ScanOwnershipAndInstallationTests(TestCase):
             organization=self.factory,
             role=factory_sales_role,
         )
+        factory_aftersales_role, _ = OrganizationRole.objects.update_or_create(
+            organization_type=self.factory.organization_type,
+            code="factory_aftersales",
+            defaults={"name": "厂家售后经理", "is_active": True},
+        )
+        factory_senior_manager_role, _ = OrganizationRole.objects.update_or_create(
+            organization_type=self.factory.organization_type,
+            code="factory_senior_manager",
+            defaults={"name": "厂家高级经理", "is_active": True},
+        )
+        factory_senior_manager = User.objects.create_user(
+            username="aftersales_factory_senior_manager",
+            wx_openid="openid-aftersales-factory-senior-manager",
+        )
+        senior_identity = UserOrganization.objects.create(
+            user=factory_senior_manager,
+            organization=self.factory,
+            role=factory_senior_manager_role,
+        )
+        senior_profile = SeniorManagerProfile.objects.create(
+            identity=senior_identity
+        )
+        senior_profile.managed_roles.add(factory_aftersales_role)
+        factory_aftersales = User.objects.create_user(
+            username="aftersales_factory_aftersales",
+            wx_openid="openid-aftersales-factory-aftersales",
+        )
+        UserOrganization.objects.create(
+            user=factory_aftersales,
+            organization=self.factory,
+            role=factory_aftersales_role,
+            inviter=factory_senior_manager,
+        )
 
         context = self.client.get(
             f"/pldp/api/lifecycle/customer/devices/{self.device.id}/after-sales/context/",
@@ -1486,7 +1691,7 @@ class ScanOwnershipAndInstallationTests(TestCase):
             self.assertEqual(submitted.status_code, 200)
             detail = self.client.get(
                 f"/pldp/api/lifecycle/after-sales/applications/{application_id}/",
-                **self.auth(factory_sales),
+                **self.auth(factory_aftersales),
             )
             self.assertEqual(detail.status_code, 200)
             factory_detail = detail.json()["data"]
@@ -1496,7 +1701,38 @@ class ScanOwnershipAndInstallationTests(TestCase):
                 factory_detail["viewer_stage"]["badge"],
                 "待您认定并分派",
             )
+            self.assertTrue(factory_detail["actions"]["can_triage"])
             self.assertEqual(factory_detail["applicant_instruction"], {})
+
+            senior_detail = self.client.get(
+                f"/pldp/api/lifecycle/after-sales/applications/{application_id}/",
+                **self.auth(factory_senior_manager),
+            )
+            self.assertEqual(senior_detail.status_code, 200)
+            self.assertTrue(senior_detail.json()["data"]["actions"]["can_triage"])
+
+            sales_detail = self.client.get(
+                f"/pldp/api/lifecycle/after-sales/applications/{application_id}/",
+                **self.auth(factory_sales),
+            )
+            self.assertEqual(sales_detail.status_code, 200)
+            self.assertFalse(sales_detail.json()["data"]["actions"]["can_triage"])
+
+            other_factory = Organization.objects.create(
+                code="AFTERSALES-OTHER-FACTORY",
+                name="其他厂家根组织",
+                organization_type=self.factory.organization_type,
+            )
+            other_factory_aftersales = self._user_identity(
+                "aftersales_other_factory",
+                other_factory,
+                factory_aftersales_role,
+            )
+            other_factory_detail = self.client.get(
+                f"/pldp/api/lifecycle/after-sales/applications/{application_id}/",
+                **self.auth(other_factory_aftersales),
+            )
+            self.assertNotEqual(other_factory_detail.status_code, 200)
 
             applicant_detail = self.client.get(
                 f"/pldp/api/lifecycle/after-sales/applications/{application_id}/",
@@ -1505,11 +1741,11 @@ class ScanOwnershipAndInstallationTests(TestCase):
             self.assertEqual(applicant_detail.status_code, 200)
             self.assertEqual(
                 applicant_detail.json()["data"]["viewer_stage"]["title"],
-                "等待厂家销售经理判断并指派",
+                "等待厂家售后经理判断并指派",
             )
             self.assertEqual(
                 applicant_detail.json()["data"]["viewer_stage"]["badge"],
-                "等待厂家销售经理判断并指派",
+                "等待厂家售后经理判断并指派",
             )
 
         application = AfterSalesApplication.objects.get(pk=application_id)
@@ -1526,10 +1762,34 @@ class ScanOwnershipAndInstallationTests(TestCase):
         self.assertTrue(
             UserTask.objects.filter(
                 workitem__type="AFTERSALES_FACTORY_WORKORDER",
-                to_openid=factory_sales.wx_openid,
+                to_openid=factory_aftersales.wx_openid,
                 need_action=True,
             ).exists()
         )
+        self.assertFalse(
+            UserTask.objects.filter(
+                workitem__type="AFTERSALES_FACTORY_WORKORDER",
+                to_openid=factory_sales.wx_openid,
+            ).exists()
+        )
+        legacy_sales_task = UserTask.objects.create(
+            workitem=WorkItem.objects.get(
+                uniq_key=f"aftersales:{application_id}:factory-workorder"
+            ),
+            to_openid=factory_sales.wx_openid,
+            need_action=True,
+        )
+        legacy_sales_detail = self.client.get(
+            f"/pldp/api/lifecycle/after-sales/applications/{application_id}/",
+            **self.auth(factory_sales),
+        )
+        self.assertEqual(legacy_sales_detail.status_code, 200)
+        self.assertTrue(legacy_sales_detail.json()["data"]["actions"]["can_triage"])
+        senior_task = UserTask.objects.get(
+            workitem__type="AFTERSALES_FACTORY_WORKORDER",
+            to_openid=factory_senior_manager.wx_openid,
+        )
+        self.assertTrue(senior_task.need_action)
         applicant_task = UserTask.objects.get(
             workitem__uniq_key=(
                 f"aftersales:{application_id}:applicant-workorder"
@@ -1633,9 +1893,15 @@ class ScanOwnershipAndInstallationTests(TestCase):
                 "final_solution_note": "已远程指导完成复紧和启动测试，设备恢复正常。",
             },
             content_type="application/json",
-            **self.auth(factory_sales),
+            **self.auth(factory_aftersales),
         )
         self.assertEqual(remote.status_code, 200, remote.json())
+        senior_task.refresh_from_db()
+        self.assertEqual(senior_task.state, "DONE")
+        self.assertEqual(senior_task.done_reason, "OTHER_ACTION")
+        legacy_sales_task.refresh_from_db()
+        self.assertEqual(legacy_sales_task.state, "DONE")
+        self.assertEqual(legacy_sales_task.done_reason, "OTHER_ACTION")
         applicant_task.refresh_from_db()
         self.assertEqual(
             WorkItem.objects.get(pk=applicant_task.workitem_id).uniq_key,

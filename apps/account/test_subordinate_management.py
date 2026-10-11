@@ -1,5 +1,7 @@
 from datetime import timedelta
+from io import StringIO
 
+from django.core.management import call_command
 from django.test import TestCase
 from django.utils import timezone
 
@@ -150,7 +152,7 @@ class SubordinateManagementApiTests(TestCase):
     def _authorization(self, user):
         return f"Bearer {issue_access_token(user)}"
 
-    def test_owner_sees_only_accounts_invited_directly_by_owner(self):
+    def test_owner_sees_active_staff_slots_and_directly_invited_organizations(self):
         response = self.client.get(
             self.url,
             HTTP_AUTHORIZATION=self._authorization(self.admin),
@@ -161,13 +163,44 @@ class SubordinateManagementApiTests(TestCase):
         items = response.json()["data"]["items"]
         self.assertEqual(
             {item["role"]["code"] for item in items},
-            {"factory_sales", "factory_stock"},
+            {"factory_sales", "factory_stock", "factory_matching"},
         )
         self.assertNotIn(
             self.merchant_owner.pk,
             {item["user"]["id"] for item in items},
         )
         self.assertTrue(all(item["management_mode"] == "view_only" for item in items))
+
+    def test_owner_sees_legacy_staff_slot_without_invitation_event(self):
+        legacy_staff = self._user_with_identity(
+            "subordinate-legacy-staff",
+            self.factory,
+            self.factory_stock_role,
+            inviter=self.admin,
+        )
+        aftersales_role = OrganizationRole.objects.get(code="factory_aftersales")
+        unlinked_staff = self._user_with_identity(
+            "subordinate-unlinked-staff",
+            self.factory,
+            aftersales_role,
+        )
+
+        response = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION=self._authorization(self.admin),
+        )
+
+        items = response.json()["data"]["items"]
+        legacy_item = next(
+            item for item in items if item["user"]["id"] == legacy_staff.pk
+        )
+        self.assertIsNone(legacy_item["invitation_id"])
+        self.assertTrue(legacy_item["item_key"].startswith("membership-"))
+        self.assertEqual(legacy_item["relation_type_name"], "同组织邀请")
+        unlinked_item = next(
+            item for item in items if item["user"]["id"] == unlinked_staff.pk
+        )
+        self.assertEqual(unlinked_item["relation_type_name"], "本组织岗位")
 
     def test_factory_sales_direct_merchant_exposes_only_channel_edit_mode(self):
         response = self.client.get(
@@ -217,10 +250,48 @@ class SubordinateManagementApiTests(TestCase):
             item["role"]["code"]
             for item in response.json()["data"]["items"]
         }
-        self.assertEqual(role_codes, {"factory_sales"})
+        self.assertEqual(role_codes, {"factory_sales", "factory_matching"})
 
     def test_authentication_is_required(self):
         response = self.client.get(self.url)
 
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.json()["code"], 401)
+
+    def test_service_and_customer_chain_invitation_rules_are_available(self):
+        expected = (
+            ("merchant_owner", "service_owner", "cross_organization", "SERVICE"),
+            ("merchant_senior_manager", "service_owner", "cross_organization", "SERVICE"),
+            ("merchant_sales", "service_owner", "cross_organization", "SERVICE"),
+            ("service_owner", "customer_owner", "cross_organization", "SERVICE"),
+            ("customer_owner", "driver", "same_organization", ""),
+        )
+        for inviter, target, scope, relation_type in expected:
+            self.assertTrue(
+                RoleInvitationRule.objects.filter(
+                    inviter_role__code=inviter,
+                    target_role__code=target,
+                    scope=scope,
+                    relation_type=relation_type,
+                    is_active=True,
+                ).exists(),
+                f"缺少邀请链路规则：{inviter} -> {target}",
+            )
+
+    def test_factory_inviter_repair_is_check_only_unless_apply_is_requested(self):
+        aftersales_role = OrganizationRole.objects.get(code="factory_aftersales")
+        aftersales = self._user_with_identity(
+            "subordinate-aftersales",
+            self.factory,
+            aftersales_role,
+        )
+
+        check_output = StringIO()
+        call_command("repair_factory_role_inviter_links", stdout=check_output)
+        aftersales_identity = UserOrganization.objects.get(user=aftersales)
+        self.assertIsNone(aftersales_identity.inviter_id)
+        self.assertIn("CHECK_ONLY", check_output.getvalue())
+
+        call_command("repair_factory_role_inviter_links", apply=True, stdout=StringIO())
+        aftersales_identity.refresh_from_db()
+        self.assertEqual(aftersales_identity.inviter_id, self.admin.pk)

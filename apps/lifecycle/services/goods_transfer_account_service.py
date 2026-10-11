@@ -13,6 +13,11 @@ from account.models import (
     UserOrganization,
 )
 from account.services.auth_service import get_active_identity
+from account.services.role_delegation_service import (
+    SENIOR_MANAGER_ROLE_CODES,
+    has_open_action_task_copy,
+    identity_has_role,
+)
 from lifecycle.models import (
     GoodsTransfer,
     GoodsTransferAccountCase,
@@ -97,11 +102,29 @@ def _validate_image(uploaded_file, label):
 
 def _identity(user):
     identity = get_active_identity(user)
-    if not identity or identity.role.code not in ACCOUNT_ROLES:
+    if not identity or not identity_has_role(identity, ACCOUNT_ROLES):
         raise GoodsTransferAccountError("当前岗位无权处理商品流转往来账。")
     if identity.organization.organization_type.code not in {"MERCHANT", "OWNER"}:
         raise GoodsTransferAccountError("当前组织无权处理商品流转往来账。")
     return identity
+
+
+def _require_manager_task_copy(identity, workitem):
+    """Require the exact open task before a manager mutates account data."""
+
+    if (
+        identity.role.code in SENIOR_MANAGER_ROLE_CODES
+        and (
+            not workitem
+            or not has_open_action_task_copy(
+                identity,
+                workitem_ids=(workitem.pk,),
+            )
+        )
+    ):
+        raise GoodsTransferAccountError(
+            "高级经理只能通过本人收到的待办办理该项往来账业务。"
+        )
 
 
 def _role_codes_for_org(organization):
@@ -897,6 +920,12 @@ def submit_goods_transfer_account_case(
     no_amount = str(no_amount).lower() in {"1", "true", "yes", "on"}
     proposed = None if no_amount else _parse_amount(amount, "关联金额")
     current_submit_key = _submit_key(case)
+    submit_workitem = WorkItem.objects.select_for_update().filter(
+        type=SUBMIT_WORK_TYPE,
+        uniq_key=current_submit_key,
+        status="OPEN",
+    ).first()
+    _require_manager_task_copy(identity, submit_workitem)
     validated_image = _validate_image(image, "款项关联清单")
     if validated_image:
         suffix, original_name, _content_type = validated_image
@@ -919,11 +948,6 @@ def submit_goods_transfer_account_case(
     case.rejection_reason = ""
     case.status = GoodsTransferAccountCase.Status.PENDING_CONFIRM
     case.save()
-    submit_workitem = WorkItem.objects.select_for_update().filter(
-        type=SUBMIT_WORK_TYPE,
-        uniq_key=current_submit_key,
-        status="OPEN",
-    ).first()
     if submit_workitem:
         _complete_anyone(
             submit_workitem,
@@ -1013,6 +1037,10 @@ def allocate_goods_transfer_credit(
     *, user, transfer_id, case_id, target_kind, target_id, amount
 ):
     case, identity = _authorized_case(user, transfer_id, case_id=case_id, lock=True)
+    if identity.role.code in SENIOR_MANAGER_ROLE_CODES:
+        raise GoodsTransferAccountError(
+            "高级经理不能在没有本人待办任务时办理退货冲抵分配。"
+        )
     if case.case_type not in {
         GoodsTransferAccountCase.CaseType.RETURN_CREDIT,
         GoodsTransferAccountCase.CaseType.TRANSFER_OUT_CREDIT,

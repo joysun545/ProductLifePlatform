@@ -28,7 +28,12 @@ class MaterialInventoryTests(TestCase):
         self.other_factory = self.org("factory-b", "OWNER")
         self.supplier = self.org("supplier-a", "SUPPLIER")
         self.other_supplier = self.org("supplier-b", "SUPPLIER")
-        for factory, supplier in ((self.factory, self.supplier), (self.factory, self.other_supplier), (self.other_factory, self.supplier)):
+        self.other_factory_supplier = self.org("supplier-c", "SUPPLIER")
+        for factory, supplier in (
+            (self.factory, self.supplier),
+            (self.factory, self.other_supplier),
+            (self.other_factory, self.other_factory_supplier),
+        ):
             OrganizationRelation.objects.create(source_organization=factory, target_organization=supplier, relation_type="SUPPLY")
         self.keeper = self.user("keeper", "factory_material_stock", self.factory)
         self.keeper2 = self.user("keeper2", "factory_material_stock", self.other_factory)
@@ -37,8 +42,10 @@ class MaterialInventoryTests(TestCase):
         self.sales = self.user("sales", "supplier_sales", self.supplier)
         self.sales2 = self.user("sales2", "supplier_sales", self.supplier)
         self.category = ProductCategory.objects.create(code="MI-CAT", name="测试品类")
-        self.material = Material.objects.create(code="MI-MAT", name="控制器", product_category=self.category)
-        self.material2 = Material.objects.create(code="MI-MAT-2", name="电机", product_category=self.category)
+        self.material = Material.objects.create(code="MI-MAT", name="控制器")
+        self.material.product_categories.add(self.category)
+        self.material2 = Material.objects.create(code="MI-MAT-2", name="电机")
+        self.material2.product_categories.add(self.category)
         self.spec = MaterialSpec.objects.create(material=self.material, code="MI-SPEC", name="规格一")
         self.spec2 = MaterialSpec.objects.create(material=self.material2, code="MI-SPEC-2", name="规格二")
         for spec, supplier in ((self.spec, self.supplier), (self.spec2, self.supplier), (self.spec, self.other_supplier)):

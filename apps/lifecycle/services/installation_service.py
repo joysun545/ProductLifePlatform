@@ -5,6 +5,9 @@ from django.utils import timezone
 
 from account.models import OrganizationRole
 from account.services.auth_service import get_active_identity
+from account.services.role_delegation_service import (
+    identity_can_perform_shared_operation,
+)
 from common.domain.device_ownership import (
     evaluate_device_access,
     resolve_device_ownership,
@@ -45,7 +48,6 @@ class InstallationService:
                 "batch__manufacturer__organization_type",
                 "batch__bom",
                 "product_model__category",
-                "product_model__brand",
             )
             .filter(pk=device_id)
             .first()
@@ -108,14 +110,16 @@ class InstallationService:
             device=device,
             viewer_identity=identity,
         )
+        if not ownership.is_direct_owner:
+            raise InstallationPermissionError("该设备不是本组织的库存设备")
+        if not identity_can_perform_shared_operation(identity, "install_device"):
+            raise InstallationPermissionError("当前岗位不能执行装车操作")
         access = evaluate_device_access(
             device=device,
             identity=identity,
             ownership=ownership,
         )
         if not access.allows("install_device"):
-            if not ownership.is_direct_owner:
-                raise InstallationPermissionError("该设备不是本组织的库存设备")
             raise InstallationStateError("设备当前状态不能执行装车操作")
 
         if InstallationRecord.objects.filter(device=device).exists():

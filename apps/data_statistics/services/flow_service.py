@@ -242,21 +242,38 @@ def _tree(identity, rows):
 
 
 def _upstream_factory(organization):
-    """Find the OWNER ancestor for direct and arbitrarily deep merchants."""
-    current, visited = organization, set()
-    while current and current.id not in visited:
-        visited.add(current.id)
-        relation = OrganizationRelation.objects.filter(
-            target_organization=current,
+    """Resolve the assigned manufacturer; never choose an arbitrary parent."""
+    explicit_root = organization.get_factory_root()
+    if explicit_root:
+        return explicit_root
+
+    # Compatibility for legacy rows that have not yet been backfilled. The
+    # inference is accepted only when the active distribution graph has one
+    # possible OWNER ancestor.
+    frontier = {organization.pk}
+    visited = set()
+    roots = {}
+    while frontier:
+        target_ids = frontier - visited
+        if not target_ids:
+            break
+        visited.update(target_ids)
+        relations = OrganizationRelation.objects.filter(
+            target_organization_id__in=target_ids,
             relation_type=OrganizationRelationType.DISTRIBUTION,
             is_active=True,
-        ).select_related("source_organization__organization_type").order_by("id").first()
-        if not relation:
-            return None
-        current = relation.source_organization
-        if current.organization_type.code == "OWNER":
-            return current
-    return None
+            source_organization__is_active=True,
+            source_organization__organization_type__is_active=True,
+        ).select_related("source_organization__organization_type")
+        next_frontier = set()
+        for relation in relations:
+            parent = relation.source_organization
+            if parent.organization_type.code == "OWNER":
+                roots[parent.pk] = parent
+            else:
+                next_frontier.add(parent.pk)
+        frontier = next_frontier
+    return next(iter(roots.values())) if len(roots) == 1 else None
 
 
 def build_flow_statistics(identity):

@@ -2,6 +2,7 @@ import uuid
 
 from django.db import models
 from django.db.models import Q
+from django.utils import timezone
 
 from lifecycle.private_storage import after_sales_private_storage
 
@@ -193,3 +194,186 @@ class AfterSalesEvent(models.Model):
 
     class Meta:
         ordering = ("created_at", "id")
+
+
+class AfterSalesServiceStationApplication(models.Model):
+    """Merchant application to register a repair and receiving location.
+
+    This application is intentionally separate from device-level
+    AfterSalesApplication records. It stores the merchant organization's
+    qualification details and does not change the existing case workflow.
+    """
+
+    class Status(models.TextChoices):
+        PENDING_REVIEW = "PENDING_REVIEW", "待审核"
+        APPROVED = "APPROVED", "已通过"
+        REJECTED = "REJECTED", "未通过"
+
+    organization = models.ForeignKey(
+        "account.Organization",
+        on_delete=models.PROTECT,
+        related_name="after_sales_station_applications",
+        verbose_name="申请商家组织",
+    )
+    submitted_by = models.ForeignKey(
+        "account.User",
+        on_delete=models.PROTECT,
+        related_name="after_sales_station_applications_submitted",
+        verbose_name="申请账号",
+    )
+    status = models.CharField(
+        max_length=24,
+        choices=Status.choices,
+        default=Status.PENDING_REVIEW,
+        db_index=True,
+        verbose_name="申请状态",
+    )
+    service_location_name = models.CharField(
+        max_length=128,
+        blank=True,
+        default="",
+        verbose_name="维修服务点名称",
+    )
+    service_location_address = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        verbose_name="维修服务点地图地址",
+    )
+    service_latitude = models.DecimalField(
+        max_digits=10,
+        decimal_places=7,
+        verbose_name="维修服务点纬度",
+    )
+    service_longitude = models.DecimalField(
+        max_digits=10,
+        decimal_places=7,
+        verbose_name="维修服务点经度",
+    )
+    location_captured_at = models.DateTimeField(
+        verbose_name="定位确认时间",
+    )
+    receiving_address = models.CharField(
+        max_length=255,
+        verbose_name="官方标准收件地址",
+    )
+    receiving_contact_name = models.CharField(
+        max_length=64,
+        verbose_name="收件联系人",
+    )
+    receiving_contact_phone = models.CharField(
+        max_length=32,
+        verbose_name="收件联系电话",
+    )
+    notice_version = models.CharField(
+        max_length=32,
+        default="2026-09-29-v1",
+        verbose_name="申请须知版本",
+    )
+    notice_agreed_at = models.DateTimeField(
+        verbose_name="确认申请须知时间",
+    )
+    submitted_at = models.DateTimeField(
+        default=timezone.now,
+        verbose_name="首次提交时间",
+    )
+    reviewed_by = models.ForeignKey(
+        "account.User",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="after_sales_station_applications_reviewed",
+        verbose_name="审核账号",
+    )
+    reviewed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="审核时间",
+    )
+    review_note = models.TextField(
+        blank=True,
+        default="",
+        verbose_name="审核说明",
+    )
+    liaison_members = models.ManyToManyField(
+        "account.UserOrganization",
+        through="lifecycle.AfterSalesServiceStationLiaison",
+        related_name="after_sales_station_applications",
+        blank=True,
+        verbose_name="售后服务对接成员",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="更新时间")
+
+    class Meta:
+        ordering = ("-submitted_at", "-id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("organization",),
+                condition=Q(status="PENDING_REVIEW"),
+                name="life_one_pending_station_app",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(service_latitude__gte=-90)
+                    & Q(service_latitude__lte=90)
+                ),
+                name="life_station_latitude_range",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(service_longitude__gte=-180)
+                    & Q(service_longitude__lte=180)
+                ),
+                name="life_station_longitude_range",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=("organization", "status"),
+                name="life_station_org_status",
+            ),
+        ]
+        verbose_name = "售后服务站申请"
+        verbose_name_plural = "售后服务站申请"
+
+
+class AfterSalesServiceStationLiaison(models.Model):
+    """The same-organization member roles selected for station coordination."""
+
+    application = models.ForeignKey(
+        AfterSalesServiceStationApplication,
+        on_delete=models.CASCADE,
+        related_name="liaison_links",
+        verbose_name="服务站申请",
+    )
+    identity = models.ForeignKey(
+        "account.UserOrganization",
+        on_delete=models.PROTECT,
+        related_name="service_station_liaisons",
+        verbose_name="组织成员身份",
+    )
+    member_name_snapshot = models.CharField(
+        max_length=128,
+        verbose_name="成员名称快照",
+    )
+    role_code_snapshot = models.CharField(
+        max_length=64,
+        verbose_name="成员岗位代码快照",
+    )
+    role_name_snapshot = models.CharField(
+        max_length=64,
+        verbose_name="成员岗位名称快照",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
+
+    class Meta:
+        ordering = ("role_code_snapshot", "identity_id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("application", "identity"),
+                name="life_station_liaison_unique",
+            ),
+        ]
+        verbose_name = "售后服务站对接成员"
+        verbose_name_plural = "售后服务站对接成员"

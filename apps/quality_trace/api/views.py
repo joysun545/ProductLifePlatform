@@ -168,7 +168,7 @@ def rule_detail(request, rule_id):
         serialize_rule(rule, version)["version"]
         for version in rule.versions.order_by("-version")
     ]
-    data["can_manage"] = identity.role.code in {"factory_admin", "factory_chief_engineer"}
+    data["can_manage"] = identity.role.code == "factory_chief_engineer"
     return JsonResponse({"code": 0, "msg": "", "data": data}, status=200)
 
 
@@ -183,7 +183,7 @@ def evaluate_rules(request):
         identity = get_quality_trace_identity(user)
         if (
             identity.organization.organization_type.code != "OWNER"
-            or identity.role.code not in {"factory_admin", "factory_chief_engineer"}
+            or identity.role.code != "factory_chief_engineer"
         ):
             raise QualityTraceAccessError("当前岗位无权执行质量规则重算。")
         payload = _request_data(request)
@@ -291,7 +291,7 @@ def alert_detail(request, alert_id):
     if error_response:
         return error_response
     try:
-        _, alert = _factory_alert(user, alert_id)
+        identity, alert = _factory_alert(user, alert_id)
     except QualityTraceAccessError as exc:
         return JsonResponse({"code": 1, "msg": str(exc), "data": {}}, status=200)
     metric = (
@@ -339,9 +339,13 @@ def alert_detail(request, alert_id):
         ],
         "device_evidence_complete_count": evidence_rows.count() if metric else 0,
         "available_actions": {
-            "assess": alert.status not in {QualityAlert.Status.DISMISSED, QualityAlert.Status.CLOSED},
+            "assess": (
+                identity.role.code == "factory_chief_engineer"
+                and alert.status not in {QualityAlert.Status.DISMISSED, QualityAlert.Status.CLOSED}
+            ),
             "open_case": (
-                alert.status not in {QualityAlert.Status.DISMISSED, QualityAlert.Status.CLOSED}
+                identity.role.code == "factory_chief_engineer"
+                and alert.status not in {QualityAlert.Status.DISMISSED, QualityAlert.Status.CLOSED}
                 and alert.assessments.exists()
                 and not alert.quality_cases.exists()
             ),
@@ -459,7 +463,8 @@ def quality_case_detail(request, case_id):
         .values_list("control_action_id", flat=True)
     )
     orphan_recall = bool(active_recall and active_recall.pk not in bound_action_ids)
-    can_control = identity.organization.organization_type.code == "OWNER"
+    can_view_factory_recall = identity.organization.organization_type.code == "OWNER"
+    can_control = can_view_factory_recall and identity.role.code == "factory_chief_engineer"
     data["recall_campaign"] = ({
         "id": current_campaign.pk,
         "recall_no": current_campaign.recall_no,
@@ -484,7 +489,7 @@ def quality_case_detail(request, case_id):
             BatchQualityCase.Status.HELD,
         } and not current_campaign and not active_recall,
         "create_recall_campaign": False,
-        "open_recall_detail": can_control and row.status in {
+        "open_recall_detail": can_view_factory_recall and row.status in {
             BatchQualityCase.Status.OPEN,
             BatchQualityCase.Status.HELD,
             BatchQualityCase.Status.RECALLING,

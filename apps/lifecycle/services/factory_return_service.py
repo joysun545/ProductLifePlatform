@@ -10,6 +10,12 @@ from django.utils import timezone
 
 from account.models import UserOrganization
 from account.services.auth_service import get_active_identity
+from account.services.role_delegation_service import (
+    SENIOR_MANAGER_ROLE_CODES,
+    delegated_role_codes,
+    effective_role_codes,
+    identity_has_role,
+)
 from lifecycle.models import (
     DeviceMaterialFaultRecord,
     DeviceMaterialWarrantyEvaluation,
@@ -182,10 +188,96 @@ def _factory_identity(user, allowed_roles=None):
         not identity
         or not identity.is_active
         or identity.organization.organization_type.code != "OWNER"
-        or (allowed_roles and identity.role.code not in allowed_roles)
+        or (allowed_roles and not identity_has_role(identity, allowed_roles))
     ):
         raise FactoryReturnProcessError("当前账号没有厂家退货处理权限。")
     return identity
+
+
+def _senior_manager_has_task(identity, transfer, work_types, *, require_action=False):
+    """Whether this manager received this exact organization-scoped task."""
+
+    openid = (identity.user.wx_openid or "").strip()
+    if not openid:
+        return False
+    tasks = UserTask.objects.filter(
+        to_openid=openid,
+        workitem__biz_ref=f"lifecycle.GoodsTransfer:{transfer.pk}",
+        workitem__type__in=tuple(work_types),
+    )
+    if require_action:
+        tasks = tasks.filter(
+            need_action=True,
+            state__in=("NEW", "READ"),
+            workitem__status="OPEN",
+        )
+    return tasks.exists()
+
+
+def _role_task_access(
+    identity,
+    transfer,
+    role_code,
+    work_types,
+    *,
+    require_action=False,
+):
+    if not identity_has_role(identity, role_code):
+        return False
+    if identity.role.code not in SENIOR_MANAGER_ROLE_CODES:
+        return identity.role.code == role_code
+    return _senior_manager_has_task(
+        identity,
+        transfer,
+        work_types,
+        require_action=require_action,
+    )
+
+
+def _require_role_task_access(identity, transfer, role_code, work_types):
+    if not _role_task_access(
+        identity,
+        transfer,
+        role_code,
+        work_types,
+        require_action=True,
+    ):
+        raise FactoryReturnProcessError("当前高级经理没有收到这项退货协同任务。")
+
+
+def _manager_task_transfer_ids(identity):
+    """Factory-return records visible through the manager's own task copies."""
+
+    if identity.role.code not in SENIOR_MANAGER_ROLE_CODES:
+        return None
+    role_codes = effective_role_codes(identity)
+    task_types = tuple(
+        node["type"]
+        for role_code, definitions in FACTORY_RETURN_ROLE_TASK_NODES.items()
+        if role_code in role_codes
+        for node in definitions
+    )
+    openid = (identity.user.wx_openid or "").strip()
+    if not openid or not task_types:
+        return set()
+    refs = UserTask.objects.filter(
+        to_openid=openid,
+        workitem__type__in=task_types,
+        workitem__biz_ref__startswith="lifecycle.GoodsTransfer:",
+    ).values_list("workitem__biz_ref", flat=True).distinct()
+    transfer_ids = set()
+    for ref in refs:
+        try:
+            transfer_ids.add(int(str(ref).rsplit(":", 1)[1]))
+        except (IndexError, TypeError, ValueError):
+            continue
+    return transfer_ids
+
+
+def _manager_can_view_return(identity, transfer):
+    if identity.role.code not in SENIOR_MANAGER_ROLE_CODES:
+        return True
+    return transfer.pk in _manager_task_transfer_ids(identity)
 
 
 def _role_openids(organization, role_codes):
@@ -577,7 +669,7 @@ def _return_document_identity(user):
         not identity
         or not identity.is_active
         or identity.organization.organization_type.code != "MERCHANT"
-        or identity.role.code not in MERCHANT_RETURN_DOCUMENT_ROLES
+        or not identity_has_role(identity, MERCHANT_RETURN_DOCUMENT_ROLES)
     ):
         raise FactoryReturnProcessError("当前岗位不能上传退厂退货单据。")
     return identity
@@ -590,10 +682,33 @@ def _return_document_access(identity, transfer, document_kind):
         and identity.organization.organization_type.code == "MERCHANT"
         and identity.role.code in MERCHANT_RETURN_DOCUMENT_ROLES
     )
-    factory_access = bool(
+    factory_role_task = {
+        "factory_logistics": PICKUP_WORK_TYPE,
+        "factory_sales_assistant": POSTING_WORK_TYPE,
+    }.get(config["factory_role"], "")
+    factory_access_by_role = bool(
+        factory_role_task
+        and identity.organization_id == transfer.to_organization_id
+        and identity.organization.organization_type.code == "OWNER"
+        and _role_task_access(
+            identity,
+            transfer,
+            config["factory_role"],
+            (factory_role_task,),
+        )
+    )
+    factory_sales_access = bool(
         identity.organization_id == transfer.to_organization_id
         and identity.organization.organization_type.code == "OWNER"
-        and identity.role.code in {config["factory_role"], "factory_sales"}
+        and _role_task_access(
+            identity,
+            transfer,
+            "factory_sales",
+            (SALES_NOTICE_SUBMITTED,),
+        )
+    )
+    factory_access = bool(
+        factory_access_by_role or factory_sales_access
     )
     return merchant_access or factory_access
 
@@ -991,6 +1106,12 @@ def record_factory_return_credit_amount(*, user, transfer_id, amount):
     if not transfer:
         raise FactoryReturnProcessError("退货商品流转单不存在。")
     _validate_factory_return(transfer, identity.organization_id)
+    _require_role_task_access(
+        identity,
+        transfer,
+        "factory_sales_assistant",
+        (POSTING_WORK_TYPE,),
+    )
     process = _locked_process(transfer)
     if not process.picked_at:
         raise FactoryReturnProcessError("厂家物流尚未确认取回，不能填写冲抵金额。")
@@ -1054,6 +1175,12 @@ def confirm_factory_return_pickup(*, user, transfer_id):
     if not transfer:
         raise FactoryReturnProcessError("退货商品流转单不存在。")
     _validate_factory_return(transfer, identity.organization_id)
+    _require_role_task_access(
+        identity,
+        transfer,
+        "factory_logistics",
+        (PICKUP_WORK_TYPE,),
+    )
     if transfer.status in {
         GoodsTransfer.Status.PENDING_FACTORY_POSTING,
         GoodsTransfer.Status.COMPLETED,
@@ -1299,6 +1426,12 @@ def post_factory_return_inventory(
     if not transfer:
         raise FactoryReturnProcessError("退货商品流转单不存在。")
     _validate_factory_return(transfer, identity.organization_id)
+    _require_role_task_access(
+        identity,
+        transfer,
+        "factory_sales_assistant",
+        (POSTING_WORK_TYPE,),
+    )
     process = _locked_process(transfer)
     if process.phase == FactoryReturnProcess.Phase.POSTED:
         return _serialize_process(process, identity), False
@@ -2900,6 +3033,19 @@ def process_factory_return_production_item(
     _validate_factory_return(transfer, identity.organization_id)
     item = _locked_internal_inventory_item(transfer, item_id)
     action = str(action or "").upper()
+    if action in {"REPAIR_DIAGNOSIS", "REPAIR_COMPLETE"}:
+        task_type = REPAIR_PRODUCTION_WORK_TYPE
+    elif action == "DISASSEMBLY_COMPLETE":
+        task_type = DISASSEMBLY_PRODUCTION_WORK_TYPE
+    else:
+        task_type = ""
+    if task_type:
+        _require_role_task_access(
+            identity,
+            transfer,
+            "factory_production",
+            (task_type,),
+        )
     now = timezone.now()
 
     if action == "REPAIR_DIAGNOSIS":
@@ -3111,9 +3257,22 @@ def process_factory_return_matching_item(
         raise FactoryReturnProcessError("退货商品流转单不存在。")
     _validate_factory_return(transfer, identity.organization_id)
     item = _locked_internal_inventory_item(transfer, item_id)
+    action = str(action or "").upper()
+    if action == "REPAIR_MATERIAL_PLAN":
+        task_type = REPAIR_MATCHING_WORK_TYPE
+    elif action == "DISASSEMBLY_MATERIAL_DISPOSITION":
+        task_type = DISASSEMBLY_MATCHING_WORK_TYPE
+    else:
+        task_type = ""
+    if task_type:
+        _require_role_task_access(
+            identity,
+            transfer,
+            "factory_matching",
+            (task_type,),
+        )
     if item.matching_status != FactoryReturnInventoryItem.MatchingStatus.PENDING:
         raise FactoryReturnProcessError("当前仍在等待生产结果或配套处置已经完成。")
-    action = str(action or "").upper()
     if action == "REPAIR_MATERIAL_PLAN":
         plan = str(material_plan or "").strip()[:1000]
         if (
@@ -3190,7 +3349,11 @@ def process_factory_return_matching_item(
     return _serialize_process(item.process, identity), True
 
 
-def _serialize_inventory_item(item, can_post, role_code=""):
+def _serialize_inventory_item(item, can_post, role_codes=None):
+    if isinstance(role_codes, str):
+        role_codes = {role_codes}
+    else:
+        role_codes = set(role_codes or ())
     transfer_item = item.transfer_item
     device = transfer_item.device
     qrcode = getattr(device, "qrcode", None)
@@ -3358,28 +3521,28 @@ def _serialize_inventory_item(item, can_post, role_code=""):
         "actions": {
             "can_classify": bool(can_post),
             "can_submit_repair_diagnosis": bool(
-                role_code == "factory_production"
+                "factory_production" in role_codes
                 and item.stock_status
                 == FactoryReturnInventoryItem.StockStatus.PENDING_REPAIR
                 and item.production_status
                 == FactoryReturnInventoryItem.ProductionStatus.PENDING
             ),
             "can_complete_repair": bool(
-                role_code == "factory_production"
+                "factory_production" in role_codes
                 and item.stock_status
                 == FactoryReturnInventoryItem.StockStatus.REPAIRING
                 and item.production_status
                 == FactoryReturnInventoryItem.ProductionStatus.READY_TO_COMPLETE
             ),
             "can_complete_disassembly": bool(
-                role_code == "factory_production"
+                "factory_production" in role_codes
                 and item.stock_status
                 == FactoryReturnInventoryItem.StockStatus.PENDING_DISASSEMBLY
                 and item.production_status
                 == FactoryReturnInventoryItem.ProductionStatus.PENDING
             ),
             "can_submit_repair_material_plan": bool(
-                role_code == "factory_matching"
+                "factory_matching" in role_codes
                 and item.stock_status
                 == FactoryReturnInventoryItem.StockStatus.REPAIRING
                 and item.matching_status
@@ -3387,7 +3550,7 @@ def _serialize_inventory_item(item, can_post, role_code=""):
                 and item.needs_replacement_material
             ),
             "can_notify_repair_suppliers": bool(
-                role_code == "factory_matching"
+                "factory_matching" in role_codes
                 and item.stock_status
                 == FactoryReturnInventoryItem.StockStatus.REPAIRING
                 and item.matching_status
@@ -3397,7 +3560,7 @@ def _serialize_inventory_item(item, can_post, role_code=""):
                 and unresolved_repair_count == 0
             ),
             "can_submit_disassembly_disposition": bool(
-                role_code == "factory_matching"
+                "factory_matching" in role_codes
                 and item.stock_status
                 == FactoryReturnInventoryItem.StockStatus.LIFECYCLE_ENDED
                 and item.matching_status
@@ -3405,7 +3568,7 @@ def _serialize_inventory_item(item, can_post, role_code=""):
                 and disassembly_return_records
             ),
             "can_notify_warranty_suppliers": bool(
-                role_code == "factory_matching"
+                "factory_matching" in role_codes
                 and item.stock_status
                 == FactoryReturnInventoryItem.StockStatus.LIFECYCLE_ENDED
                 and item.matching_status
@@ -3425,9 +3588,12 @@ def _serialize_role_workflow_tasks(transfer, identity):
     explain the whole role workflow without fabricating tasks or permissions.
     """
 
-    node_definitions = FACTORY_RETURN_ROLE_TASK_NODES.get(
-        identity.role.code,
-        (),
+    role_codes = effective_role_codes(identity)
+    node_definitions = tuple(
+        node
+        for role_code, definitions in FACTORY_RETURN_ROLE_TASK_NODES.items()
+        if role_code in role_codes
+        for node in definitions
     )
     if not node_definitions:
         return []
@@ -3546,13 +3712,42 @@ def _serialize_process(process, identity):
         ).order_by("transfer_item_id")
     )
     can_pickup = bool(
-        identity.role.code == "factory_logistics"
+        _role_task_access(
+            identity,
+            transfer,
+            "factory_logistics",
+            (PICKUP_WORK_TYPE,),
+            require_action=True,
+        )
         and process.phase == FactoryReturnProcess.Phase.WAITING_PICKUP
     )
     can_post = bool(
-        identity.role.code == "factory_sales_assistant"
+        _role_task_access(
+            identity,
+            transfer,
+            "factory_sales_assistant",
+            (POSTING_WORK_TYPE,),
+            require_action=True,
+        )
         and process.phase == FactoryReturnProcess.Phase.WAITING_POSTING
     )
+    action_roles = set()
+    if _role_task_access(
+        identity,
+        transfer,
+        "factory_production",
+        (DISASSEMBLY_PRODUCTION_WORK_TYPE, REPAIR_PRODUCTION_WORK_TYPE),
+        require_action=True,
+    ):
+        action_roles.add("factory_production")
+    if _role_task_access(
+        identity,
+        transfer,
+        "factory_matching",
+        (DISASSEMBLY_MATCHING_WORK_TYPE, REPAIR_MATCHING_WORK_TYPE),
+        require_action=True,
+    ):
+        action_roles.add("factory_matching")
     account_case = process.account_case
     credit_amount_recorded = bool(
         account_case
@@ -3560,7 +3755,13 @@ def _serialize_process(process, identity):
         and account_case.confirmed_amount is not None
     )
     can_record_credit_amount = bool(
-        identity.role.code == "factory_sales_assistant"
+        _role_task_access(
+            identity,
+            transfer,
+            "factory_sales_assistant",
+            (POSTING_WORK_TYPE,),
+            require_action=True,
+        )
         and process.picked_at
         and account_case
         and not credit_amount_recorded
@@ -3569,10 +3770,20 @@ def _serialize_process(process, identity):
         type=POSTING_WORK_TYPE,
         uniq_key=f"lifecycle:factory-return:{transfer.pk}:posting",
     ).first()
-    can_view_account_case = identity.role.code in {
-        "factory_sales",
-        "factory_sales_assistant",
-    }
+    can_view_account_case = bool(
+        _role_task_access(
+            identity,
+            transfer,
+            "factory_sales",
+            (SALES_NOTICE_SUBMITTED,),
+        )
+        or _role_task_access(
+            identity,
+            transfer,
+            "factory_sales_assistant",
+            (POSTING_WORK_TYPE,),
+        )
+    )
     inventory_summary = defaultdict(int)
     for inventory_item in inventory_items:
         inventory_summary[inventory_item.stock_status] += 1
@@ -3687,7 +3898,7 @@ def _serialize_process(process, identity):
         ),
         "document_task": document_actions,
         "items": [
-            _serialize_inventory_item(item, can_post, identity.role.code)
+            _serialize_inventory_item(item, can_post, action_roles)
             for item in inventory_items
         ],
         "actions": {
@@ -3695,7 +3906,7 @@ def _serialize_process(process, identity):
             "can_post_inventory": can_post,
             "can_record_credit_amount": can_record_credit_amount,
             "assistant_action_locked": bool(
-                identity.role.code == "factory_sales_assistant"
+                identity_has_role(identity, "factory_sales_assistant")
                 and not process.picked_at
             ),
             "assistant_task_status": (
@@ -3735,6 +3946,8 @@ def get_factory_return_process(*, user, transfer_id):
     if not process:
         raise FactoryReturnProcessError("厂家退货处理流程不存在。")
     _validate_factory_return(process.transfer, identity.organization_id)
+    if not _manager_can_view_return(identity, process.transfer):
+        raise FactoryReturnProcessError("该退货流程没有发给当前高级经理的协同任务。")
     return _serialize_process(process, identity)
 
 
@@ -3749,7 +3962,7 @@ def get_factory_return_inventory(*, user):
             "factory_matching",
         },
     )
-    items = list(
+    inventory_queryset = (
         FactoryReturnInventoryItem.objects.select_related(
             "process__transfer__from_organization",
             "process__transfer__to_organization",
@@ -3760,13 +3973,16 @@ def get_factory_return_inventory(*, user):
             "source_production_batch",
             "source_bom",
             "transfer_item__device__qrcode",
-        )
-        .filter(
+        ).filter(
             process__transfer__to_organization_id=identity.organization_id,
             process__phase=FactoryReturnProcess.Phase.POSTED,
         )
-        .order_by("stock_status", "-classified_at", "-pk")
     )
+    if identity.role.code in SENIOR_MANAGER_ROLE_CODES:
+        inventory_queryset = inventory_queryset.filter(
+            process__transfer_id__in=_manager_task_transfer_ids(identity),
+        )
+    items = list(inventory_queryset.order_by("stock_status", "-classified_at", "-pk"))
     counts = defaultdict(int)
     for item in items:
         counts[item.stock_status] += 1

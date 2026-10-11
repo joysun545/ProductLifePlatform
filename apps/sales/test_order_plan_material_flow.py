@@ -8,6 +8,7 @@ from account.models import (
     OrganizationRelationType,
     OrganizationRole,
     OrganizationType,
+    SeniorManagerProfile,
 )
 from django.db.models import Sum
 from django.test import TestCase
@@ -1066,24 +1067,40 @@ class OrderPlanMaterialFlowTests(TestCase):
             )
         )
 
-    def test_v2_merchant_senior_manager_can_view_but_cannot_confirm_receipt(self):
+    def test_v2_stock_senior_manager_can_confirm_receipt_without_task(self):
         plan, _subplan, shipment = self._ready_production_shipment(
-            request_id="v2-senior-view-only-receipt",
+            request_id="v2-senior-proactive-receipt",
             quantity=5,
         )
         self._authorize_print_and_outbound(plan=plan, shipment=shipment)
+
+        profile = SeniorManagerProfile.objects.create(
+            identity=self.merchant_senior_manager.organization_identity
+        )
+        profile.managed_roles.add(self.merchant_stock_role)
 
         senior_detail = get_material_flow_detail(
             user=self.merchant_senior_manager,
             plan_id=plan.pk,
         )
-        self.assertFalse(
+        self.assertTrue(
             self._timeline_node(senior_detail, "MERCHANT_RECEIPT")["active"]
+        )
+        self.assertTrue(
+            any(
+                action["code"] == "shipment-receipt"
+                for row in senior_detail["shipments"]
+                for action in row["available_actions"]
+            )
+        )
+        owner_detail = get_material_flow_detail(
+            user=self.merchant_owner,
+            plan_id=plan.pk,
         )
         self.assertFalse(
             any(
                 action["code"] == "shipment-receipt"
-                for row in senior_detail["shipments"]
+                for row in owner_detail["shipments"]
                 for action in row["available_actions"]
             )
         )
@@ -1093,12 +1110,14 @@ class OrderPlanMaterialFlowTests(TestCase):
                 user_tasks__to_openid=self.merchant_senior_manager.wx_openid,
             ).exists()
         )
-        with self.assertRaisesRegex(OrderPlanMaterialFlowError, "负责人、销售经理或库管"):
-            confirm_material_flow_merchant_receipt(
-                user=self.merchant_senior_manager,
-                plan_id=plan.pk,
-                shipment_id=shipment.pk,
-            )
+        _result, changed = confirm_material_flow_merchant_receipt(
+            user=self.merchant_senior_manager,
+            plan_id=plan.pk,
+            shipment_id=shipment.pk,
+        )
+        self.assertTrue(changed)
+        shipment.refresh_from_db()
+        self.assertEqual(shipment.received_by_id, self.merchant_senior_manager.pk)
 
     def test_v2_sales_can_split_pending_subplan_shipment_and_preserve_exact_device_sets(self):
         """A sales-side urgent split must not duplicate devices or ship the remainder.

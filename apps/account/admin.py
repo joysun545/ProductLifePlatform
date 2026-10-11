@@ -7,6 +7,7 @@ from .models import (
     OrganizationRelation,
     OrganizationRole,
     OrganizationType,
+    PlatformFactoryInvitation,
     RoleInvitationRule,
     User,
     UserOrganization,
@@ -27,7 +28,7 @@ class UserOrganizationInline(admin.StackedInline):
         "created_at",
         "updated_at",
     )
-    readonly_fields = ("created_at", "updated_at")
+    readonly_fields = ("created_at",)
     autocomplete_fields = ("organization", "role", "inviter")
 
 
@@ -113,15 +114,31 @@ class OrganizationAdmin(admin.ModelAdmin):
         "name",
         "code",
         "organization_type",
+        "factory_root",
         "region",
+        "ui_color_scheme",
+        "ui_style_scheme",
         "is_active",
         "created_at",
     )
-    list_filter = ("organization_type", "is_active", "region")
+    list_filter = (
+        "organization_type",
+        "factory_root",
+        "ui_color_scheme",
+        "ui_style_scheme",
+        "is_active",
+        "region",
+    )
     search_fields = ("name", "code", "region", "address")
     ordering = ("name", "id")
     readonly_fields = ("created_at", "updated_at")
-    autocomplete_fields = ("organization_type",)
+    autocomplete_fields = ("organization_type", "factory_root")
+
+    def get_readonly_fields(self, request, obj=None):
+        fields = list(super().get_readonly_fields(request, obj))
+        if obj and obj.factory_root_id:
+            fields.append("factory_root")
+        return tuple(fields)
 
 
 @admin.register(OrganizationRole)
@@ -224,6 +241,39 @@ class InvitationRecordAdmin(admin.ModelAdmin):
         "target_organization",
         "invitee",
     )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def get_readonly_fields(self, request, obj=None):
+        return tuple(field.name for field in self.model._meta.fields)
+
+
+@admin.register(PlatformFactoryInvitation)
+class PlatformFactoryInvitationAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "organization_name",
+        "inviter",
+        "target_role",
+        "status",
+        "invitee",
+        "expires_at",
+        "created_at",
+    )
+    list_filter = ("status", "created_at")
+    search_fields = (
+        "organization_name",
+        "inviter__username",
+        "inviter__wx_nickname",
+        "invitee__username",
+        "invitee__wx_nickname",
+    )
+    ordering = ("-created_at", "-id")
+    list_select_related = ("inviter", "target_role", "invitee")
 
     def has_add_permission(self, request):
         return False

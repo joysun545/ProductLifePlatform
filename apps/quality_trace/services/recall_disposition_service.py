@@ -2,6 +2,11 @@ from django.db import transaction
 from django.utils import timezone
 
 from account.models import UserOrganization
+from account.services.auth_service import get_active_identity
+from account.services.role_delegation_service import (
+    has_open_action_task_copy,
+    identity_has_role,
+)
 from lifecycle.models import (
     CustomerDeviceBinding, DeviceState, LifecycleEvent, OrganizationDevice,
 )
@@ -14,7 +19,6 @@ from quality_trace.models import (
 from workflow.models import WorkItem
 from workflow.services.workflow_service import publish_workitem
 
-from .case_service import _identity
 from .recall_service import QualityRecallError
 
 
@@ -25,14 +29,30 @@ TASK_CHIEF = "QUALITY_RECALL_DISPOSITION_CHIEF_CONFIRM"
 NOTICE_DISASSEMBLY = "QUALITY_RECALL_DISASSEMBLY_NOTICE"
 
 
+def _delegated_identity(user, role_codes):
+    identity = get_active_identity(user)
+    if (
+        not identity
+        or not identity.is_active
+        or identity.organization.organization_type.code != "OWNER"
+        or not identity_has_role(identity, role_codes)
+    ):
+        raise QualityRecallError("当前厂家身份没有该召回协同岗位权限。")
+    return identity
+
+
 def _chief_campaign(user, campaign_id):
-    identity = _identity(user, {"factory_chief_engineer"})
+    identity = _delegated_identity(user, {"factory_chief_engineer"})
     campaign = QualityRecallCampaign.objects.select_for_update().filter(
         pk=campaign_id, factory_organization=identity.organization,
         status=QualityRecallCampaign.Status.ACTIVE,
     ).first()
     if not campaign:
         raise QualityRecallError("有效召回批次不存在或不属于当前厂家。")
+    if not has_open_action_task_copy(
+        identity, (f"quality-recall:{campaign.pk}:post-recall-disposition",),
+    ):
+        raise QualityRecallError("当前高级经理没有收到这项召回后处置任务。")
     if not QualityRecallInventoryBatchConfirmation.objects.filter(campaign=campaign).exists():
         raise QualityRecallError("销售助理尚未确认本批召回设备全部入库记账。")
     return identity, campaign
@@ -300,13 +320,17 @@ def confirm_recall_disposition_supplier(*, user, confirmation_id, note=""):
 @transaction.atomic
 def confirm_recall_disposition_matching(*, user, disposition_id,
                                         replacement_parts=None, note=""):
-    identity = _identity(user, {"factory_matching"})
+    identity = _delegated_identity(user, {"factory_matching"})
     item = QualityRecallPostDisposition.objects.select_for_update().select_related(
         "campaign__factory_organization", "recall_device",
     ).filter(pk=disposition_id,
              campaign__factory_organization=identity.organization).first()
     if not item or item.method != QualityRecallPostDisposition.Method.REPAIR_WITH_PARTS:
         raise QualityRecallError("换件维修配套任务不存在。")
+    if not has_open_action_task_copy(
+        identity, (f"quality-recall:disposition:{item.pk}:matching",),
+    ):
+        raise QualityRecallError("当前高级经理没有收到这项配套处理任务。")
     if item.execution_stage != QualityRecallPostDisposition.ExecutionStage.WAITING_MATCHING:
         raise QualityRecallError("尚未完成全部供应商负责人确认，不能进行配套确认。")
     parts = replacement_parts if isinstance(replacement_parts, list) else []
@@ -332,7 +356,7 @@ def confirm_recall_disposition_matching(*, user, disposition_id,
 @transaction.atomic
 def complete_recall_disposition_production(*, user, disposition_id,
                                            completion_note=""):
-    identity = _identity(user, {"factory_production"})
+    identity = _delegated_identity(user, {"factory_production"})
     item = QualityRecallPostDisposition.objects.select_for_update().select_related(
         "campaign__factory_organization", "campaign__quality_case__source_alert",
         "recall_device__device__batch__bom",
@@ -340,6 +364,10 @@ def complete_recall_disposition_production(*, user, disposition_id,
              campaign__factory_organization=identity.organization).first()
     if not item:
         raise QualityRecallError("召回生产处置任务不存在。")
+    if not has_open_action_task_copy(
+        identity, (f"quality-recall:disposition:{item.pk}:production",),
+    ):
+        raise QualityRecallError("当前高级经理没有收到这项生产处置任务。")
     valid_stage = (QualityRecallPostDisposition.ExecutionStage.WAITING_PRODUCTION_COMPLETION
                    if item.method == QualityRecallPostDisposition.Method.REPAIR_WITH_PARTS
                    else QualityRecallPostDisposition.ExecutionStage.WAITING_PRODUCTION)
@@ -370,7 +398,7 @@ def complete_recall_disposition_production(*, user, disposition_id,
 @transaction.atomic
 def complete_recall_device_disposition(*, user, disposition_id,
                                        completion_note="", replacement_parts=None):
-    identity = _identity(user, {"factory_chief_engineer"})
+    identity = _delegated_identity(user, {"factory_chief_engineer"})
     item = QualityRecallPostDisposition.objects.select_for_update().select_related(
         "campaign__factory_organization", "campaign__quality_case__source_alert",
         "recall_device__device__batch__bom", "recall_device__device__product_model",
@@ -378,6 +406,10 @@ def complete_recall_device_disposition(*, user, disposition_id,
              campaign__factory_organization=identity.organization).first()
     if not item:
         raise QualityRecallError("召回后处置记录不存在。")
+    if not has_open_action_task_copy(
+        identity, (f"quality-recall:disposition:{item.pk}:chief",),
+    ):
+        raise QualityRecallError("当前高级经理没有收到这项处置复核任务。")
     if item.status == QualityRecallPostDisposition.Status.COMPLETED:
         return item
     if item.method == QualityRecallPostDisposition.Method.DISASSEMBLE:

@@ -124,7 +124,7 @@ class ReceivedShipmentNoticeTests(V2OrderPlanFixture):
             to_openid=self.merchant_stock_2.wx_openid,
         ).update(state="READ", read_at=read_at)
 
-        self._receipt(plan, first, self.merchant_sales)
+        self._receipt(plan, first, self.merchant_stock_1)
         first.refresh_from_db()
         second.refresh_from_db()
         self.assertEqual(first.status, OrderPlanShipment.Status.RECEIVED)
@@ -132,9 +132,12 @@ class ReceivedShipmentNoticeTests(V2OrderPlanFixture):
         self.assertEqual(self._merchant_notices(plan, first).filter(state="DONE").count(), 4)
         self.assertEqual(self._merchant_notices(plan, second).filter(state="NEW").count(), 4)
         for user in self._merchant_users():
-            self.assertEqual(get_task_summary(user.wx_openid), {
-                "unread_count": 1, "action_pending_count": 1, "attention_count": 1,
-            })
+            expected_summary = (
+                {"unread_count": 1, "action_pending_count": 0, "attention_count": 1}
+                if user == self.merchant_sales
+                else {"unread_count": 1, "action_pending_count": 1, "attention_count": 1}
+            )
+            self.assertEqual(get_task_summary(user.wx_openid), expected_summary)
         self.assertFalse(WorkItem.objects.filter(type="ORDER_PLAN_V2_ACCOUNTING_CONFIRM").exists())
         with self.assertRaises(flow.OrderPlanMaterialFlowError):
             flow.confirm_material_flow_accounting(user=self.factory_assistant_1, plan_id=plan.pk)
@@ -291,7 +294,7 @@ class ReceivedShipmentNoticeTests(V2OrderPlanFixture):
             "sales.services.shipment_receipt_notice_service.close_received_shipment_notices",
             side_effect=RuntimeError("simulated notice write failure"),
         ), self.assertRaisesRegex(RuntimeError, "simulated notice write failure"):
-            self._receipt(plan, shipment, self.merchant_sales)
+            self._receipt(plan, shipment, self.merchant_stock_1)
         self.assertEqual(self._snapshot(*models), before)
         shipment.refresh_from_db()
         self.assertEqual(shipment.status, OrderPlanShipment.Status.SHIPPED)

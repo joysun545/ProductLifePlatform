@@ -59,7 +59,9 @@ class ShipmentReceiptInventoryTests(V2OrderPlanFixture):
         for shipment in shipments:
             self._ship(plan, shipment)
         self.assertEqual(self._inventory(self.merchant_owner), 0)
-        self._receipt(plan, shipments[0], self.merchant_sales)
+        # Physical receipt is handled by the owner or stock role; sales keeps
+        # inventory visibility but no longer acts as the shared receiver.
+        self._receipt(plan, shipments[0], self.merchant_stock_1)
         plan.refresh_from_db()
         self.assertIsNone(plan.received_at)
         self.assertIsNone(plan.accounted_at)

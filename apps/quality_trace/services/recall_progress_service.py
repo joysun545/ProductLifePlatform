@@ -3,7 +3,12 @@ from collections import Counter
 from django.db import transaction
 from django.utils import timezone
 
+from account.services.auth_service import get_active_identity
 from account.models import UserOrganization
+from account.services.role_delegation_service import (
+    has_open_action_task_copy,
+    identity_has_role,
+)
 from quality_trace.models import (
     BatchQualityCase,
     QualityControlAction,
@@ -291,9 +296,18 @@ def _complete_campaign_workitems(campaign, user):
 
 @transaction.atomic
 def complete_recall_campaign(*, user, campaign_id, reason):
-    identity = _identity(user, RECALL_MANAGER_ROLES)
-    if identity.role.code != "factory_chief_engineer":
+    identity = get_active_identity(user)
+    if (
+        not identity
+        or not identity.is_active
+        or identity.organization.organization_type.code != "OWNER"
+        or not identity_has_role(identity, "factory_chief_engineer")
+    ):
         raise QualityRecallError("只有厂家总工程师可以确认召回任务完成。")
+    if not has_open_action_task_copy(
+        identity, (f"quality-recall:{campaign_id}:post-recall-disposition",),
+    ):
+        raise QualityRecallError("当前高级经理没有收到这项召回完成任务。")
     campaign = (
         QualityRecallCampaign.objects.select_for_update()
         .select_related("control_action", "quality_case__source_alert")

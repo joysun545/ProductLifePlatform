@@ -9,6 +9,7 @@ app_name = "account"
 urlpatterns = [
     path("login/", views.login, name="login"),
     path("profile/", views.profile, name="profile"),
+    path("appearance/", views.appearance, name="appearance"),
     path(
         "invitation_roles/",
         views.invitation_roles,
@@ -20,9 +21,24 @@ urlpatterns = [
         name="subordinates",
     ),
     path(
+        "subordinates/after-sales-qualification/",
+        views.update_subordinate_after_sales_qualification,
+        name="update_subordinate_after_sales_qualification",
+    ),
+    path(
+        "subordinates/merchant-catalog/",
+        views.subordinate_merchant_catalog,
+        name="subordinate_merchant_catalog",
+    ),
+    path(
         "invitations/create/",
         views.create_invitation,
         name="create_invitation",
+    ),
+    path(
+        "platform/factory-invitations/create/",
+        views.create_platform_factory_invitation_view,
+        name="create_platform_factory_invitation",
     ),
     path(
         "invitations/detail/",

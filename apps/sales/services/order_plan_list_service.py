@@ -8,6 +8,8 @@ from django.db.models import Q
 
 from sales.models import OrderPlan, OrderPlanMaterialPlan
 from sales.services.order_plan_flow_guard import material_flow_status_name
+from account.services.role_delegation_service import effective_role_codes
+from account.services.role_delegation_service import delegated_role_user_ids
 from sales.services.order_plan_material_flow_service import _viewer_identity
 from supply_chain.services.supplier_responsibility_service import (
     get_responsible_material_ids,
@@ -36,19 +38,19 @@ def _identity(user):
         identity = _viewer_identity(user)
     except Exception as exc:
         raise OrderPlanListError(str(exc)) from exc
-    if identity.role.code not in ALLOWED_ROLES:
+    if not (effective_role_codes(identity) & ALLOWED_ROLES):
         raise OrderPlanListError("当前账号没有查看订单计划列表的岗位权限。")
     return identity
 
 
 def _scope(identity):
-    role = identity.role.code
+    roles = effective_role_codes(identity)
     kind = identity.organization.organization_type.code
-    if role in FACTORY_ROLES and kind == "OWNER":
+    if roles & FACTORY_ROLES and kind == "OWNER":
         return "factory"
-    if role in MERCHANT_ROLES and kind == "MERCHANT":
+    if roles & MERCHANT_ROLES and kind == "MERCHANT":
         return "merchant"
-    if role in SUPPLIER_ROLES and kind == "SUPPLIER":
+    if roles & SUPPLIER_ROLES and kind == "SUPPLIER":
         return "supplier"
     raise OrderPlanListError("当前岗位与所属组织类型不一致。")
 
@@ -115,8 +117,18 @@ def get_order_plan_list(user, status="", limit=50):
     ).filter(flow_version=OrderPlan.FlowVersion.MATERIAL_STOCK_V2)
     if scope == "factory":
         plans = plans.filter(factory_organization=identity.organization)
-        if role == "factory_sales":
-            plans = plans.filter(created_by=user)
+        if roles := effective_role_codes(identity):
+            # A senior manager assigned only the sales role sees the plans
+            # created by factory-sales users they directly invited. A second
+            # delegated factory role keeps its normal organization-wide scope.
+            other_factory_roles = FACTORY_ROLES - {"factory_sales"}
+            if "factory_sales" in roles and not (roles & other_factory_roles):
+                creator_ids = (
+                    delegated_role_user_ids(identity, "factory_sales")
+                    if identity.role.code in {"factory_senior_manager", "merchant_senior_manager"}
+                    else {identity.user_id}
+                )
+                plans = plans.filter(created_by_id__in=creator_ids)
         visibility = "factory_v2"
     elif scope == "merchant":
         plans = plans.filter(merchant_organization=identity.organization)

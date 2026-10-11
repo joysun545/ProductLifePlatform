@@ -30,6 +30,7 @@ from lifecycle.models import (
     FactoryReturnRepairMaterialRequirement,
     FactoryReturnWarrantyDispatch,
     GoodsTransfer,
+    GoodsTransferItem,
     GoodsTransferAccountCase,
     GoodsTransferCreditAllocation,
     LifecycleEvent,
@@ -136,6 +137,9 @@ class GoodsTransferApiTests(TestCase):
         )
         cls.child_b_owner = cls._user(
             "flow_child_b_owner", cls.child_b, cls.merchant_owner_role
+        )
+        cls.child_b_sales = cls._user(
+            "flow_child_b_sales", cls.child_b, cls.merchant_sales_role
         )
         cls.child_b_stock = cls._user(
             "flow_child_b_stock", cls.child_b, cls.merchant_stock_role
@@ -339,6 +343,309 @@ class GoodsTransferApiTests(TestCase):
             **self.auth(user),
         )
 
+    def test_releasing_scanning_draft_frees_devices_and_keeps_draft(self):
+        device = self.devices[0]
+        self.set_owner(device, self.parent)
+        flow = self.create_flow(
+            self.parent_owner,
+            {
+                "flow_type": "SHIPMENT",
+                "client_request_id": "shipment-release-scan-draft-1",
+                "target_account_id": self.child_b_owner.pk,
+            },
+        )
+
+        scanned = self.client.post(
+            f"{self.endpoint}{flow['id']}/scan/",
+            {"qr_text": device.qrcode.code},
+            **self.auth(self.parent_owner),
+        )
+        self.assertEqual(scanned.json()["code"], 0, scanned.json())
+        self.assertTrue(
+            GoodsTransferItem.objects.filter(
+                transfer_id=flow["id"], device=device
+            ).exists()
+        )
+
+        ownership_before = OrganizationDevice.objects.get(device=device)
+        state_before = DeviceState.objects.get(device=device)
+        lifecycle_event_count = LifecycleEvent.objects.filter(
+            device=device
+        ).count()
+
+        released = self.client.post(
+            f"{self.endpoint}{flow['id']}/release-scan/",
+            {},
+            **self.auth(self.parent_owner),
+        )
+        self.assertEqual(released.json()["code"], 0, released.json())
+        self.assertEqual(released.json()["data"]["released_count"], 1)
+        self.assertEqual(released.json()["data"]["item_count"], 0)
+
+        transfer = GoodsTransfer.objects.get(pk=flow["id"])
+        self.assertEqual(transfer.status, GoodsTransfer.Status.SCANNING)
+        self.assertFalse(transfer.items.exists())
+        ownership_after = OrganizationDevice.objects.get(device=device)
+        state_after = DeviceState.objects.get(device=device)
+        self.assertEqual(ownership_after.organization_id, ownership_before.organization_id)
+        self.assertEqual(ownership_after.status, ownership_before.status)
+        self.assertEqual(state_after.current_organization_id, state_before.current_organization_id)
+        self.assertEqual(state_after.status, state_before.status)
+        self.assertEqual(
+            LifecycleEvent.objects.filter(device=device).count(),
+            lifecycle_event_count,
+        )
+
+        next_flow = self.create_flow(
+            self.parent_owner,
+            {
+                "flow_type": "SHIPMENT",
+                "client_request_id": "shipment-release-scan-draft-2",
+                "target_account_id": self.child_b_owner.pk,
+            },
+        )
+        rescanned = self.client.post(
+            f"{self.endpoint}{next_flow['id']}/scan/",
+            {"qr_text": device.qrcode.code},
+            **self.auth(self.parent_owner),
+        )
+        self.assertEqual(rescanned.json()["code"], 0, rescanned.json())
+
+    def test_only_draft_initiator_can_release_scanned_devices(self):
+        device = self.devices[0]
+        self.set_owner(device, self.parent)
+        flow = self.create_flow(
+            self.parent_owner,
+            {
+                "flow_type": "SHIPMENT",
+                "client_request_id": "shipment-release-scan-owner-only",
+                "target_account_id": self.child_b_owner.pk,
+            },
+        )
+        self.assertTrue(flow["actions"]["can_delete"])
+        scanned = self.client.post(
+            f"{self.endpoint}{flow['id']}/scan/",
+            {"qr_text": device.qrcode.code},
+            **self.auth(self.parent_owner),
+        )
+        self.assertEqual(scanned.json()["code"], 0, scanned.json())
+
+        forbidden = self.client.post(
+            f"{self.endpoint}{flow['id']}/release-scan/",
+            {},
+            **self.auth(self.parent_sales),
+        )
+        self.assertEqual(forbidden.status_code, 409)
+        self.assertEqual(forbidden.json()["code"], 1)
+        self.assertTrue(
+            GoodsTransferItem.objects.filter(
+                transfer_id=flow["id"], device=device
+            ).exists()
+        )
+
+    def test_submitted_transfer_items_cannot_be_released(self):
+        device = self.devices[0]
+        self.set_owner(device, self.parent)
+        flow = self.create_flow(
+            self.parent_owner,
+            {
+                "flow_type": "SHIPMENT",
+                "client_request_id": "shipment-release-scan-after-submit",
+                "target_account_id": self.child_b_owner.pk,
+            },
+        )
+        scanned = self.client.post(
+            f"{self.endpoint}{flow['id']}/scan/",
+            {"qr_text": device.qrcode.code},
+            **self.auth(self.parent_owner),
+        )
+        self.assertEqual(scanned.json()["code"], 0, scanned.json())
+        submitted = self.submit_transfer(self.parent_owner, flow["id"])
+        self.assertEqual(submitted.json()["code"], 0, submitted.json())
+
+        release = self.client.post(
+            f"{self.endpoint}{flow['id']}/release-scan/",
+            {},
+            **self.auth(self.parent_owner),
+        )
+        self.assertEqual(release.status_code, 409)
+        transfer = GoodsTransfer.objects.get(pk=flow["id"])
+        self.assertEqual(transfer.status, GoodsTransfer.Status.PENDING_RECEIPT)
+        self.assertEqual(transfer.items.count(), 1)
+
+    def test_rescan_conflict_returns_link_to_callers_existing_draft(self):
+        device = self.devices[0]
+        self.set_owner(device, self.parent)
+        first_flow = self.create_flow(
+            self.parent_owner,
+            {
+                "flow_type": "SHIPMENT",
+                "client_request_id": "shipment-rescan-existing-draft-1",
+                "target_account_id": self.child_b_owner.pk,
+            },
+        )
+        scanned = self.client.post(
+            f"{self.endpoint}{first_flow['id']}/scan/",
+            {"qr_text": device.qrcode.code},
+            **self.auth(self.parent_owner),
+        )
+        self.assertEqual(scanned.json()["code"], 0, scanned.json())
+
+        second_flow = self.create_flow(
+            self.parent_owner,
+            {
+                "flow_type": "SHIPMENT",
+                "client_request_id": "shipment-rescan-existing-draft-2",
+                "target_account_id": self.child_c_owner.pk,
+            },
+        )
+        conflict = self.client.post(
+            f"{self.endpoint}{second_flow['id']}/scan/",
+            {"qr_text": device.qrcode.code},
+            **self.auth(self.parent_owner),
+        )
+
+        self.assertEqual(conflict.status_code, 409)
+        payload = conflict.json()
+        self.assertEqual(
+            payload["data"]["reason_code"],
+            "DEVICE_IN_UNFINISHED_GOODS_TRANSFER",
+        )
+        self.assertEqual(
+            payload["data"]["conflict_transfer"],
+            {
+                "id": first_flow["id"],
+                "flow_no": first_flow["flow_no"],
+                "can_continue": True,
+            },
+        )
+        self.assertEqual(
+            GoodsTransferItem.objects.filter(device=device).count(),
+            1,
+        )
+
+    def test_delete_unsubmitted_draft_removes_only_draft_and_allows_rescan(self):
+        device = self.devices[0]
+        self.set_owner(device, self.parent)
+        flow = self.create_flow(
+            self.parent_owner,
+            {
+                "flow_type": "SHIPMENT",
+                "client_request_id": "shipment-delete-scan-draft-1",
+                "target_account_id": self.child_b_owner.pk,
+            },
+        )
+        self.assertTrue(flow["actions"]["can_delete"])
+        scanned = self.client.post(
+            f"{self.endpoint}{flow['id']}/scan/",
+            {"qr_text": device.qrcode.code},
+            **self.auth(self.parent_owner),
+        )
+        self.assertEqual(scanned.json()["code"], 0, scanned.json())
+
+        ownership_before = OrganizationDevice.objects.get(device=device)
+        state_before = DeviceState.objects.get(device=device)
+        events_before = LifecycleEvent.objects.filter(device=device).count()
+        deleted = self.client.delete(
+            f"{self.endpoint}{flow['id']}/",
+            **self.auth(self.parent_owner),
+        )
+
+        self.assertEqual(deleted.status_code, 200, deleted.json())
+        self.assertEqual(deleted.json()["data"]["deleted_item_count"], 1)
+        self.assertFalse(GoodsTransfer.objects.filter(pk=flow["id"]).exists())
+        self.assertFalse(
+            GoodsTransferItem.objects.filter(transfer_id=flow["id"]).exists()
+        )
+        ownership_after = OrganizationDevice.objects.get(device=device)
+        state_after = DeviceState.objects.get(device=device)
+        self.assertEqual(
+            ownership_after.organization_id,
+            ownership_before.organization_id,
+        )
+        self.assertEqual(ownership_after.status, ownership_before.status)
+        self.assertEqual(
+            state_after.current_organization_id,
+            state_before.current_organization_id,
+        )
+        self.assertEqual(state_after.status, state_before.status)
+        self.assertEqual(LifecycleEvent.objects.filter(device=device).count(), events_before)
+
+        next_flow = self.create_flow(
+            self.parent_owner,
+            {
+                "flow_type": "SHIPMENT",
+                "client_request_id": "shipment-delete-scan-draft-2",
+                "target_account_id": self.child_b_owner.pk,
+            },
+        )
+        rescanned = self.client.post(
+            f"{self.endpoint}{next_flow['id']}/scan/",
+            {"qr_text": device.qrcode.code},
+            **self.auth(self.parent_owner),
+        )
+        self.assertEqual(rescanned.json()["code"], 0, rescanned.json())
+
+    def test_only_draft_initiator_can_delete_unsubmitted_transfer(self):
+        device = self.devices[0]
+        self.set_owner(device, self.parent)
+        flow = self.create_flow(
+            self.parent_owner,
+            {
+                "flow_type": "SHIPMENT",
+                "client_request_id": "shipment-delete-scan-owner-only",
+                "target_account_id": self.child_b_owner.pk,
+            },
+        )
+        denied = self.client.delete(
+            f"{self.endpoint}{flow['id']}/",
+            **self.auth(self.parent_sales),
+        )
+
+        self.assertEqual(denied.status_code, 409)
+        self.assertTrue(GoodsTransfer.objects.filter(pk=flow["id"]).exists())
+
+    def test_submitted_transfer_cannot_be_deleted_as_scan_draft(self):
+        device = self.devices[0]
+        self.set_owner(device, self.parent)
+        flow = self.create_flow(
+            self.parent_owner,
+            {
+                "flow_type": "SHIPMENT",
+                "client_request_id": "shipment-delete-after-submit",
+                "target_account_id": self.child_b_owner.pk,
+            },
+        )
+        scanned = self.client.post(
+            f"{self.endpoint}{flow['id']}/scan/",
+            {"qr_text": device.qrcode.code},
+            **self.auth(self.parent_owner),
+        )
+        self.assertEqual(scanned.json()["code"], 0, scanned.json())
+        submitted = self.submit_transfer(self.parent_owner, flow["id"])
+        self.assertEqual(submitted.json()["code"], 0, submitted.json())
+
+        denied = self.client.delete(
+            f"{self.endpoint}{flow['id']}/",
+            **self.auth(self.parent_owner),
+        )
+
+        self.assertEqual(denied.status_code, 409)
+        self.assertEqual(
+            GoodsTransfer.objects.get(pk=flow["id"]).status,
+            GoodsTransfer.Status.PENDING_RECEIPT,
+        )
+        self.assertEqual(
+            GoodsTransferItem.objects.filter(transfer_id=flow["id"]).count(),
+            1,
+        )
+        detail = self.client.get(
+            f"{self.endpoint}{flow['id']}/",
+            **self.auth(self.parent_owner),
+        )
+        self.assertEqual(detail.json()["code"], 0, detail.json())
+        self.assertFalse(detail.json()["data"]["actions"]["can_delete"])
+
     def test_shipment_requires_receiver_confirmation_before_ownership_moves(self):
         device = self.devices[0]
         self.set_owner(device, self.parent)
@@ -383,6 +690,13 @@ class GoodsTransferApiTests(TestCase):
             )
         )
 
+        sales_receipt = self.client.post(
+            f"{self.endpoint}{flow['id']}/receipt/",
+            {},
+            **self.auth(self.child_b_sales),
+        )
+        self.assertEqual(sales_receipt.json()["code"], 1, sales_receipt.json())
+
         receipt = self.client.post(
             f"{self.endpoint}{flow['id']}/receipt/",
             {},
@@ -400,6 +714,22 @@ class GoodsTransferApiTests(TestCase):
             "DONE",
         )
 
+    def test_sales_can_only_start_the_transfer_flow(self):
+        capability = self.client.get(
+            f"{self.endpoint}options/?flow_type=CAPABILITIES",
+            **self.auth(self.parent_sales),
+        )
+        self.assertEqual(capability.json()["code"], 0, capability.json())
+        self.assertEqual(
+            capability.json()["data"]["available_flow_types"], ["TRANSFER"]
+        )
+        for flow_type in ("SHIPMENT", "RETURN"):
+            response = self.client.get(
+                f"{self.endpoint}options/?flow_type={flow_type}",
+                **self.auth(self.parent_sales),
+            )
+            self.assertEqual(response.json()["code"], 1, response.json())
+
     def test_return_to_upstream_merchant_waits_for_receipt_then_moves_owner(self):
         device = self.devices[0]
         self.set_owner(device, self.child_b)
@@ -416,6 +746,15 @@ class GoodsTransferApiTests(TestCase):
         ownership = OrganizationDevice.objects.get(device=device)
         self.assertEqual(ownership.organization, self.child_b)
         self.assertEqual(ownership.status, "RETURNED")
+
+        sales_receipt = self.client.post(
+            f"{self.endpoint}{flow['id']}/receipt/",
+            {},
+            **self.auth(self.parent_sales),
+        )
+        self.assertEqual(sales_receipt.json()["code"], 1, sales_receipt.json())
+        ownership.refresh_from_db()
+        self.assertEqual(ownership.organization, self.child_b)
 
         receipt = self.client.post(
             f"{self.endpoint}{flow['id']}/receipt/",

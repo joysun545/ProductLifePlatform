@@ -47,7 +47,7 @@ def _direct_owner(device):
     return None
 
 
-def _parent_relation(organization_id):
+def _parent_relation(organization_id, factory_root_id=None):
     """
     返回当前有效的直接经销上级。
 
@@ -55,21 +55,22 @@ def _parent_relation(organization_id):
     多条，采用最后建立的一条，保证扫码、统计和任务推送得到同一结果。
     """
 
-    return (
-        OrganizationRelation.objects.select_related(
+    relations = OrganizationRelation.objects.select_related(
             "source_organization__organization_type",
             "target_organization__organization_type",
             "created_by_invitation__inviter",
-        )
-        .filter(
+        ).filter(
             target_organization_id=organization_id,
             relation_type=OrganizationRelationType.DISTRIBUTION,
             is_active=True,
             source_organization__is_active=True,
         )
-        .order_by("-created_at", "-id")
-        .first()
-    )
+    if factory_root_id is not None:
+        relations = relations.filter(
+            source_organization__factory_root_id=factory_root_id,
+            target_organization__factory_root_id=factory_root_id,
+        )
+    return relations.order_by("-created_at", "-id").first()
 
 
 def _upstream_identity(relation, device=None):
@@ -116,12 +117,22 @@ def _build_links(direct_owner, device=None):
     if not direct_owner:
         return ()
 
+    factory_root = direct_owner.get_factory_root()
+    if device is not None:
+        manufacturer = device.batch.manufacturer
+        device_root = manufacturer.get_factory_root()
+        if not device_root or (factory_root and device_root.pk != factory_root.pk):
+            return ()
+        factory_root = device_root
+    if not factory_root:
+        return ()
+
     links = []
     visited = {direct_owner.pk}
     current_id = direct_owner.pk
 
     for _depth in range(MAX_OWNERSHIP_DEPTH):
-        relation = _parent_relation(current_id)
+        relation = _parent_relation(current_id, factory_root.pk)
         if not relation:
             break
         if relation.source_organization_id in visited:

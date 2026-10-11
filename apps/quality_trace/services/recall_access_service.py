@@ -8,13 +8,18 @@ from functools import cached_property
 from django.db.models import Q
 from account.models import OrganizationRelation
 from account.services.auth_service import get_active_identity
+from account.services.role_delegation_service import (
+    SENIOR_MANAGER_ROLE_CODES,
+    effective_role_codes,
+)
 from lifecycle.models import CustomerDeviceBinding, DriverVehicleBinding
 from quality_trace.models import QualityRecallCampaign
+from workflow.models import UserTask
 
 FACTORY_FULL_RECALL_ROLES = {
     "factory_chief_engineer", "factory_sales_assistant", "factory_logistics",
 }
-FACTORY_RECALL_OBSERVER_ROLES = {"factory_admin", "factory_manager", "factory_senior_manager"}
+FACTORY_RECALL_OBSERVER_ROLES = {"factory_admin", "factory_manager"}
 FACTORY_SCOPED_RECALL_ROLES = {"factory_sales", "factory_production", "factory_matching"}
 FACTORY_RECALL_VIEW_ROLES = FACTORY_FULL_RECALL_ROLES | FACTORY_SCOPED_RECALL_ROLES | FACTORY_RECALL_OBSERVER_ROLES
 MERCHANT_RECALL_ROLES = {
@@ -31,7 +36,37 @@ class RecallViewer:
         self.identity = get_active_identity(user) if user and user.is_active else None
         self.organization_id = self.identity.organization_id if self.identity else None
         self.role = self.identity.role.code if self.identity else ""
+        self.roles = effective_role_codes(self.identity)
         self.kind = self.identity.organization.organization_type.code if self.identity else ""
+
+    def has_role(self, role_codes):
+        if isinstance(role_codes, str):
+            role_codes = {role_codes}
+        return bool(self.roles & set(role_codes or ()))
+
+    @cached_property
+    def open_action_task_keys(self):
+        if not self.identity or self.role not in SENIOR_MANAGER_ROLE_CODES:
+            return set()
+        openid = (self.user.wx_openid or "").strip()
+        if not openid:
+            return set()
+        return set(UserTask.objects.filter(
+            to_openid=openid,
+            workitem__status="OPEN",
+            need_action=True,
+            state__in=("NEW", "READ"),
+        ).values_list("workitem__uniq_key", flat=True))
+
+    def has_action_task_copy(self, uniq_keys):
+        if isinstance(uniq_keys, str):
+            uniq_keys = {uniq_keys}
+        keys = {str(value) for value in (uniq_keys or ())}
+        if not self.identity or not keys:
+            return False
+        if self.role not in SENIOR_MANAGER_ROLE_CODES:
+            return True
+        return bool(self.open_action_task_keys & keys)
 
     @property
     def valid(self):
@@ -41,15 +76,15 @@ class RecallViewer:
     def factory(self, campaign):
         return bool(self.valid and self.kind == "OWNER"
                     and self.organization_id == campaign.factory_organization_id
-                    and self.role in FACTORY_FULL_RECALL_ROLES | FACTORY_SCOPED_RECALL_ROLES)
+                    and bool(self.roles & (FACTORY_FULL_RECALL_ROLES | FACTORY_SCOPED_RECALL_ROLES)))
 
     def full_campaign(self, campaign):
-        return self.factory(campaign) and self.role in FACTORY_FULL_RECALL_ROLES
+        return self.factory(campaign) and bool(self.roles & FACTORY_FULL_RECALL_ROLES)
 
     def observer(self, campaign):
         return bool(self.valid and self.kind == "OWNER"
                     and self.organization_id == campaign.factory_organization_id
-                    and self.role in FACTORY_RECALL_OBSERVER_ROLES)
+                    and bool(self.roles & FACTORY_RECALL_OBSERVER_ROLES))
 
     def metadata_access(self, campaign):
         return self.full_campaign(campaign) or self.observer(campaign)
@@ -58,16 +93,25 @@ class RecallViewer:
     def sales_merchant_ids(self):
         # Current channel ownership belongs to the stable account/role slot,
         # not a WeChat identifier or a campaign-wide notification recipient.
+        from account.services.role_delegation_service import delegated_role_user_ids
+
+        sales_user_ids = (
+            delegated_role_user_ids(self.identity, "factory_sales")
+            if self.role in {"factory_senior_manager", "merchant_senior_manager"}
+            else {self.user.pk}
+        )
+        if not sales_user_ids:
+            return set()
         relations = OrganizationRelation.objects.filter(
             is_active=True, relation_type="DISTRIBUTION",
             target_organization__organization_type__code="MERCHANT",
             target_organization__is_active=True,
         )
         direct = relations.filter(source_organization_id=self.organization_id).filter(
-            Q(merchant_channel_assignment__assigned_by=self.user,
+            Q(merchant_channel_assignment__assigned_by_id__in=sales_user_ids,
               merchant_channel_assignment__is_active=True)
             | Q(merchant_channel_assignment__isnull=True,
-                created_by_invitation__inviter=self.user,
+                created_by_invitation__inviter_id__in=sales_user_ids,
                 created_by_invitation__inviter_role__code="factory_sales",
                 created_by_invitation__status="accepted")
         )
@@ -84,7 +128,7 @@ class RecallViewer:
             return True
         if not self.factory(row.campaign):
             return False
-        if self.role == "factory_sales":
+        if "factory_sales" in self.roles:
             groups = (row.responsibility_snapshot or {}).get("groups", [])
             merchant_ids = {str(value) for value in self.sales_merchant_ids}
             return any(group.get("organization_type") == "MERCHANT"
@@ -92,9 +136,9 @@ class RecallViewer:
         disposition = getattr(row, "post_disposition", None)
         if not disposition:
             return False
-        if self.role == "factory_production":
+        if "factory_production" in self.roles:
             return True  # Every issued disposition has a production execution node.
-        if self.role == "factory_matching":
+        if "factory_matching" in self.roles:
             return (disposition.method == "REPAIR_WITH_PARTS"
                     or (disposition.method == "DISASSEMBLE" and disposition.status == "COMPLETED"))
         return False
@@ -147,7 +191,7 @@ class RecallViewer:
                     driver=self.user, is_active=True,
                 ).values_list("vehicle_id", flat=True),
             ).exists())
-        if self.kind == "MERCHANT" and self.role in MERCHANT_RECALL_ROLES:
+        if self.kind == "MERCHANT" and bool(self.roles & MERCHANT_RECALL_ROLES):
             groups = (row.responsibility_snapshot or {}).get("groups", [])
             if any(str(group.get("organization_id")) == str(self.organization_id)
                    and group.get("organization_type") == "MERCHANT"

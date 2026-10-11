@@ -6,6 +6,10 @@ from django.db.models import Max
 from django.utils import timezone
 
 from account.services.auth_service import get_active_identity
+from account.services.role_delegation_service import (
+    has_open_action_task_copy,
+    identity_has_role,
+)
 from lifecycle.models import CustomerDeviceBinding, DriverVehicleBinding
 from quality_trace.models import (
     QualityRecallCampaign,
@@ -59,6 +63,11 @@ def _active_identity(user):
     return identity
 
 
+def _require_manager_task_copy(identity, *uniq_keys):
+    if not has_open_action_task_copy(identity, uniq_keys):
+        raise QualityRecallError("当前高级经理没有收到这项召回协同任务。")
+
+
 def _ensure_active_handover(handover):
     if (handover.campaign.status != QualityRecallCampaign.Status.ACTIVE
             or handover.status == QualityRecallCustomerHandover.Status.CANCELLED):
@@ -70,7 +79,7 @@ def _customer_identity(user, handover):
     identity = _active_identity(user)
     if (
         identity.organization_id != handover.customer_organization_id
-        or identity.role.code not in CUSTOMER_HANDOVER_ROLES
+        or not identity_has_role(identity, CUSTOMER_HANDOVER_ROLES)
     ):
         raise QualityRecallError("只有设备所属用户负责人或关联共享司机可以处理召回交接。")
     if identity.role.code == "driver":
@@ -486,9 +495,10 @@ def accept_factory_pickup_request(
     _ensure_active_handover(handover)
     if (
         identity.organization_id != handover.campaign.factory_organization_id
-        or identity.role.code not in FACTORY_PICKUP_ROLES
+        or not identity_has_role(identity, FACTORY_PICKUP_ROLES)
     ):
         raise QualityRecallError("只有厂家总工程师或厂家物流经理可以受理上门取件。")
+    _require_manager_task_copy(identity, f"quality-recall-pickup:{handover.pk}")
     if handover.delivery_method != QualityRecallCustomerHandover.DeliveryMethod.FACTORY_PICKUP:
         raise QualityRecallError("该设备未选择厂家上门取件。")
     if handover.method_locked_at:
@@ -710,9 +720,14 @@ def accept_merchant_handover_by_token(*, user, token, receipt_note=""):
     _ensure_active_handover(handover)
     if (
         identity.organization_id != handover.merchant_organization_id
-        or identity.role.code not in MERCHANT_HANDOVER_ROLES
+        or not identity_has_role(identity, MERCHANT_HANDOVER_ROLES)
     ):
         raise QualityRecallError("只有该设备来源商家的授权岗位可以扫码接管。")
+    _require_manager_task_copy(
+        identity,
+        f"quality-recall-merchant-return:{handover.recall_device_id}:org:{handover.merchant_organization_id}",
+        f"quality-recall:{handover.campaign_id}:org:{handover.merchant_organization_id}",
+    )
     if handover.delivery_method != QualityRecallCustomerHandover.DeliveryMethod.MERCHANT_HANDOVER:
         raise QualityRecallError("用户当前未选择商家接管。")
     if handover.method_locked_at:
@@ -838,9 +853,14 @@ def schedule_customer_pickup(*, user, handover_id, pickup_scheduled_at, pickup_a
     _ensure_active_handover(handover)
     if (
         identity.organization_id != handover.merchant_organization_id
-        or identity.role.code not in MERCHANT_HANDOVER_ROLES
+        or not identity_has_role(identity, MERCHANT_HANDOVER_ROLES)
     ):
         raise QualityRecallError("只有来源商家的负责人、管理人员或销售可以预约取回。")
+    _require_manager_task_copy(
+        identity,
+        f"quality-recall-merchant-return:{handover.recall_device_id}:org:{handover.merchant_organization_id}",
+        f"quality-recall:{handover.campaign_id}:org:{handover.merchant_organization_id}",
+    )
     if handover.status != QualityRecallCustomerHandover.Status.ACKNOWLEDGED:
         raise QualityRecallError("用户确认召回后才能预约取回。")
     address = str(pickup_address or "").strip()
@@ -867,8 +887,14 @@ def add_handover_evidence(*, user, handover_id, kind, client_request_id, evidenc
     if identity.organization_id == handover.customer_organization_id:
         _customer_identity(user, handover)
     elif (identity.organization_id != handover.merchant_organization_id
-          or identity.role.code not in MERCHANT_HANDOVER_ROLES):
+          or not identity_has_role(identity, MERCHANT_HANDOVER_ROLES)):
         raise QualityRecallError("当前岗位无权提交该召回交接凭证。")
+    else:
+        _require_manager_task_copy(
+            identity,
+            f"quality-recall-merchant-return:{handover.recall_device_id}:org:{handover.merchant_organization_id}",
+            f"quality-recall:{handover.campaign_id}:org:{handover.merchant_organization_id}",
+        )
     data = dict(evidence or {})
     storage_key = str(data.get("storage_key") or "").strip()
     request_id = str(client_request_id or "").strip()
@@ -902,9 +928,14 @@ def confirm_merchant_handover_receipt(*, user, handover_id, receipt_note):
     _ensure_active_handover(handover)
     if (
         identity.organization_id != handover.merchant_organization_id
-        or identity.role.code not in MERCHANT_HANDOVER_ROLES
+        or not identity_has_role(identity, MERCHANT_HANDOVER_ROLES)
     ):
         raise QualityRecallError("只有来源商家的授权岗位可以验收召回设备。")
+    _require_manager_task_copy(
+        identity,
+        f"quality-recall-merchant-return:{handover.recall_device_id}:org:{handover.merchant_organization_id}",
+        f"quality-recall:{handover.campaign_id}:org:{handover.merchant_organization_id}",
+    )
     if handover.status != QualityRecallCustomerHandover.Status.PICKUP_SCHEDULED:
         raise QualityRecallError("只有已预约取回的设备可以验收接管。")
     if not handover.evidence.filter(

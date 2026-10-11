@@ -2,6 +2,8 @@ from dataclasses import dataclass
 
 from account.models import UserOrganization
 
+from account.services.auth_service import get_active_identity
+
 
 class StatisticsAccessError(Exception):
     pass
@@ -20,14 +22,11 @@ class StatisticsIdentity:
 
 
 def get_statistics_identity(user):
-    identity = (
-        UserOrganization.objects
-        .select_related("organization__organization_type", "role")
-        .filter(user=user, user__is_active=True, is_active=True)
-        .first()
-    )
+    identity = get_active_identity(user)
     if not identity:
-        raise StatisticsAccessError("当前账号没有有效的组织岗位，无法查看数据统计。")
+        raise StatisticsAccessError(
+            "当前账号没有归属明确厂家链路的有效组织岗位，无法查看数据统计。"
+        )
     if identity.organization.organization_type.code == "CUSTOMER":
         raise StatisticsAccessError("用户账号请从‘我的设备与服务’查看个人数据。")
     return StatisticsIdentity(user, identity, identity.organization, identity.role)

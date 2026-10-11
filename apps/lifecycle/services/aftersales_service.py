@@ -11,6 +11,11 @@ from django.utils import timezone
 
 from account.models import Organization, OrganizationRelation, OrganizationRelationType, UserOrganization
 from account.services.auth_service import get_active_identity
+from account.services.role_delegation_service import (
+    SENIOR_MANAGER_ROLE_CODES,
+    has_open_action_task_copy,
+    identity_has_role,
+)
 from lifecycle.models import (
     AfterSalesApplication,
     AfterSalesEvent,
@@ -351,6 +356,49 @@ class AfterSalesService:
         )
 
     @classmethod
+    def _is_factory_aftersales(cls, application, user, identity=None):
+        identity = identity if identity is not None else cls._identity(user)
+        return bool(
+            identity
+            and identity.organization_id == application.factory_organization_id
+            and identity_has_role(identity, "factory_aftersales")
+        )
+
+    @classmethod
+    def _has_open_factory_workorder_task(cls, application, user):
+        openid = (getattr(user, "wx_openid", "") or "").strip()
+        if not openid:
+            return False
+        return UserTask.objects.filter(
+            to_openid=openid,
+            workitem__uniq_key=(
+                f"aftersales:{application.id}:{cls.FACTORY_WORKORDER_STEP}"
+            ),
+            workitem__status="OPEN",
+            need_action=True,
+            state__in=("NEW", "READ"),
+        ).exists()
+
+    @classmethod
+    def _can_process_factory_workorder(cls, application, user, identity=None):
+        identity = identity if identity is not None else cls._identity(user)
+        if cls._is_factory_aftersales(application, user, identity):
+            if identity.role.code in SENIOR_MANAGER_ROLE_CODES:
+                return has_open_action_task_copy(
+                    identity,
+                    uniq_keys=[
+                        f"aftersales:{application.id}:{cls.FACTORY_WORKORDER_STEP}"
+                    ],
+                )
+            return True
+        # Keep already-issued sales-manager tasks actionable during rollout.
+        # New applications never send this task to factory sales.
+        return bool(
+            cls._is_factory_sales(application, user, identity)
+            and cls._has_open_factory_workorder_task(application, user)
+        )
+
+    @classmethod
     def _is_applicant(cls, application, user):
         return application.applicant_id == user.id
 
@@ -365,13 +413,14 @@ class AfterSalesService:
             cls._is_applicant(application, user)
             or cls._is_assignee(application, user)
             or cls._is_factory_sales(application, user, identity)
+            or cls._is_factory_aftersales(application, user, identity)
         )
 
     @classmethod
-    def _require_factory_sales(cls, application, user):
+    def _require_factory_aftersales(cls, application, user):
         identity = cls._identity(user)
-        if not cls._is_factory_sales(application, user, identity):
-            raise AfterSalesError("仅对应厂家销售经理可以处理该售后申请")
+        if not cls._can_process_factory_workorder(application, user, identity):
+            raise AfterSalesError("仅对应厂家售后经理、其分管高级经理或持有旧待办的厂家销售经理可以处理该售后申请")
         return identity
 
     @classmethod
@@ -529,7 +578,7 @@ class AfterSalesService:
         )
         if not application:
             raise AfterSalesError("售后申请不存在")
-        cls._require_factory_sales(application, user)
+        cls._require_factory_aftersales(application, user)
         if application.status != AfterSalesApplication.Status.SUBMITTED:
             raise AfterSalesError("该售后申请当前不能重新判断或派单")
         return {
@@ -589,7 +638,7 @@ class AfterSalesService:
                 AfterSalesMedia.Purpose.THIRD_PARTY_FEE_VOUCHER,
                 AfterSalesMedia.Purpose.THIRD_PARTY_FAULT_MATERIAL_RETURN_DOCUMENT,
             }
-            and cls._is_factory_sales(application, user)
+            and cls._can_process_factory_workorder(application, user)
             and application.dispatch_route
             == AfterSalesApplication.DispatchRoute.THIRD_PARTY
             and application.execution_stage
@@ -711,11 +760,11 @@ class AfterSalesService:
         return cls.serialize_media(media)
 
     @classmethod
-    def _factory_sales_openids(cls, application):
+    def _factory_aftersales_openids(cls, application):
         return list(
             UserOrganization.objects.filter(
                 organization_id=application.factory_organization_id,
-                role__code="factory_sales",
+                role__code="factory_aftersales",
                 is_active=True,
                 user__is_active=True,
                 role__is_active=True,
@@ -885,7 +934,7 @@ class AfterSalesService:
         )
 
     @classmethod
-    def _publish_factory_sales_notice(cls, application, *, topic, title, summary, actor_openid=""):
+    def _publish_factory_aftersales_notice(cls, application, *, topic, title, summary, actor_openid=""):
         return cls._publish_factory_workorder(
             application,
             topic=topic,
@@ -908,7 +957,7 @@ class AfterSalesService:
             title=title,
             summary=summary,
             link=cls._link(application),
-            recipients_openids=cls._factory_sales_openids(application),
+            recipients_openids=cls._factory_aftersales_openids(application),
             need_action=need_action,
             action_mode="ANYONE_DO",
             payload=cls._task_payload(
@@ -1064,9 +1113,9 @@ class AfterSalesService:
             ),
         ).exists():
             raise AfterSalesError("请至少上传一张图片或一段视频")
-        recipients = cls._factory_sales_openids(application)
+        recipients = cls._factory_aftersales_openids(application)
         if not recipients:
-            raise AfterSalesError("厂家尚未配置销售经理，暂不能提交")
+            raise AfterSalesError("厂家尚未配置厂家售后经理，暂不能提交")
         application.status = AfterSalesApplication.Status.SUBMITTED
         application.execution_stage = AfterSalesApplication.ExecutionStage.NONE
         application.submitted_at = timezone.now()
@@ -1090,7 +1139,7 @@ class AfterSalesService:
             application,
             topic="submitted",
             title="售后申请已提交",
-            summary=f"{cls._summary(application)}｜等待厂家销售经理判断",
+            summary=f"{cls._summary(application)}｜等待厂家售后经理判断",
             actor_openid=user.wx_openid or "",
         )
         cls._event(application, "SUBMITTED", user=user, identity=identity)
@@ -1306,7 +1355,7 @@ class AfterSalesService:
         )
         if not application:
             raise AfterSalesError("售后申请不存在")
-        identity = cls._require_factory_sales(application, user)
+        identity = cls._require_factory_aftersales(application, user)
         if application.status != AfterSalesApplication.Status.SUBMITTED:
             raise AfterSalesError("该售后申请已经完成判断或派单")
 
@@ -1473,7 +1522,7 @@ class AfterSalesService:
             AfterSalesApplication.ExecutionStage.THIRD_PARTY_REPAIR
         )
         application.save()
-        recipients = cls._factory_sales_openids(application)
+        recipients = cls._factory_aftersales_openids(application)
         cls._publish_factory_workorder(
             application,
             topic="third-party-material-shipment-required",
@@ -1730,7 +1779,7 @@ class AfterSalesService:
                 "repair_materials": repair_materials,
             },
         )
-        cls._publish_factory_sales_notice(
+        cls._publish_factory_aftersales_notice(
             application,
             topic="repair-completed",
             title="维修执行人已确认处理完成",
@@ -1816,7 +1865,7 @@ class AfterSalesService:
             actor_openid=user.wx_openid or "",
             need_action=True,
         )
-        cls._publish_factory_sales_notice(
+        cls._publish_factory_aftersales_notice(
             application,
             topic="return-shipped",
             title="维修设备已寄回，待发起人确认",
@@ -1827,7 +1876,7 @@ class AfterSalesService:
 
     @classmethod
     def _send_factory_close_task(cls, application, *, actor_openid="", title="售后待最终归因结案"):
-        recipients = cls._factory_sales_openids(application)
+        recipients = cls._factory_aftersales_openids(application)
         cls._publish_factory_workorder(
             application,
             topic="factory-close-required",
@@ -1894,7 +1943,7 @@ class AfterSalesService:
         )
         if not application:
             raise AfterSalesError("售后申请不存在")
-        identity = cls._require_factory_sales(application, user)
+        identity = cls._require_factory_aftersales(application, user)
         if (
             application.dispatch_route != AfterSalesApplication.DispatchRoute.THIRD_PARTY
             or application.execution_stage
@@ -1951,7 +2000,7 @@ class AfterSalesService:
         )
         if not application:
             raise AfterSalesError("售后申请不存在")
-        identity = cls._require_factory_sales(application, user)
+        identity = cls._require_factory_aftersales(application, user)
         if (
             application.dispatch_route != AfterSalesApplication.DispatchRoute.THIRD_PARTY
             or application.execution_stage
@@ -2005,7 +2054,7 @@ class AfterSalesService:
         )
         if not application:
             raise AfterSalesError("售后申请不存在")
-        identity = cls._require_factory_sales(application, user)
+        identity = cls._require_factory_aftersales(application, user)
         if (
             application.dispatch_route != AfterSalesApplication.DispatchRoute.THIRD_PARTY
             or application.execution_stage
@@ -2396,7 +2445,7 @@ class AfterSalesService:
         )
         if not application:
             raise AfterSalesError("售后申请不存在")
-        identity = cls._require_factory_sales(application, user)
+        identity = cls._require_factory_aftersales(application, user)
         if (
             application.status != AfterSalesApplication.Status.PENDING_FACTORY_CLOSE
             or application.execution_stage
@@ -2539,7 +2588,9 @@ class AfterSalesService:
     def _viewer_actions(cls, application, user, identity):
         applicant = cls._is_applicant(application, user)
         assignee = cls._is_assignee(application, user)
-        factory_sales = cls._is_factory_sales(application, user, identity)
+        factory_aftersales = cls._can_process_factory_workorder(
+            application, user, identity
+        )
         stage = application.execution_stage
         third_party_stage = (
             application.dispatch_route == AfterSalesApplication.DispatchRoute.THIRD_PARTY
@@ -2552,7 +2603,7 @@ class AfterSalesService:
             application, "THIRD_PARTY_EXPENSE_RECORDED"
         ) if third_party_stage else False
         actions = {
-            "can_triage": factory_sales
+            "can_triage": factory_aftersales
             and application.status == AfterSalesApplication.Status.SUBMITTED,
             "can_applicant_shipment": applicant
             and stage == AfterSalesApplication.ExecutionStage.AWAITING_APPLICANT_SHIPMENT,
@@ -2568,14 +2619,14 @@ class AfterSalesService:
             and stage == AfterSalesApplication.ExecutionStage.AWAITING_RETURN_SHIPMENT,
             "can_applicant_confirm": applicant
             and stage == AfterSalesApplication.ExecutionStage.AWAITING_APPLICANT_CONFIRM,
-            "can_factory_close": factory_sales
+            "can_factory_close": factory_aftersales
             and stage == AfterSalesApplication.ExecutionStage.FINAL_DIAGNOSIS
             and application.status == AfterSalesApplication.Status.PENDING_FACTORY_CLOSE,
-            "can_third_party_material_shipment": factory_sales and third_party_stage
+            "can_third_party_material_shipment": factory_aftersales and third_party_stage
             and not third_party_material_done,
-            "can_third_party_expense": factory_sales and third_party_stage
+            "can_third_party_expense": factory_aftersales and third_party_stage
             and third_party_material_done and not third_party_expense_done,
-            "can_third_party_fault_material_return": factory_sales and third_party_stage
+            "can_third_party_fault_material_return": factory_aftersales and third_party_stage
             and third_party_expense_done,
         }
         actions["allowed_media_purposes"] = [
@@ -2586,7 +2637,16 @@ class AfterSalesService:
         return actions
 
     @classmethod
-    def _viewer_stage(cls, application, *, applicant, assignee, factory_sales, actions):
+    def _viewer_stage(
+        cls,
+        application,
+        *,
+        applicant,
+        assignee,
+        factory_sales,
+        factory_aftersales,
+        actions,
+    ):
         """Describe the current node from this viewer's perspective."""
 
         stage = application.execution_stage
@@ -2629,7 +2689,7 @@ class AfterSalesService:
 
         waiting = {
             AfterSalesApplication.ExecutionStage.NONE: (
-                "等待厂家销售经理判断并指派", "厂家尚未完成故障认定。"
+                "等待厂家售后经理判断并指派", "厂家尚未完成故障认定。"
             ),
             AfterSalesApplication.ExecutionStage.AWAITING_APPLICANT_SHIPMENT: (
                 "等待售后发起人寄送设备", "发起人尚未上传物流单据并确认寄送。"
@@ -2647,7 +2707,7 @@ class AfterSalesService:
                 "等待售后发起人确认结果", "设备处理结果等待发起人确认。"
             ),
             AfterSalesApplication.ExecutionStage.FINAL_DIAGNOSIS: (
-                "等待厂家完成最终归因", "厂家销售经理将确认故障物料、类型和解决方案。"
+                "等待厂家完成最终归因", "厂家售后经理将确认故障物料、类型和解决方案。"
             ),
         }
         title, message = waiting.get(stage, ("售后处理中", "请查看最新处理记录。"))
@@ -2668,7 +2728,7 @@ class AfterSalesService:
 
         # A viewer who is involved but has no current action sees the actual
         # counterparty that owns this node.
-        if applicant or assignee or factory_sales:
+        if applicant or assignee or factory_sales or factory_aftersales:
             return {
                 "mode": "WAITING",
                 "badge": title,
@@ -2709,10 +2769,14 @@ class AfterSalesService:
         is_applicant = cls._is_applicant(application, user)
         is_assignee = cls._is_assignee(application, user)
         is_factory_sales = cls._is_factory_sales(application, user, identity)
+        is_factory_aftersales = cls._is_factory_aftersales(
+            application, user, identity
+        )
         data["viewer"] = {
             "is_applicant": is_applicant,
             "is_assignee": is_assignee,
             "is_factory_sales": is_factory_sales,
+            "is_factory_aftersales": is_factory_aftersales,
         }
         data["actions"] = cls._viewer_actions(application, user, identity)
         data["viewer_stage"] = cls._viewer_stage(
@@ -2720,6 +2784,7 @@ class AfterSalesService:
             applicant=is_applicant,
             assignee=is_assignee,
             factory_sales=is_factory_sales,
+            factory_aftersales=is_factory_aftersales,
             actions=data["actions"],
         )
         data["applicant_instruction"] = (
@@ -2753,7 +2818,10 @@ class AfterSalesService:
         queryset = AfterSalesApplication.objects.select_related(
             "device__product_model", "applicant", "factory_organization", "assigned_user"
         )
-        if identity and identity.role.code == "factory_sales":
+        if identity and (
+            identity.role.code == "factory_sales"
+            or identity_has_role(identity, "factory_aftersales")
+        ):
             queryset = queryset.filter(
                 Q(factory_organization_id=identity.organization_id)
                 | Q(applicant_id=user.id)
