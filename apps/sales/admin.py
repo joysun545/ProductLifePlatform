@@ -9,6 +9,8 @@ from .models import (
     OrderPlanLogisticsDocument,
     OrderPlanPayment,
     OrderPlanReturnInventoryAllocation,
+    OrderPlanAccessoryCompatibility,
+    OrderPlanAccessoryItem,
     SalesPlan,
 )
 
@@ -23,6 +25,45 @@ class OrderPlanItemInline(admin.TabularInline):
         "production_quantity",
         "created_at",
     )
+
+
+class OrderPlanAccessoryItemInline(admin.TabularInline):
+    model = OrderPlanAccessoryItem
+    extra = 0
+    can_delete = False
+    readonly_fields = (
+        "category",
+        "product_model",
+        "material_spec",
+        "quantity_milli",
+        "unit_snapshot",
+        "status",
+        "created_at",
+    )
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(OrderPlanAccessoryCompatibility)
+class OrderPlanAccessoryCompatibilityAdmin(admin.ModelAdmin):
+    list_display = (
+        "factory_organization",
+        "material_spec",
+        "product_model",
+        "is_active",
+        "updated_at",
+    )
+    list_filter = ("factory_organization", "is_active", "product_model__category")
+    search_fields = (
+        "factory_organization__name",
+        "material_spec__code",
+        "material_spec__name",
+        "material_spec__material__name",
+        "product_model__code",
+        "product_model__name",
+    )
+    readonly_fields = ("created_at", "updated_at")
 
 
 @admin.register(OrderPlanReturnInventoryAllocation)
@@ -101,7 +142,7 @@ class OrderPlanAdmin(admin.ModelAdmin):
         "submitted_at",
         "shipment_authorized_at",
     )
-    inlines = (OrderPlanItemInline,)
+    inlines = (OrderPlanItemInline, OrderPlanAccessoryItemInline)
 
 
 admin.site.register(SalesPlan)

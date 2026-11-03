@@ -1185,7 +1185,9 @@ def serialize_goods_transfer(transfer, identity=None):
                 process,
                 FactoryReturnDocument.DocumentKind.GOODS_LIST,
             )
+    from lifecycle.services.replacement_v6_service import pending_for_route
     return {
+        "pending_replacement_demands":pending_for_route(transfer.from_organization_id,transfer.to_organization_id) if transfer.flow_type=='SHIPMENT' else [],
         "id": transfer.pk,
         "flow_no": transfer.flow_no,
         "flow_type": transfer.flow_type,

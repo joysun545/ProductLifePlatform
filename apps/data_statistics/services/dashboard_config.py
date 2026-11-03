@@ -1,4 +1,6 @@
 ROLE_MODULES = {
+    "customer_owner": ("AFTERSALES",),
+    "driver": ("AFTERSALES",),
     "factory_admin": ("FLOW", "MATERIAL", "AFTERSALES", "QUALITY"),
     "factory_owner": ("FLOW", "MATERIAL", "AFTERSALES", "QUALITY"),
     "factory_senior_manager": ("FLOW", "MATERIAL", "AFTERSALES", "QUALITY"),

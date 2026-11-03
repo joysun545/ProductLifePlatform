@@ -58,6 +58,10 @@ class ActivationRecord(models.Model):
 
 
 
+    class ActivationMethod(models.TextChoices):
+        VEHICLE_PLATE = "VEHICLE_PLATE", "车牌号"
+        DEVICE_CODE = "DEVICE_CODE", "设备编码二维码"
+
     STATUS_CHOICES = [
 
         (
@@ -109,6 +113,20 @@ class ActivationRecord(models.Model):
     )
 
 
+
+    activation_method = models.CharField(
+        max_length=24,
+        choices=ActivationMethod.choices,
+        default=ActivationMethod.VEHICLE_PLATE,
+        verbose_name="激活绑定方式",
+    )
+
+    physical_device_code_snapshot = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        verbose_name="激活时设备编码快照",
+    )
 
     # 安装相关信息
 

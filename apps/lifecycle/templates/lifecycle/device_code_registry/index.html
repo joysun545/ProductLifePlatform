@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>厂家设备编码发行</title>
+  <style>
+    :root{font-family:"Microsoft YaHei",Arial,sans-serif;color:#19352d;background:#f3f7f5}
+    *{box-sizing:border-box}body{margin:0;min-width:320px}
+    header{background:#087b55;color:#fff;padding:22px max(20px,calc((100vw - 1100px)/2));display:flex;align-items:center;justify-content:space-between;gap:20px}
+    header h1{font-size:22px;margin:0 0 6px}header p{margin:0;color:#d9f1e7;font-size:14px}
+    main{max-width:1100px;margin:28px auto;padding:0 18px 48px}
+    .card{background:#fff;border:1px solid #e0ebe5;border-radius:14px;padding:22px;margin-bottom:18px;box-shadow:0 5px 20px #173e2f0b}
+    .card h2{font-size:18px;margin:0 0 14px}.muted{color:#687b73;font-size:14px;line-height:1.7}
+    .login{max-width:580px;margin:7vh auto;text-align:center;padding:32px}.login img{width:260px;height:260px;object-fit:contain;margin:12px auto}
+    button,.button{border:0;border-radius:8px;background:#087b55;color:white;padding:11px 18px;font-size:14px;cursor:pointer;text-decoration:none;display:inline-block}
+    button.secondary,.button.secondary{background:#e7f2ed;color:#176346}button:disabled{opacity:.45;cursor:not-allowed}
+    .row{display:flex;align-items:end;gap:12px;flex-wrap:wrap}.field{display:flex;flex-direction:column;gap:7px;min-width:180px;flex:1}
+    label{font-size:13px;color:#48645a}input,textarea{width:100%;border:1px solid #cbd9d1;border-radius:8px;padding:10px 11px;font:inherit;color:#19352d;background:#fff}
+    textarea{min-height:94px;resize:vertical}.status{min-height:24px;margin-top:12px;color:#526b60;font-size:14px}.status.error{color:#a3372b}
+    .table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:12px 10px;border-bottom:1px solid #edf1ee;vertical-align:middle}th{color:#60746a;font-weight:600;white-space:nowrap}.actions{display:flex;gap:7px;flex-wrap:wrap}.small{padding:8px 10px;font-size:13px}
+    code{font-size:12px;overflow-wrap:anywhere;color:#245843}.pill{background:#eaf5ef;color:#176346;border-radius:20px;padding:4px 9px;font-size:12px}
+    .preview{max-height:220px;overflow:auto;background:#f7faf8;border-radius:8px;padding:10px;margin-top:12px}.preview li{font-family:ui-monospace,monospace;font-size:12px;padding:3px 0}
+    .modal-backdrop{position:fixed;inset:0;background:#0b2119a8;display:none;align-items:center;justify-content:center;padding:16px;z-index:10}.modal-backdrop.open{display:flex}
+    .modal{width:min(560px,100%);background:#fff;border-radius:14px;padding:22px;max-height:92vh;overflow:auto}.modal h2{margin:0 0 16px;font-size:18px}.modal .field{margin-bottom:13px}.modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}
+    @media(max-width:650px){header{padding:18px;align-items:flex-start}header h1{font-size:19px}main{margin-top:16px;padding:0 12px 32px}.card{padding:16px}.login{margin:3vh auto;padding:22px}.login img{width:220px;height:220px}table{min-width:720px}}
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>厂家设备编码发行</h1>
+      <p>生成已登记的设备编码，并制作交付第三方的二维码与编码清单</p>
+    </div>
+    {% if authorized %}
+    <div style="text-align:right">
+      <div>{{ identity.organization.name }} · {{ identity.role.name }}</div>
+      <button id="logoutButton" class="secondary small" type="button" style="margin-top:8px">退出登录</button>
+    </div>
+    {% endif %}
+  </header>
+
+  <main>
+    <section id="loginView" class="card login" {% if authorized %}hidden{% endif %}>
+      <h2>使用厂家角色扫码登录</h2>
+      <p class="muted">请使用厂家生产经理、符合授权条件的厂家负责人，或分管生产经理的厂家高级经理账号扫码。此页面只发行设备编码，不提供成品打印功能。</p>
+      <img id="loginQr" alt="设备编码发行页面登录二维码" hidden>
+      <p id="loginStatus" class="status" role="status">正在生成登录二维码…</p>
+      <button id="refreshLogin" class="secondary" type="button">刷新登录二维码</button>
+    </section>
+
+    <section id="registryView" {% if not authorized %}hidden{% endif %}>
+      <section class="card">
+        <h2>生成设备编码</h2>
+        <p class="muted">每个设备编码只登记一次，并与对应二维码内容一一对应。二维码图片包供第三方制作永久标签；本页面不执行打印或绑定设备。</p>
+        <div class="row">
+          <div class="field" style="max-width:250px">
+            <label for="quantity">本批数量（1–1000）</label>
+            <input id="quantity" type="number" min="1" max="1000" value="50" inputmode="numeric">
+          </div>
+          <button id="generateButton" type="button">生成编码批次</button>
+        </div>
+        <p id="generateStatus" class="status" role="status"></p>
+        <div id="generatedPreview" hidden></div>
+      </section>
+
+      <section class="card">
+        <h2>已生成批次</h2>
+        <p class="muted">先填写批次打包信息，再下载对应压缩包。二维码包包含二维码图片和编码对应清单；纯编码包不包含二维码图片。</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>批次名称</th><th>编码数量</th><th>生成时间</th><th>第三方制作信息</th><th>操作</th></tr></thead>
+            <tbody id="batchRows"><tr><td colspan="5" class="muted">正在读取批次…</td></tr></tbody>
+          </table>
+        </div>
+        <p id="batchStatus" class="status" role="status"></p>
+      </section>
+    </section>
+  </main>
+
+  <div id="packageModal" class="modal-backdrop" role="presentation">
+    <form id="packageForm" class="modal" role="dialog" aria-modal="true" aria-labelledby="packageTitle">
+      <h2 id="packageTitle">输入第三方制作打包信息</h2>
+      <p class="muted">这些信息会与批次关联，供后续重新下载和核对。</p>
+      <input id="packageBatchId" type="hidden">
+      <div class="field"><label for="packageName">批次名称 *</label><input id="packageName" maxlength="120" required></div>
+      <div class="field"><label for="makerName">第三方制作单位</label><input id="makerName" maxlength="120"></div>
+      <div class="field"><label for="labelSpec">标签材料、尺寸或制作规格</label><textarea id="labelSpec" maxlength="4000"></textarea></div>
+      <div class="field"><label for="packageNotes">打包/交付备注</label><textarea id="packageNotes" maxlength="4000"></textarea></div>
+      <div class="modal-actions"><button id="cancelPackage" class="secondary" type="button">取消</button><button type="submit">保存打包信息</button></div>
+      <p id="packageStatus" class="status" role="status"></p>
+    </form>
+  </div>
+
+  {{ urls|json_script:"device-code-registry-urls" }}
+  <script>
+  (() => {
+    const urls = JSON.parse(document.getElementById('device-code-registry-urls').textContent);
+    const authorized = {{ authorized|yesno:"true,false" }};
+    const $ = id => document.getElementById(id);
+    let pollTimer = null;
+    let activeBatches = [];
+
+    function csrfToken() {
+      const found = document.cookie.split(';').map(x => x.trim()).find(x => x.startsWith('csrftoken='));
+      return found ? decodeURIComponent(found.slice('csrftoken='.length)) : '';
+    }
+    async function request(url, method='GET', data=null) {
+      const headers = {};
+      if (method !== 'GET') {
+        headers['Content-Type'] = 'application/json';
+        headers['X-CSRFToken'] = csrfToken();
+      }
+      const response = await fetch(url, {
+        method, headers, credentials: 'same-origin',
+        body: data === null ? undefined : JSON.stringify(data)
+      });
+      const body = response.headers.get('content-type')?.includes('application/json')
+        ? await response.json() : null;
+      if (!response.ok || !body || body.code !== 0) {
+        throw new Error((body && body.msg) || `请求失败（${response.status}）`);
+      }
+      return body.data || {};
+    }
+    function setStatus(id, message, error=false) {
+      const element = $(id);
+      element.textContent = message || '';
+      element.classList.toggle('error', !!error);
+    }
+    function stopLoginPolling() {
+      if (pollTimer) clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+    async function pollLogin() {
+      try {
+        const data = await request(urls.login_status, 'POST', {});
+        if (data.status === 'ready') {
+          stopLoginPolling();
+          location.reload();
+          return;
+        }
+        setStatus('loginStatus', '等待小程序扫码确认…');
+        pollTimer = setTimeout(pollLogin, 1800);
+      } catch (error) {
+        stopLoginPolling();
+        setStatus('loginStatus', error.message, true);
+      }
+    }
+    async function startLogin() {
+      stopLoginPolling();
+      $('loginQr').hidden = true;
+      setStatus('loginStatus', '正在生成登录二维码…');
+      try {
+        const data = await request(urls.login_start, 'POST', {});
+        $('loginQr').src = data.qr_image;
+        $('loginQr').hidden = false;
+        setStatus('loginStatus', '请使用有授权的厂家角色，在小程序“扫一扫”中扫码确认。');
+        pollTimer = setTimeout(pollLogin, 1200);
+      } catch (error) {
+        setStatus('loginStatus', error.message, true);
+      }
+    }
+    function formatTime(value) {
+      if (!value) return '-';
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN', {hour12:false});
+    }
+    function packageUrl(template, batchId) {
+      return template.replace('00000000-0000-0000-0000-000000000000', encodeURIComponent(batchId));
+    }
+    function openPackageInfo(batchId, info=null) {
+      $('packageBatchId').value = batchId;
+      $('packageName').value = info?.batch_name || '';
+      $('makerName').value = info?.maker_name || '';
+      $('labelSpec').value = info?.label_spec || '';
+      $('packageNotes').value = info?.notes || '';
+      setStatus('packageStatus', '');
+      $('packageModal').classList.add('open');
+    }
+    function addTextCell(row, text) {
+      const cell = document.createElement('td');
+      cell.textContent = text || '-';
+      row.appendChild(cell);
+      return cell;
+    }
+    function renderBatches(batches) {
+      activeBatches = batches || [];
+      const body = $('batchRows');
+      body.replaceChildren();
+      if (!activeBatches.length) {
+        const row = document.createElement('tr');
+        const cell = addTextCell(row, '当前厂家还没有已生成的设备编码批次。');
+        cell.colSpan = 5;
+        cell.className = 'muted';
+        body.appendChild(row);
+        return;
+      }
+      for (const batch of activeBatches) {
+        const row = document.createElement('tr');
+        const info = batch.packaging_info;
+        addTextCell(row, info?.batch_name || '未填写打包信息');
+        addTextCell(row, String(batch.code_count || 0));
+        addTextCell(row, formatTime(batch.generated_at));
+        addTextCell(row, info ? (info.maker_name || '已填写') : '未填写');
+        const actions = document.createElement('td');
+        actions.className = 'actions';
+        const packageButton = document.createElement('button');
+        packageButton.className = 'small secondary';
+        packageButton.type = 'button';
+        packageButton.textContent = info ? '编辑打包信息' : '输入打包信息';
+        packageButton.addEventListener('click', () => openPackageInfo(batch.generation_batch_id, info));
+        actions.appendChild(packageButton);
+        const qrButton = document.createElement('button');
+        qrButton.className = 'small';
+        qrButton.type = 'button';
+        qrButton.textContent = '下载二维码图片包';
+        qrButton.disabled = !info;
+        qrButton.addEventListener('click', () => {
+          location.href = packageUrl(urls.qr_download_template, batch.generation_batch_id);
+        });
+        actions.appendChild(qrButton);
+        const codesButton = document.createElement('button');
+        codesButton.className = 'small secondary';
+        codesButton.type = 'button';
+        codesButton.textContent = '下载纯编码包';
+        codesButton.disabled = !info;
+        codesButton.addEventListener('click', () => {
+          location.href = packageUrl(urls.codes_download_template, batch.generation_batch_id);
+        });
+        actions.appendChild(codesButton);
+        row.appendChild(actions);
+        body.appendChild(row);
+      }
+    }
+    async function loadBatches() {
+      try {
+        const data = await request(urls.batches);
+        renderBatches(data.batches);
+        setStatus('batchStatus', '');
+      } catch (error) {
+        setStatus('batchStatus', error.message, true);
+      }
+    }
+    function renderGeneratedPreview(data) {
+      const host = $('generatedPreview');
+      host.replaceChildren();
+      const summary = document.createElement('p');
+      summary.innerHTML = '';
+      summary.textContent = `已生成 ${data.count} 个设备编码。批次：${data.generation_batch_id}`;
+      host.appendChild(summary);
+      if (data.codes_preview_truncated) {
+        const note = document.createElement('p');
+        note.className = 'muted';
+        note.textContent = '页面仅预览前30个编码；完整清单可在打包信息保存后下载。';
+        host.appendChild(note);
+      }
+      const list = document.createElement('ul');
+      list.className = 'preview';
+      for (const item of (data.codes || [])) {
+        const line = document.createElement('li');
+        line.textContent = item.code;
+        list.appendChild(line);
+      }
+      host.appendChild(list);
+      host.hidden = false;
+    }
+
+    $('refreshLogin').addEventListener('click', startLogin);
+    $('generateButton').addEventListener('click', async () => {
+      const button = $('generateButton');
+      const quantity = Number($('quantity').value);
+      button.disabled = true;
+      setStatus('generateStatus', '正在登记本批设备编码…');
+      try {
+        const data = await request(urls.generate_batch, 'POST', {quantity});
+        renderGeneratedPreview(data);
+        setStatus('generateStatus', '编码已入库登记。请为该批次输入打包信息，再下载交付文件。');
+        await loadBatches();
+        const current = activeBatches.find(row => row.generation_batch_id === data.generation_batch_id);
+        openPackageInfo(data.generation_batch_id, current?.packaging_info || null);
+      } catch (error) {
+        setStatus('generateStatus', error.message, true);
+      } finally {
+        button.disabled = false;
+      }
+    });
+    $('packageForm').addEventListener('submit', async event => {
+      event.preventDefault();
+      const batchId = $('packageBatchId').value;
+      const url = packageUrl(urls.packaging_template, batchId);
+      const submit = $('packageForm').querySelector('button[type="submit"]');
+      submit.disabled = true;
+      setStatus('packageStatus', '正在保存…');
+      try {
+        await request(url, 'POST', {
+          batch_name: $('packageName').value.trim(),
+          maker_name: $('makerName').value.trim(),
+          label_spec: $('labelSpec').value.trim(),
+          notes: $('packageNotes').value.trim()
+        });
+        $('packageModal').classList.remove('open');
+        setStatus('batchStatus', '打包信息已保存，可以下载两种压缩包。');
+        await loadBatches();
+      } catch (error) {
+        setStatus('packageStatus', error.message, true);
+      } finally {
+        submit.disabled = false;
+      }
+    });
+    $('cancelPackage').addEventListener('click', () => $('packageModal').classList.remove('open'));
+    $('packageModal').addEventListener('click', event => {
+      if (event.target === $('packageModal')) $('packageModal').classList.remove('open');
+    });
+    $('logoutButton')?.addEventListener('click', async () => {
+      try { await request(urls.logout, 'POST', {}); } catch (_) {}
+      location.reload();
+    });
+
+    if (authorized) loadBatches();
+    else startLogin();
+  })();
+  </script>
+</body>
+</html>

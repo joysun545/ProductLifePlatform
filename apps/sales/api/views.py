@@ -160,7 +160,8 @@ def create_material_flow_plan(request):
     try:
         result, created = create_material_flow_order_plan(
             user=user, merchant_id=data.get("merchant_id"), client_request_id=data.get("client_request_id"),
-            items=data.get("items"), remark=data.get("remark", "")
+            items=data.get("items"), accessories=data.get("accessories"),
+            remark=data.get("remark", "")
         )
         return JsonResponse({"code": 0, "msg": "订单计划创建成功" if created else "订单计划已创建，请勿重复提交", "data": result}, status=200)
     except OrderPlanMaterialFlowError as exc:
@@ -323,3 +324,24 @@ def material_flow_accounting_confirm(request, plan_id):
 @csrf_exempt
 def material_flow_cancel(request, plan_id):
     return _post_v2(request, action=cancel_material_flow_order_plan, success_message="订单计划已取消", argument_builder=lambda data: {"plan_id": plan_id, "assembly_started_offline": _optional_bool(data.get("assembly_started_offline")), "reason": str(data.get("reason") or "")})
+
+
+@csrf_exempt
+def replacement_supply_plans(request,plan_id=None):
+    user,error=_user(request)
+    if error:return error
+    from sales.services import replacement_supply_service as R
+    try:
+        if request.method=='GET':result=R.overview(user,plan_id,request.GET.get('order_id'))
+        elif request.method=='POST':
+            data=_data(request)
+            if plan_id:
+                from sales.models import ReplacementSupplyPlan
+                plan=ReplacementSupplyPlan.objects.filter(pk=plan_id).first()
+                if not plan:raise OrderPlanMaterialFlowError('补发计划不存在')
+                if data.get('action')!='CANCEL':raise OrderPlanMaterialFlowError('未知补发计划操作')
+                result={'plan':R.cancel(plan,user)}
+            else:result={'plan':R.create(user,data.get('merchant_id'),data.get('client_request_id'))}
+        else:return _method('GET/POST')
+        return JsonResponse({'code':0,'msg':'ok','data':result})
+    except OrderPlanMaterialFlowError as exc:return _v2_error(exc)

@@ -1,4 +1,5 @@
 import calendar
+import math
 import uuid
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -6,7 +7,7 @@ from pathlib import Path
 
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import F, Q
 from django.utils import timezone
 
 from account.models import Organization, OrganizationRelation, OrganizationRelationType, UserOrganization
@@ -18,13 +19,20 @@ from account.services.role_delegation_service import (
 )
 from lifecycle.models import (
     AfterSalesApplication,
+    AfterSalesDeviceCodeVerification,
     AfterSalesEvent,
     AfterSalesMedia,
+    AfterSalesServiceStationApplication,
+    AfterSalesServiceStationLiaison,
     Device,
     LifecycleEvent,
 )
-from lifecycle.services.customer_service import CustomerDeviceService
-from supply_chain.models import MaterialFaultCause, MaterialSpecSupplier
+from lifecycle.services.customer_service import CustomerDeviceService, CustomerFlowStateError
+from supply_chain.models import (
+    MaterialFaultCause,
+    MaterialSpecSupplier,
+    OrganizationMaterialLot,
+)
 from supply_chain.services.supplier_responsibility_service import (
     get_supplier_task_recipients,
 )
@@ -108,6 +116,13 @@ class AfterSalesService:
     def _identity(user):
         return get_active_identity(user)
 
+    @staticmethod
+    def _lifecycle_code(device):
+        try:
+            return device.qrcode.code
+        except ObjectDoesNotExist:
+            return ""
+
     @classmethod
     def _event(cls, application, event_type, *, user=None, identity=None, payload=None):
         identity = identity if identity is not None else (
@@ -179,15 +194,14 @@ class AfterSalesService:
             if warranty_end
             else "暂无明确质保期限"
         )
-        try:
-            qr_code = device.qrcode.code
-        except ObjectDoesNotExist:
-            qr_code = ""
+        qr_code = cls._lifecycle_code(device)
         return {
             "device": {
                 "id": device.id,
                 "sn": device.sn,
                 "qr_code": qr_code,
+                "lifecycle_code": qr_code,
+                "physical_device_code": device.physical_device_code or "",
                 "product_model": device.product_model.name,
                 "product_model_id": device.product_model_id,
                 "production_batch": device.batch.batch_no if device.batch_id else "",
@@ -196,7 +210,13 @@ class AfterSalesService:
                 "activated_at": (
                     activation.activation_time.isoformat() if activation else ""
                 ),
+                "activation_method": (
+                    activation.activation_method if activation else ""
+                ),
                 "vehicle_no": activation.vehicle_no if activation else "",
+                "physical_device_code": (
+                    activation.physical_device_code_snapshot if activation else ""
+                ),
             },
             "bom": {
                 "id": bom.id if bom else None,
@@ -277,6 +297,49 @@ class AfterSalesService:
                 "organization": identity.organization.name,
             },
             "active_application": active_data,
+            "device_presence_verified": bool(
+                active
+                and active.applicant_id == user.id
+                and active.device_presence_verified_at
+                and active.device_presence_code_snapshot
+                == (device.physical_device_code or "")
+            ),
+        }
+
+    @classmethod
+    @transaction.atomic
+    def verify_device_code_presence(cls, *, device_id, user, scanned_code):
+        _, device, _ = CustomerDeviceService._owned_device_context(
+            device_id=device_id, user=user
+        )
+        activation = getattr(device, "activation", None)
+        if not activation or activation.activation_method != "DEVICE_CODE":
+            raise AfterSalesError("该设备激活时未选择设备编码方式")
+        expected_code = (
+            activation.physical_device_code_snapshot
+            or device.physical_device_code
+            or ""
+        )
+        if not expected_code or expected_code != device.physical_device_code:
+            raise AfterSalesError("设备编码绑定信息不完整，请联系厂家")
+        try:
+            actual_code = CustomerDeviceService.normalize_physical_device_code(
+                scanned_code
+            )
+        except CustomerFlowStateError as exc:
+            raise AfterSalesError(str(exc)) from exc
+        if actual_code != expected_code:
+            raise AfterSalesError("扫码设备编码与当前设备不匹配，请扫描本机二维码")
+        now = timezone.now()
+        proof = AfterSalesDeviceCodeVerification.objects.create(
+            device=device,
+            user=user,
+            device_code=expected_code,
+            expires_at=now + timedelta(minutes=30),
+        )
+        return {
+            "verification_token": str(proof.token),
+            "expires_at": proof.expires_at.isoformat(),
         }
 
     @classmethod
@@ -290,6 +353,12 @@ class AfterSalesService:
         # the one-active-application constraint remains a user-facing rule,
         # not an IntegrityError response.
         device = Device.objects.select_for_update().get(pk=device.pk)
+        from lifecycle.models import ReplacementFlow, ActivationRecord
+        if ReplacementFlow.objects.filter(application__device=device,swapped_at__isnull=False).exists():
+            raise AfterSalesError('此设备已被换新，请使用新设备生命周期编码')
+        incoming = ReplacementFlow.objects.filter(application__replacement_device=device).first()
+        if incoming and (not incoming.swapped_at or not ActivationRecord.objects.filter(device=device,status='ACTIVATED').exists()):
+            raise AfterSalesError('换新设备尚未完成签收或售后激活，请先扫描设备编码激活')
         factory = device.batch.manufacturer if device.batch_id else None
         if not factory:
             raise AfterSalesError("设备缺少原生产厂家，暂不能申请售后")
@@ -304,6 +373,44 @@ class AfterSalesService:
             raise AfterSalesError("该设备已有其他账号创建的售后草稿")
 
         snapshot = cls._snapshot(device)
+        activation_method = snapshot["activation"].get("activation_method") or ""
+        presence_verified_at = (
+            application.device_presence_verified_at if application else None
+        )
+        presence_code_snapshot = (
+            application.device_presence_code_snapshot if application else ""
+        )
+        if activation_method == "DEVICE_CODE":
+            token_text = str(data.get("device_code_verification_token") or "").strip()
+            try:
+                token = uuid.UUID(token_text) if token_text else None
+            except (TypeError, ValueError, AttributeError):
+                token = None
+            proof = None
+            if token:
+                proof = (
+                    AfterSalesDeviceCodeVerification.objects.select_for_update()
+                    .filter(
+                        token=token,
+                        device=device,
+                        user=user,
+                        device_code=device.physical_device_code or "",
+                        used_at__isnull=True,
+                        expires_at__gt=timezone.now(),
+                    )
+                    .first()
+                )
+                if not proof:
+                    raise AfterSalesError("设备编码核验已失效，请重新扫描设备本体二维码")
+                proof.used_at = timezone.now()
+                proof.save(update_fields=("used_at",))
+                presence_verified_at = proof.used_at
+                presence_code_snapshot = device.physical_device_code or ""
+            elif not (
+                presence_verified_at
+                and presence_code_snapshot == (device.physical_device_code or "")
+            ):
+                raise AfterSalesError("请先扫描设备本体二维码，确认设备在身边")
         created = application is None
         if created:
             application = AfterSalesApplication(
@@ -335,6 +442,9 @@ class AfterSalesService:
         )
         application.device_snapshot = snapshot["device"]
         application.activation_snapshot = snapshot["activation"]
+        if activation_method == "DEVICE_CODE":
+            application.device_presence_verified_at = presence_verified_at
+            application.device_presence_code_snapshot = presence_code_snapshot
         application.bom_snapshot = snapshot["bom"]
         application.warranty_snapshot = snapshot["warranty"]
         application.save()
@@ -404,17 +514,32 @@ class AfterSalesService:
 
     @classmethod
     def _is_assignee(cls, application, user):
-        return bool(application.assigned_user_id and application.assigned_user_id == user.id)
+        if application.assigned_user_id and application.assigned_user_id == user.id:
+            return True
+        if (
+            application.dispatch_route
+            != AfterSalesApplication.DispatchRoute.SERVICE_STATION
+            or not application.assigned_organization_id
+        ):
+            return False
+        identity = cls._identity(user)
+        station_application_id = (application.assignee_snapshot or {}).get(
+            "service_station_application_id"
+        )
+        return bool(
+            identity
+            and identity.organization_id == application.assigned_organization_id
+            and AfterSalesServiceStationLiaison.objects.filter(
+                application_id=station_application_id,
+                application__status=AfterSalesServiceStationApplication.Status.APPROVED,
+                identity=identity,
+            ).exists()
+        )
 
     @classmethod
     def can_view_application(cls, *, application, user):
-        identity = cls._identity(user)
-        return (
-            cls._is_applicant(application, user)
-            or cls._is_assignee(application, user)
-            or cls._is_factory_sales(application, user, identity)
-            or cls._is_factory_aftersales(application, user, identity)
-        )
+        from lifecycle.services.aftersales_access import visible_cases
+        return visible_cases(user).filter(pk=application.pk).exists()
 
     @classmethod
     def _require_factory_aftersales(cls, application, user):
@@ -494,19 +619,11 @@ class AfterSalesService:
                 }
             )
 
-        try:
-            installation = application.device.installation
-        except ObjectDoesNotExist:
-            installation = None
-        if installation and installation.operator_id:
-            add(
-                installation.operator,
-                installation.organization,
-                AfterSalesApplication.DispatchRoute.ORIGINAL_INSTALLER,
-                "installation_operator",
-                "原装车操作人员",
-                fallback_address=installation.location,
-            )
+        from lifecycle.services.installer_dispatch_service import installer_row
+        original, _reason = installer_row(cls, application)
+        if original:
+            rows.append(original)
+            seen.add(original["user"].pk)
 
         direct_merchant_ids = OrganizationRelation.objects.filter(
             source_organization_id=application.factory_organization_id,
@@ -569,8 +686,209 @@ class AfterSalesService:
             "unavailable_reason": row["unavailable_reason"],
         }
 
+    @staticmethod
+    def _distance_km(lat1, lon1, lat2, lon2):
+        """Great-circle distance between two confirmed WGS84 locations."""
+        radius_km = 6371.0088
+        lat1, lon1, lat2, lon2 = map(
+            math.radians, (float(lat1), float(lon1), float(lat2), float(lon2))
+        )
+        delta_lat = lat2 - lat1
+        delta_lon = lon2 - lon1
+        value = (
+            math.sin(delta_lat / 2) ** 2
+            + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lon / 2) ** 2
+        )
+        return radius_km * 2 * math.asin(math.sqrt(min(1.0, value)))
+
     @classmethod
-    def triage_options(cls, *, application_id, user):
+    def _service_station_recommendations(cls, application, selected_materials):
+        """Filter stations by manufacturer and available parts before ranking by distance."""
+        if (
+            application.location_latitude is None
+            or application.location_longitude is None
+        ):
+            return [], "申请位置缺少有效经纬度，暂时无法按距离推荐服务站。"
+
+        root = application.factory_organization.get_factory_root()
+        if not root:
+            return [], "售后申请未关联有效厂家，暂时无法推荐服务站。"
+
+        # Manufacturer ownership is the first scope boundary.  A service
+        # station from another manufacturer's chain never enters the distance
+        # or inventory comparison.
+        station_apps = list(
+            AfterSalesServiceStationApplication.objects.select_related(
+                "organization"
+            )
+            .prefetch_related(
+                "liaison_links__identity__user",
+                "liaison_links__identity__role",
+            )
+            .filter(
+                status=AfterSalesServiceStationApplication.Status.APPROVED,
+                organization__is_active=True,
+                organization__factory_root_id=root.pk,
+            )
+            .order_by("organization__name", "id")
+        )
+        stations = []
+        for station_app in station_apps:
+            contact = next(
+                (
+                    link
+                    for link in station_app.liaison_links.all()
+                    if link.identity.is_active
+                    and link.identity.organization_id == station_app.organization_id
+                    and link.identity.organization.is_active
+                    and link.identity.role.is_active
+                    and link.identity.user.is_active
+                    and bool(link.identity.user.wx_openid)
+                ),
+                None,
+            )
+            if contact:
+                stations.append((station_app, contact))
+
+        if not stations:
+            return [], "该厂家目前没有已审核且配置有效对接人的售后服务站。"
+
+        specification_ids = set()
+        for item in selected_materials:
+            text = str(item.get("specification_id") or "")
+            if not text.isascii() or not text.isdigit() or int(text) <= 0:
+                return [], "所选疑似物料缺少有效规格型号，无法核对服务站库存。"
+            specification_ids.add(int(text))
+
+        if specification_ids:
+            available_pairs = OrganizationMaterialLot.objects.filter(
+                stock__organization_id__in=[
+                    station.organization_id for station, _contact in stations
+                ],
+                stock__source_factory_id=root.pk,
+                stock__material_spec_id__in=specification_ids,
+                on_hand_milli__gt=F("reserved_milli"),
+            ).values_list(
+                "stock__organization_id", "stock__material_spec_id"
+            ).distinct()
+            available_by_station = {}
+            for organization_id, specification_id in available_pairs:
+                available_by_station.setdefault(organization_id, set()).add(
+                    specification_id
+                )
+            stations = [
+                (station_app, contact)
+                for station_app, contact in stations
+                if specification_ids.issubset(
+                    available_by_station.get(station_app.organization_id, set())
+                )
+            ]
+            if not stations:
+                return [], "没有已审核的同厂家服务站持有本次勾选的全部物料型号现存库存。"
+
+        rows = []
+        for station_app, contact in stations:
+            distance = cls._distance_km(
+                application.location_latitude,
+                application.location_longitude,
+                station_app.service_latitude,
+                station_app.service_longitude,
+            )
+            identity = contact.identity
+            user = identity.user
+            organization = station_app.organization
+            role_code = contact.role_code_snapshot or identity.role.code
+            role_name = contact.role_name_snapshot or identity.role.name
+            snapshot = {
+                "user_id": user.pk,
+                "name": contact.member_name_snapshot or _user_name(user),
+                "phone": user.phone or station_app.receiving_contact_phone or "",
+                "organization_id": organization.pk,
+                "organization_name": organization.name,
+                "organization_region": organization.region,
+                "organization_address": station_app.service_location_address,
+                "role_code": role_code,
+                "role_name": role_name,
+                "service_station_application_id": station_app.pk,
+                "service_location_name": station_app.service_location_name,
+                "service_location_address": station_app.service_location_address,
+                "service_latitude": str(station_app.service_latitude),
+                "service_longitude": str(station_app.service_longitude),
+                "distance_km": round(distance, 2),
+                "distance_label": f"{distance:.1f} 公里",
+                "material_models": [
+                    {
+                        "material_name": item.get("material_name") or "",
+                        "specification_name": item.get("specification_name") or "",
+                    }
+                    for item in selected_materials
+                ],
+            }
+            rows.append(
+                {
+                    "user": user,
+                    "organization": organization,
+                    "route": AfterSalesApplication.DispatchRoute.SERVICE_STATION,
+                    "snapshot": snapshot,
+                    "available": True,
+                    "unavailable_reason": "",
+                    "station_application": station_app,
+                    "distance_km": distance,
+                }
+            )
+
+        rows.sort(
+            key=lambda row: (
+                row["distance_km"],
+                row["organization"].name,
+                row["station_application"].pk,
+            )
+        )
+        within_range = [row for row in rows if row["distance_km"] <= 50]
+        if within_range:
+            recommendations = within_range[:3]
+            message = (
+                f"按厂家和物料库存筛选后，推荐 50 公里内最近的 "
+                f"{len(recommendations)} 家服务站；请线下联系后确认一家。"
+            )
+        else:
+            recommendations = rows[:1]
+            message = "同厂家且物料库存匹配的服务站均超过 50 公里，已推荐最近的一家。"
+        return recommendations, message
+
+    @classmethod
+    def _public_service_station(cls, row):
+        snapshot = row["snapshot"]
+        return {
+            "station_application_id": snapshot["service_station_application_id"],
+            "user_id": snapshot["user_id"],
+            "name": snapshot["organization_name"],
+            "organization_id": snapshot["organization_id"],
+            "organization": snapshot["organization_name"],
+            "role_code": snapshot["role_code"],
+            "role_name": snapshot["role_name"],
+            "contact_name": snapshot["name"],
+            "phone": snapshot["phone"],
+            "address": snapshot["service_location_address"],
+            "service_location_name": snapshot["service_location_name"],
+            "distance_km": snapshot["distance_km"],
+            "distance_label": snapshot["distance_label"],
+            "material_models": snapshot["material_models"],
+            "route": row["route"],
+            "available": row["available"],
+            "unavailable_reason": row["unavailable_reason"],
+        }
+
+    @classmethod
+    def triage_options(
+        cls,
+        *,
+        application_id,
+        user,
+        dispatch_route="",
+        preliminary_fault_type="",
+        preliminary_materials=None,
+    ):
         application = (
             AfterSalesApplication.objects.select_related("device")
             .filter(pk=application_id)
@@ -581,8 +899,51 @@ class AfterSalesService:
         cls._require_factory_aftersales(application, user)
         if application.status != AfterSalesApplication.Status.SUBMITTED:
             raise AfterSalesError("该售后申请当前不能重新判断或派单")
+        station_recommendations = []
+        station_recommendation_message = ""
+        station_material_filter_applied = False
+        if dispatch_route == AfterSalesApplication.DispatchRoute.SERVICE_STATION:
+            fault_values = {
+                value for value, _label in AfterSalesApplication.FaultType.choices
+            }
+            if preliminary_fault_type not in fault_values:
+                station_recommendation_message = (
+                    "请先选择初步故障认定，再按物料库存和距离筛选服务站。"
+                )
+            else:
+                selected_materials = cls._normalize_materials(
+                    application,
+                    preliminary_materials,
+                    key_only=False,
+                )
+                if selected_materials:
+                    station_material_filter_applied = True
+                if (
+                    preliminary_fault_type
+                    == AfterSalesApplication.FaultType.COMPONENT_SUSPECTED
+                    and not selected_materials
+                ):
+                    station_recommendation_message = (
+                        "请先勾选可能需要更换的BOM物料，再查看库存匹配的服务站。"
+                    )
+                else:
+                    recommendations, station_recommendation_message = (
+                        cls._service_station_recommendations(
+                            application,
+                            selected_materials,
+                        )
+                    )
+                    station_recommendations = [
+                        cls._public_service_station(row) for row in recommendations
+                    ]
+        installer_check = None
+        if dispatch_route == AfterSalesApplication.DispatchRoute.ORIGINAL_INSTALLER:
+            from lifecycle.services.installer_dispatch_service import inspect_installer
+            materials = cls._normalize_materials(application, preliminary_materials, key_only=False)
+            installer_check, _row = inspect_installer(cls, application, user, preliminary_fault_type, materials)
         return {
-            "routes": cls._option_rows(AfterSalesApplication.DispatchRoute.choices),
+            "original_installer_check": installer_check,
+            "routes": cls._option_rows(cls._triage_dispatch_route_choices()),
             "candidates": [
                 cls._public_candidate(row) for row in cls._candidate_rows(application)
             ],
@@ -596,14 +957,25 @@ class AfterSalesService:
                 AfterSalesApplication.SolutionType.choices
             ),
             "final_material_options": cls._final_material_options(application),
+            "service_station_recommendations": station_recommendations,
+            "service_station_recommendation_message": station_recommendation_message,
+            "service_station_material_filter_applied": station_material_filter_applied,
         }
 
     @classmethod
     def _media_purpose_allowed(cls, application, user, purpose):
+        from lifecycle.services.factory_transport_service import get as transport,media_allowed as transport_media
+        if transport(application):return transport_media(application,user,purpose)
+        from lifecycle.services.repair_escalation_service import media_allowed
+        if media_allowed(cls, application, user, purpose):
+            return True
         if (
-            purpose == AfterSalesMedia.Purpose.APPLICATION_EVIDENCE
+            purpose in {
+                AfterSalesMedia.Purpose.APPLICATION_EVIDENCE,
+                AfterSalesMedia.Purpose.PLATE_PRESENCE_EVIDENCE,
+            }
             and cls._is_applicant(application, user)
-            and application.status != AfterSalesApplication.Status.CLOSED
+            and application.status == AfterSalesApplication.Status.DRAFT
         ):
             return True
         if (
@@ -718,9 +1090,16 @@ class AfterSalesService:
             raise AfterSalesError("附件用途不正确")
         if not cls._media_purpose_allowed(application, user, purpose):
             raise AfterSalesError("当前身份或处理阶段不能上传该类附件")
+        if (
+            purpose == AfterSalesMedia.Purpose.PLATE_PRESENCE_EVIDENCE
+            and media_type != AfterSalesMedia.MediaType.IMAGE
+        ):
+            raise AfterSalesError("车牌在场证明必须是实时拍摄的图片")
         max_count = (
             cls.APPLICATION_MEDIA_LIMIT
             if purpose == AfterSalesMedia.Purpose.APPLICATION_EVIDENCE
+            else 3
+            if purpose == AfterSalesMedia.Purpose.PLATE_PRESENCE_EVIDENCE
             else cls.OTHER_MEDIA_LIMIT
         )
         if application.media.filter(purpose=purpose).count() >= max_count:
@@ -780,7 +1159,10 @@ class AfterSalesService:
     @classmethod
     def _summary(cls, application):
         device = application.device_snapshot or {}
-        return f"{device.get('product_model', '')}｜{device.get('sn', '')}"
+        lifecycle_code = (
+            device.get("lifecycle_code") or device.get("qr_code") or ""
+        )
+        return f"{device.get('product_model', '')}｜{lifecycle_code}"
 
     @classmethod
     def _task_key(cls, application, step):
@@ -1113,6 +1495,20 @@ class AfterSalesService:
             ),
         ).exists():
             raise AfterSalesError("请至少上传一张图片或一段视频")
+        activation_method = (application.activation_snapshot or {}).get(
+            "activation_method", ""
+        )
+        if activation_method == "DEVICE_CODE" and not (
+            application.device_presence_verified_at
+            and application.device_presence_code_snapshot
+            == (application.device.physical_device_code or "")
+        ):
+            raise AfterSalesError("请先扫描设备本体二维码，确认设备在身边")
+        if activation_method == "VEHICLE_PLATE" and not application.media.filter(
+            purpose=AfterSalesMedia.Purpose.PLATE_PRESENCE_EVIDENCE,
+            media_type=AfterSalesMedia.MediaType.IMAGE,
+        ).exists():
+            raise AfterSalesError("请拍摄并上传包含车牌号的实时照片")
         recipients = cls._factory_aftersales_openids(application)
         if not recipients:
             raise AfterSalesError("厂家尚未配置厂家售后经理，暂不能提交")
@@ -1152,6 +1548,16 @@ class AfterSalesService:
         if value not in valid_values:
             raise AfterSalesError(message)
         return value
+
+    @classmethod
+    def _triage_dispatch_route_choices(cls):
+        """Current review UI uses service stations; keep the old route for history."""
+        return tuple(
+            choice
+            for choice in AfterSalesApplication.DispatchRoute.choices
+            if choice[0]
+            != AfterSalesApplication.DispatchRoute.MERCHANT_ELECTRICIAN
+        )
 
     @classmethod
     def _material_options(cls, application, *, key_only):
@@ -1305,6 +1711,17 @@ class AfterSalesService:
     def _applicant_instruction(cls, application):
         snapshot = application.assignee_snapshot or {}
         route = application.dispatch_route
+        if route == AfterSalesApplication.DispatchRoute.SERVICE_STATION:
+            return {
+                "type": "SERVICE_STATION",
+                "title": "厂家已安排售后服务站处理",
+                "message": (
+                    f"请联系 {snapshot.get('organization_name') or '推荐服务站'} "
+                    "确认服务时间和到站/上门安排。"
+                ),
+                "contact": snapshot,
+                "repair_plan": application.repair_plan,
+            }
         if route == AfterSalesApplication.DispatchRoute.ORIGINAL_INSTALLER:
             return {
                 "type": "CONTACT_INSTALLER",
@@ -1313,6 +1730,10 @@ class AfterSalesService:
                 "contact": snapshot,
                 "repair_plan": application.repair_plan,
             }
+        if route==AfterSalesApplication.DispatchRoute.FACTORY_AFTERSALES and data.get('factory_transport_version')==1:
+            from lifecycle.services.factory_transport_service import begin
+            begin(application,user,'REPAIR','DIRECT')
+            return cls.serialize(application)
         if route in {
             AfterSalesApplication.DispatchRoute.MERCHANT_ELECTRICIAN,
             AfterSalesApplication.DispatchRoute.FACTORY_AFTERSALES,
@@ -1372,11 +1793,28 @@ class AfterSalesService:
             raise AfterSalesError("故障认定依据和维修方案均为必填")
         route = cls._valid_choice(
             data.get("dispatch_route"),
-            AfterSalesApplication.DispatchRoute.choices,
+            cls._triage_dispatch_route_choices(),
             "请选择有效的售后处理路径",
         )
+        preliminary_materials = cls._normalize_materials(
+            application,
+            data.get("preliminary_fault_materials"),
+            key_only=False,
+        )
+        if (
+            route == AfterSalesApplication.DispatchRoute.SERVICE_STATION
+            and preliminary_fault_type == AfterSalesApplication.FaultType.COMPONENT_SUSPECTED
+            and not preliminary_materials
+        ):
+            raise AfterSalesError("选择服务站且初步判断为物料故障时，请先勾选可能需要更换的BOM物料")
 
         assigned_row = None
+        fallback_preview = None
+        if route == AfterSalesApplication.DispatchRoute.ORIGINAL_INSTALLER:
+            from lifecycle.services.installer_dispatch_service import inspect_installer
+            installer_check, _row = inspect_installer(cls, application, user, preliminary_fault_type, preliminary_materials)
+            if installer_check["status"] != "READY":
+                raise AfterSalesError(installer_check["message"])
         if route in {
             AfterSalesApplication.DispatchRoute.ORIGINAL_INSTALLER,
             AfterSalesApplication.DispatchRoute.MERCHANT_ELECTRICIAN,
@@ -1391,9 +1829,38 @@ class AfterSalesService:
                 raise AfterSalesError("请选择该处理路径下的有效维修执行人")
             if not assigned_row["available"]:
                 raise AfterSalesError(assigned_row["unavailable_reason"])
+        elif route == AfterSalesApplication.DispatchRoute.SERVICE_STATION:
+            if data.get("original_installer_fallback_confirmed") or data.get("original_installer_fallback_token"):
+                from lifecycle.services.installer_dispatch_service import validate_fallback
+                try:
+                    _nearest, fallback_preview = validate_fallback(cls, application, user,
+                        preliminary_fault_type, preliminary_materials, data)
+                except ValueError as exc:
+                    raise AfterSalesError(str(exc)) from exc
+            station_application_id = str(
+                data.get("service_station_application_id") or ""
+            )
+            station_rows, recommendation_message = cls._service_station_recommendations(
+                application,
+                preliminary_materials,
+            )
+            assigned_row = next(
+                (
+                    row
+                    for row in station_rows
+                    if str(row["station_application"].pk) == station_application_id
+                ),
+                None,
+            )
+            if not assigned_row:
+                raise AfterSalesError(
+                    recommendation_message
+                    or "所选服务站已不在当前厂家、物料库存和距离推荐范围内，请重新选择"
+                )
 
         application.dispatch_route = route
         application.preliminary_fault_type = preliminary_fault_type
+        application.preliminary_fault_materials = preliminary_materials
         application.diagnosis_note = diagnosis_note
         application.repair_plan = repair_plan
         application.triaged_by = user
@@ -1405,6 +1872,14 @@ class AfterSalesService:
         application.assignee_snapshot = (
             assigned_row["snapshot"] if assigned_row else {}
         )
+        if fallback_preview:
+            application.assignee_snapshot["original_installer_fallback"] = {
+                "confirmed_by_user_id": user.pk,
+                "confirmed_at": timezone.now().isoformat(),
+                "original_installer": fallback_preview.get("original_installer"),
+                "missing_materials": fallback_preview.get("missing_materials"),
+                "selection_rule": "NEAREST_ELIGIBLE_STATION_ONLY",
+            }
         application.third_party_snapshot = (
             cls._third_party_snapshot(data)
             if route == AfterSalesApplication.DispatchRoute.THIRD_PARTY
@@ -1427,6 +1902,7 @@ class AfterSalesService:
             identity=identity,
             payload={
                 "preliminary_fault_type": preliminary_fault_type,
+                "preliminary_fault_materials": preliminary_materials,
                 "diagnosis_note": diagnosis_note,
                 "repair_plan": repair_plan,
                 "dispatch_route": route,
@@ -1476,6 +1952,54 @@ class AfterSalesService:
                 user=user,
                 identity=identity,
                 payload={"next_stage": application.execution_stage},
+            )
+            return cls.serialize(application)
+
+        if route == AfterSalesApplication.DispatchRoute.SERVICE_STATION:
+            application.status = AfterSalesApplication.Status.PROCESSING
+            application.execution_stage = AfterSalesApplication.ExecutionStage.REPAIRING
+            application.save()
+            station_name = application.assignee_snapshot.get("organization_name") or "售后服务站"
+            cls._publish_assignee_workorder(
+                application,
+                topic="service-station-repair-required",
+                title="售后服务站维修任务待处理",
+                summary=f"{cls._summary(application)}｜{repair_plan}",
+                actor_openid=user.wx_openid or "",
+                need_action=True,
+            )
+            cls._publish_applicant_notice(
+                application,
+                topic="service-station-assigned",
+                title="厂家已安排售后服务站处理",
+                summary=(
+                    f"{cls._summary(application)}｜{station_name} "
+                    f"（{application.assignee_snapshot.get('distance_label') or ''}）"
+                ),
+                actor_openid=user.wx_openid or "",
+            )
+            cls._publish_factory_aftersales_notice(
+                application,
+                topic="service-station-assigned",
+                title="售后服务站已选定",
+                summary=(
+                    f"{cls._summary(application)}｜{station_name} "
+                    f"（{application.assignee_snapshot.get('distance_label') or ''}）"
+                ),
+                actor_openid=user.wx_openid or "",
+            )
+            cls._event(
+                application,
+                "DISPATCHED",
+                user=user,
+                identity=identity,
+                payload={
+                    "next_stage": application.execution_stage,
+                    "service_station_application_id": application.assignee_snapshot.get(
+                        "service_station_application_id"
+                    ),
+                    "service_station_name": station_name,
+                },
             )
             return cls.serialize(application)
 
@@ -1589,6 +2113,7 @@ class AfterSalesService:
         )
         if not application:
             raise AfterSalesError("售后申请不存在")
+        if (application.escalation or {}).get('factory_transport'):raise AfterSalesError('本单使用厂家物流返件流程，请按对应交接段操作')
         identity = cls._require_applicant(application, user)
         if application.execution_stage != (
             AfterSalesApplication.ExecutionStage.AWAITING_APPLICANT_SHIPMENT
@@ -1636,6 +2161,7 @@ class AfterSalesService:
         )
         if not application:
             raise AfterSalesError("售后申请不存在")
+        if (application.escalation or {}).get('factory_transport'):raise AfterSalesError('本单使用厂家物流返件流程，请按对应交接段操作')
         identity = cls._require_assignee(application, user)
         if application.execution_stage != (
             AfterSalesApplication.ExecutionStage.AWAITING_REPAIR_RECEIPT
@@ -1701,17 +2227,25 @@ class AfterSalesService:
             AfterSalesApplication.ExecutionStage.REPAIRING,
         }:
             raise AfterSalesError("当前售后申请不在可确认维修完成阶段")
+        if (application.escalation or {}).get("decision") == "FACTORY_REPAIR":
+            from lifecycle.services.repair_escalation_service import _new_media
+            _new_media(cls, application, 'REPAIR_EVIDENCE', application.escalation['factory_received_at'],
+                       '请上传厂家实际维修后的图片或测试视频，不能复用原无法维修凭证', user)
+        transport=(application.escalation or {}).get('factory_transport')
+        if transport:
+            from lifecycle.services.repair_escalation_service import _new_media
+            _new_media(cls,application,'REPAIR_EVIDENCE',transport.get('factory_received_at') or timezone.now(),'请上传厂家收货后本次实际维修凭证',user)
         repair_summary = str(data.get("repair_summary") or "").strip()
         if not repair_summary:
             raise AfterSalesError("请填写处理说明")
         if "repair_material_replaced" not in data:
             raise AfterSalesError("请确认是否更换物料")
         material_replaced = _as_bool(data.get("repair_material_replaced"))
-        repair_materials = cls._normalize_materials(
-            application,
-            data.get("repair_materials"),
-            key_only=False,
-        )
+        from lifecycle.services.repair_basis_service import normalize_replacements
+        try:
+            repair_materials = normalize_replacements(cls, application, data.get("repair_materials") or [])
+        except ValueError as exc:
+            raise AfterSalesError(str(exc)) from exc
         if material_replaced and not repair_materials:
             raise AfterSalesError("已更换物料时，请选择实际更换的BOM物料")
         if not material_replaced:
@@ -1732,9 +2266,16 @@ class AfterSalesService:
         application.repair_materials = repair_materials
         application.repair_completed_by = user
         application.repair_completed_at = actual_time
-        if application.dispatch_route == (
-            AfterSalesApplication.DispatchRoute.ORIGINAL_INSTALLER
-        ):
+        if (application.escalation or {}).get('factory_transport'):
+            from lifecycle.services.factory_transport_service import get as transport,record_repair
+            t=transport(application)
+            if t['kind']!='REPAIR' or t['state']!='FACTORY_RECEIVED' or t.get('repair_completed'):raise AfterSalesError('请先由厂家物流收货，且不能重复完成维修')
+            record_repair(application,user)
+            return cls.serialize(application)
+        if application.dispatch_route in {
+            AfterSalesApplication.DispatchRoute.ORIGINAL_INSTALLER,
+            AfterSalesApplication.DispatchRoute.SERVICE_STATION,
+        }:
             application.status = AfterSalesApplication.Status.WAITING_CUSTOMER_CONFIRM
             application.execution_stage = (
                 AfterSalesApplication.ExecutionStage.AWAITING_APPLICANT_CONFIRM
@@ -1824,6 +2365,7 @@ class AfterSalesService:
         )
         if not application:
             raise AfterSalesError("售后申请不存在")
+        if (application.escalation or {}).get('factory_transport'):raise AfterSalesError('本单使用厂家物流返件流程，请按对应交接段操作')
         identity = cls._require_assignee(application, user)
         if application.execution_stage != (
             AfterSalesApplication.ExecutionStage.AWAITING_RETURN_SHIPMENT
@@ -1897,6 +2439,7 @@ class AfterSalesService:
         )
         if not application:
             raise AfterSalesError("售后申请不存在")
+        if (application.escalation or {}).get('factory_transport'):raise AfterSalesError('本单使用厂家物流返件流程，请按对应交接段操作')
         identity = cls._require_applicant(application, user)
         if application.execution_stage != (
             AfterSalesApplication.ExecutionStage.AWAITING_APPLICANT_CONFIRM
@@ -2114,6 +2657,16 @@ class AfterSalesService:
         fault_type, materials, solution_type, solution_note = cls._validate_final_data(
             application, data
         )
+        if (application.escalation or {}).get("decision") == "REPLACEMENT" and solution_type != "DEVICE_REPLACEMENT":
+            raise AfterSalesError("整机换新结案请选择售后整机换新")
+        if solution_type == "DEVICE_REPLACEMENT" and not ((application.escalation or {}).get("replacement_confirmed_at") or (application.escalation or {}).get('delivery_basis')=='ONSITE_OPERATOR_SCAN'):
+            raise AfterSalesError("换新设备尚未经用户确认收货")
+        from lifecycle.models import ReplacementFlow
+        replacement = ReplacementFlow.objects.filter(application=application,protocol_version__gte=6).first()
+        transport=(application.escalation or {}).get('factory_transport')
+        if transport and transport.get('state')!='DELIVERED':raise AfterSalesError('返厂设备尚未完成原路交付')
+        if replacement and not transport and (not replacement.swapped_at or replacement.recovery.get('state')!='CLOSED'):
+            raise AfterSalesError('须先完成换机交付、厂家物流取货和旧机研判处置，再最终结案')
         application.final_fault_type = fault_type
         application.final_fault_materials = materials
         application.final_solution_type = solution_type
@@ -2122,6 +2675,9 @@ class AfterSalesService:
         application.execution_stage = AfterSalesApplication.ExecutionStage.CLOSED
         application.closed_by = user
         application.closed_at = timezone.now()
+        if application.repair_completed_at and not application.repair_settlement_basis:
+            from lifecycle.services.repair_basis_service import make_basis
+            application.repair_settlement_basis = make_basis(application)
         application.save()
         cls._event(
             application,
@@ -2305,7 +2861,7 @@ class AfterSalesService:
             raise AfterSalesError("供应商质量通知不存在或未向当前账号送达")
         application = (
             AfterSalesApplication.objects.select_related(
-                "factory_organization", "device", "device__product_model"
+                "factory_organization", "device__qrcode", "device__product_model"
             )
             .filter(pk=application_id, status=AfterSalesApplication.Status.CLOSED)
             .first()
@@ -2332,6 +2888,16 @@ class AfterSalesService:
             "supplier": {"id": supplier_id, "name": identity.organization.name},
             "device": {
                 "sn": device.get("sn") or application.device.sn,
+                "lifecycle_code": (
+                    device.get("lifecycle_code")
+                    or device.get("qr_code")
+                    or cls._lifecycle_code(application.device)
+                ),
+                "physical_device_code": (
+                    device.get("physical_device_code")
+                    or application.device.physical_device_code
+                    or ""
+                ),
                 "product_model": device.get("product_model")
                 or application.device.product_model.name,
                 "production_batch": device.get("production_batch")
@@ -2393,7 +2959,7 @@ class AfterSalesService:
         applications = {
             item.id: item
             for item in AfterSalesApplication.objects.select_related(
-                "factory_organization", "device", "device__product_model"
+                "factory_organization", "device__qrcode", "device__product_model"
             ).filter(id__in=application_ids, status=AfterSalesApplication.Status.CLOSED)
         }
         rows = []
@@ -2427,6 +2993,16 @@ class AfterSalesService:
                 "product_model": device.get("product_model")
                 or application.device.product_model.name,
                 "sn": device.get("sn") or application.device.sn,
+                "lifecycle_code": (
+                    device.get("lifecycle_code")
+                    or device.get("qr_code")
+                    or cls._lifecycle_code(application.device)
+                ),
+                "physical_device_code": (
+                    device.get("physical_device_code")
+                    or application.device.physical_device_code
+                    or ""
+                ),
                 "materials": materials,
                 "material_names": list(dict.fromkeys(
                     item.get("material_name") or "物料" for item in materials
@@ -2445,6 +3021,7 @@ class AfterSalesService:
         )
         if not application:
             raise AfterSalesError("售后申请不存在")
+        if (application.escalation or {}).get('factory_transport'):raise AfterSalesError('本单使用厂家物流返件流程，请按对应交接段操作')
         identity = cls._require_factory_aftersales(application, user)
         if (
             application.status != AfterSalesApplication.Status.PENDING_FACTORY_CLOSE
@@ -2629,6 +3206,15 @@ class AfterSalesService:
             "can_third_party_fault_material_return": factory_aftersales and third_party_stage
             and third_party_expense_done,
         }
+        from lifecycle.services.repair_escalation_service import actions as escalation_actions
+        actions.update(escalation_actions(cls, application, user))
+        from lifecycle.models import ReplacementFlow
+        replacement=ReplacementFlow.objects.filter(application=application,protocol_version__gte=6).first()
+        if replacement and replacement.recovery.get('state')!='CLOSED':actions['can_factory_close']=False
+        transport=(application.escalation or {}).get('factory_transport')
+        if transport:
+            for key in ['can_applicant_shipment','can_repair_receipt','can_return_shipment','can_applicant_confirm','can_factory_close','can_escalation_handover','can_escalation_receipt','can_replacement_deliver','can_replacement_confirm']:actions[key]=False
+            actions['can_repair_complete']=bool(assignee and transport.get('kind')=='REPAIR' and transport.get('state')=='FACTORY_RECEIVED' and not transport.get('repair_completed'))
         actions["allowed_media_purposes"] = [
             value
             for value, _ in AfterSalesMedia.Purpose.choices
@@ -2651,6 +3237,11 @@ class AfterSalesService:
 
         stage = application.execution_stage
         action_titles = (
+            ("can_escalation_decide", "待厂家确认无法维修申请", "请同意换新或转返厂维修"),
+            ("can_escalation_handover", "待您交接设备", "请登记寄送或现场交接至厂家"),
+            ("can_escalation_receipt", "待厂家确认收件", "请确认已收到原设备"),
+            ("can_replacement_deliver", "待厂家交付换新设备", "请登记已交付的新设备SN及交付凭证"),
+            ("can_replacement_confirm", "待您确认收到换新设备", "请核对新设备SN并确认收货"),
             ("can_triage", "待您认定并分派", "请完成故障认定并选择处理路径"),
             ("can_applicant_shipment", "待您寄送设备", "请寄送设备并上传物流单据"),
             ("can_repair_receipt", "待您确认收件", "请确认已收到寄修设备"),
@@ -2746,7 +3337,7 @@ class AfterSalesService:
     def detail(cls, *, application_id, user):
         application = (
             AfterSalesApplication.objects.select_related(
-                "device",
+                "device__qrcode",
                 "applicant",
                 "customer_organization",
                 "factory_organization",
@@ -2778,6 +3369,11 @@ class AfterSalesService:
             "is_factory_sales": is_factory_sales,
             "is_factory_aftersales": is_factory_aftersales,
         }
+        from lifecycle.services.replacement_flow_service import describe
+        data['replacement_flow'] = describe(application,user)
+        from lifecycle.services.factory_transport_service import describe as transport_describe,can_start
+        data['factory_transport']=transport_describe(application,user)
+        data['can_start_factory_transport']=can_start(application,user)
         data["actions"] = cls._viewer_actions(application, user, identity)
         data["viewer_stage"] = cls._viewer_stage(
             application,
@@ -2814,23 +3410,11 @@ class AfterSalesService:
             limit = max(1, min(int(limit), 100))
         except (TypeError, ValueError):
             limit = 50
-        identity = cls._identity(user)
-        queryset = AfterSalesApplication.objects.select_related(
-            "device__product_model", "applicant", "factory_organization", "assigned_user"
+        from lifecycle.services.aftersales_access import visible_cases
+        queryset = visible_cases(user).select_related(
+            "device__product_model", "device__qrcode", "applicant",
+            "factory_organization", "assigned_user"
         )
-        if identity and (
-            identity.role.code == "factory_sales"
-            or identity_has_role(identity, "factory_aftersales")
-        ):
-            queryset = queryset.filter(
-                Q(factory_organization_id=identity.organization_id)
-                | Q(applicant_id=user.id)
-                | Q(assigned_user_id=user.id)
-            )
-        else:
-            queryset = queryset.filter(
-                Q(applicant_id=user.id) | Q(assigned_user_id=user.id)
-            )
         return [
             {
                 "id": application.id,
@@ -2840,6 +3424,8 @@ class AfterSalesService:
                 "execution_stage": application.execution_stage,
                 "execution_stage_name": application.get_execution_stage_display(),
                 "sn": application.device.sn,
+                "lifecycle_code": cls._lifecycle_code(application.device),
+                "physical_device_code": application.device.physical_device_code or "",
                 "product_model": application.device.product_model.name,
                 "route": application.dispatch_route,
                 "route_name": (
@@ -2889,7 +3475,19 @@ class AfterSalesService:
     def serialize(cls, application, detail=False):
         if not application:
             return None
+        device_payload = dict(application.device_snapshot or {})
+        device_payload["lifecycle_code"] = (
+            device_payload.get("lifecycle_code")
+            or device_payload.get("qr_code")
+            or cls._lifecycle_code(application.device)
+        )
+        device_payload["physical_device_code"] = (
+            device_payload.get("physical_device_code")
+            or application.device.physical_device_code
+            or ""
+        )
         data = {
+            "escalation": application.escalation or {},
             "id": application.id,
             "case_no": application.case_no,
             "status": application.status,
@@ -2917,7 +3515,7 @@ class AfterSalesService:
                     else ""
                 ),
             },
-            "device": application.device_snapshot or {},
+            "device": device_payload,
             "activation": application.activation_snapshot or {},
             "bom": application.bom_snapshot or {},
             "warranty": application.warranty_snapshot or {},
@@ -2933,6 +3531,7 @@ class AfterSalesService:
                 ),
                 "version": application.dispatch_version,
                 "preliminary_fault_type": application.preliminary_fault_type,
+                "preliminary_fault_materials": application.preliminary_fault_materials or [],
                 "preliminary_fault_type_name": (
                     application.get_preliminary_fault_type_display()
                     if application.preliminary_fault_type

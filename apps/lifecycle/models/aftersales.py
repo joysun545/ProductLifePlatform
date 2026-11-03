@@ -27,10 +27,16 @@ class AfterSalesApplication(models.Model):
         ORIGINAL_INSTALLER = "ORIGINAL_INSTALLER", "原装车操作人"
         MERCHANT_ELECTRICIAN = "MERCHANT_ELECTRICIAN", "一级商家电工"
         FACTORY_AFTERSALES = "FACTORY_AFTERSALES", "厂家售后经理"
+        SERVICE_STATION = "SERVICE_STATION", "售后服务站"
         REMOTE = "REMOTE", "厂家销售经理远程排障"
         THIRD_PARTY = "THIRD_PARTY", "第三方紧急维修"
 
     class ExecutionStage(models.TextChoices):
+        PENDING_ESCALATION = "PENDING_ESCALATION", "无法维修待厂家确认"
+        AWAITING_FACTORY_HANDOVER = "AWAITING_FACTORY_HANDOVER", "待交接设备至厂家"
+        AWAITING_FACTORY_RECEIPT = "AWAITING_FACTORY_RECEIPT", "待厂家确认收件"
+        AWAITING_REPLACEMENT = "AWAITING_REPLACEMENT", "待厂家交付换新设备"
+        AWAITING_REPLACEMENT_CONFIRM = "AWAITING_REPLACEMENT_CONFIRM", "待用户确认收到换新设备"
         NONE = "NONE", "待厂家判断"
         CONTACT_INSTALLER = "CONTACT_INSTALLER", "联系原装车操作人"
         AWAITING_APPLICANT_SHIPMENT = "AWAITING_APPLICANT_SHIPMENT", "待发起人寄送设备"
@@ -57,6 +63,7 @@ class AfterSalesApplication(models.Model):
         COMPONENT_REPLACEMENT = "COMPONENT_REPLACEMENT", "更换配套物料"
         THIRD_PARTY_REPAIR = "THIRD_PARTY_REPAIR", "第三方维修"
         NO_REPAIR_REQUIRED = "NO_REPAIR_REQUIRED", "无需维修"
+        DEVICE_REPLACEMENT = "DEVICE_REPLACEMENT", "售后整机换新"
         OTHER = "OTHER", "其他"
 
     class ApplicantConfirmMode(models.TextChoices):
@@ -79,6 +86,8 @@ class AfterSalesApplication(models.Model):
     location_confirmed = models.BooleanField(default=False)
     location_confirmed_at = models.DateTimeField(null=True, blank=True)
     activation_snapshot = models.JSONField(default=dict, blank=True)
+    device_presence_verified_at = models.DateTimeField(null=True, blank=True)
+    device_presence_code_snapshot = models.CharField(max_length=64, blank=True, default="")
     device_snapshot = models.JSONField(default=dict, blank=True)
     bom_snapshot = models.JSONField(default=dict, blank=True)
     warranty_snapshot = models.JSONField(default=dict, blank=True)
@@ -89,6 +98,7 @@ class AfterSalesApplication(models.Model):
     dispatch_route = models.CharField(max_length=32, choices=DispatchRoute.choices, blank=True, default="")
     execution_stage = models.CharField(max_length=40, choices=ExecutionStage.choices, default=ExecutionStage.NONE)
     preliminary_fault_type = models.CharField(max_length=48, choices=FaultType.choices, blank=True, default="")
+    preliminary_fault_materials = models.JSONField(default=list, blank=True)
     diagnosis_note = models.TextField(blank=True, default="")
     repair_plan = models.TextField(blank=True, default="")
     assigned_user = models.ForeignKey(
@@ -106,6 +116,11 @@ class AfterSalesApplication(models.Model):
     )
     triaged_at = models.DateTimeField(null=True, blank=True)
     dispatch_version = models.PositiveIntegerField(default=0)
+    # Frozen when a repaired case is closed; historical records are not inferred.
+    escalation = models.JSONField(default=dict, blank=True)
+    replacement_device = models.OneToOneField("lifecycle.Device", null=True, blank=True,
+        on_delete=models.PROTECT, related_name="replacement_after_sales")
+    repair_settlement_basis = models.JSONField(default=dict, blank=True)
     repair_summary = models.TextField(blank=True, default="")
     repair_material_replaced = models.BooleanField(null=True, blank=True)
     repair_materials = models.JSONField(default=list, blank=True)
@@ -153,6 +168,7 @@ class AfterSalesMedia(models.Model):
 
     class Purpose(models.TextChoices):
         APPLICATION_EVIDENCE = "APPLICATION_EVIDENCE", "申请故障证据"
+        PLATE_PRESENCE_EVIDENCE = "PLATE_PRESENCE_EVIDENCE", "车牌实时照片"
         APPLICANT_SHIPMENT_DOCUMENT = "APPLICANT_SHIPMENT_DOCUMENT", "发起人寄送物流单据"
         REPAIR_EVIDENCE = "REPAIR_EVIDENCE", "维修过程或测试证据"
         REPAIR_RETURN_SHIPMENT_DOCUMENT = "REPAIR_RETURN_SHIPMENT_DOCUMENT", "维修返件物流单据"
@@ -178,6 +194,35 @@ class AfterSalesMedia(models.Model):
     class Meta:
         ordering = ("sequence", "id")
         indexes = [models.Index(fields=("application", "purpose"), name="life_as_media_purpose")]
+
+
+class AfterSalesDeviceCodeVerification(models.Model):
+    """One-time proof that the applicant scanned the device code QR."""
+
+    token = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    device = models.ForeignKey(
+        "lifecycle.Device",
+        on_delete=models.CASCADE,
+        related_name="after_sales_code_verifications",
+    )
+    user = models.ForeignKey(
+        "account.User",
+        on_delete=models.CASCADE,
+        related_name="after_sales_code_verifications",
+    )
+    device_code = models.CharField(max_length=64)
+    expires_at = models.DateTimeField(db_index=True)
+    used_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-created_at", "-id")
+        indexes = [
+            models.Index(
+                fields=("device", "user", "expires_at"),
+                name="life_as_code_verify_idx",
+            )
+        ]
 
 
 class AfterSalesEvent(models.Model):

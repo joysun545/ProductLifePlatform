@@ -59,13 +59,49 @@ class AcceptInstallationInvitationSerializer(serializers.Serializer):
 
 
 class ActivateCustomerDeviceSerializer(serializers.Serializer):
-    vehicle_no = serializers.CharField(max_length=64, trim_whitespace=True)
+    activation_method = serializers.ChoiceField(
+        choices=("VEHICLE_PLATE", "DEVICE_CODE"),
+        required=False,
+        default="VEHICLE_PLATE",
+    )
+    vehicle_no = serializers.CharField(
+        required=False, allow_blank=True, max_length=64, trim_whitespace=True
+    )
+    physical_device_code = serializers.CharField(
+        required=False, allow_blank=True, max_length=1024, trim_whitespace=True
+    )
     location = serializers.CharField(
         required=False,
         allow_blank=True,
         max_length=128,
         trim_whitespace=True,
     )
+
+    def validate(self, attrs):
+        method = attrs.get("activation_method", "VEHICLE_PLATE")
+        vehicle_no = (attrs.get("vehicle_no") or "").strip()
+        device_code = (attrs.get("physical_device_code") or "").strip()
+        if method == "VEHICLE_PLATE" and not vehicle_no:
+            raise serializers.ValidationError({"vehicle_no": "绑定车牌号时必须填写车辆牌号"})
+        if method == "DEVICE_CODE" and not device_code:
+            raise serializers.ValidationError({"physical_device_code": "请先扫描设备编码二维码"})
+        if method == "VEHICLE_PLATE" and device_code:
+            raise serializers.ValidationError({"physical_device_code": "车牌号与设备编码只能选择一种激活方式"})
+        if method == "DEVICE_CODE" and vehicle_no:
+            raise serializers.ValidationError({"vehicle_no": "设备编码与车牌号只能选择一种激活方式"})
+        return attrs
+
+
+class VerifyActivationDeviceCodeSerializer(serializers.Serializer):
+    device_code = serializers.CharField(max_length=1024, trim_whitespace=True)
+
+
+class GeneratePhysicalDeviceCodeBatchSerializer(serializers.Serializer):
+    quantity = serializers.IntegerField(min_value=1, max_value=1000)
+
+
+class VerifyAfterSalesDeviceCodeSerializer(serializers.Serializer):
+    device_code = serializers.CharField(max_length=1024, trim_whitespace=True)
 
 
 class CreateGoodsTransferSerializer(serializers.Serializer):

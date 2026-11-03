@@ -14,6 +14,9 @@ app_name = "lifecycle"
 
 
 urlpatterns = [
+    path('after-sales/replacement-material-returns/<int:part_id>/',views.ReplacementMaterialReturnAPI.as_view(),name='replacement_material_return'),
+    path('after-sales/recovered-stock/',views.ReplacementRecoveredStockAPI.as_view(),name='replacement_recovered_stock'),
+    path("after-sales/applications/<int:application_id>/escalation/", views.AfterSalesEscalationAPI.as_view(), name="after_sales_escalation"),
 
     path(
         "after-sales/service-station/organization-badge/",
@@ -39,6 +42,11 @@ urlpatterns = [
         "customer/devices/<int:device_id>/after-sales/context/",
         views.AfterSalesRequestContextAPI.as_view(),
         name="after_sales_request_context",
+    ),
+    path(
+        "customer/devices/<int:device_id>/after-sales/verify-device-code/",
+        views.AfterSalesDeviceCodePresenceAPI.as_view(),
+        name="after_sales_verify_device_code_presence",
     ),
     path(
         "customer/devices/<int:device_id>/after-sales/applications/",
@@ -441,6 +449,16 @@ urlpatterns = [
         "customer/devices/<int:device_id>/activate/",
         views.ActivateCustomerDeviceAPI.as_view(),
         name="customer_device_activate",
+    ),
+    path(
+        "customer/devices/<int:device_id>/activation-code/verify/",
+        views.VerifyCustomerActivationDeviceCodeAPI.as_view(),
+        name="customer_activation_device_code_verify",
+    ),
+    path(
+        "factory/device-codes/batches/",
+        views.FactoryPhysicalDeviceCodeBatchAPI.as_view(),
+        name="factory_physical_device_code_batch",
     ),
 
     path(

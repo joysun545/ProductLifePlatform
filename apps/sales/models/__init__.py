@@ -31,6 +31,12 @@ from .order_material_plan import (
     OrderPlanSupplyDeliveryLine,
     OrderPlanSupplyDeliveryRequirement,
 )
+from .order_accessory import (
+    OrderPlanAccessoryCompatibility,
+    OrderPlanAccessoryItem,
+    OrderPlanShipmentAccessoryItem,
+    OrderPlanAccessoryLotAllocation,
+)
 
 
 __all__ = (
@@ -62,4 +68,10 @@ __all__ = (
     "OrderPlanShipmentDevice",
     "OrderPlanShipmentItem",
     "OrderPlanCancellationAudit",
+    "OrderPlanAccessoryCompatibility",
+    "OrderPlanAccessoryItem",
+    "OrderPlanShipmentAccessoryItem",
+    "OrderPlanAccessoryLotAllocation",
 )
+
+from .replacement_supply import ReplacementSupplyPlan, ReplacementSupplyPlanItem

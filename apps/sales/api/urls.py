@@ -7,6 +7,8 @@ app_name = "sales"
 
 
 urlpatterns = [
+    path("replacement-supply-plans/",views.replacement_supply_plans,name="replacement_supply_plans"),
+    path("replacement-supply-plans/<int:plan_id>/",views.replacement_supply_plans,name="replacement_supply_plan_detail"),
     path("order-plans/", views.order_plan_list, name="order_plan_list"),
     path("order-plans/options/", views.order_plan_options, name="order_plan_options"),
     path("order-plans/reissue-options/", views.order_plan_reissue_options, name="order_plan_reissue_options"),

@@ -27,6 +27,4 @@ def get_statistics_identity(user):
         raise StatisticsAccessError(
             "当前账号没有归属明确厂家链路的有效组织岗位，无法查看数据统计。"
         )
-    if identity.organization.organization_type.code == "CUSTOMER":
-        raise StatisticsAccessError("用户账号请从‘我的设备与服务’查看个人数据。")
     return StatisticsIdentity(user, identity, identity.organization, identity.role)

@@ -1,6 +1,7 @@
 from urllib.parse import parse_qs, unquote, urlparse
 
 from django.core.exceptions import ObjectDoesNotExist
+from django.utils import timezone
 
 from account.services.auth_service import get_active_identity
 from common.domain.device_ownership import (
@@ -8,7 +9,7 @@ from common.domain.device_ownership import (
     resolve_device_ownership,
 )
 from common.domain.device_ownership.types import organization_payload
-from lifecycle.models import InstallationInvitation, QRCode
+from lifecycle.models import Device, InstallationInvitation, QRCode
 
 
 class QRCodeResolveError(Exception):
@@ -24,7 +25,7 @@ class ScanService:
         if not raw or len(raw) > 1024:
             raise QRCodeResolveError("二维码内容无效")
 
-        if raw.startswith("PLDP_DEVICE|"):
+        if raw.startswith(("PLDP_DEVICE|", "PLDP_DEVICE_CODE|")):
             code = raw.partition("|")[2].strip()
         elif raw.startswith(("http://", "https://")):
             parsed = urlparse(raw)
@@ -62,8 +63,22 @@ class ScanService:
     def resolve(cls, *, qr_text: str, user) -> dict:
         code = cls.extract_code(qr_text)
         qrcode = cls._qrcode_queryset().filter(code=code).first()
-        cls._validate_qrcode(qrcode)
-        return cls._build_result(qrcode=qrcode, user=user)
+        if qrcode:
+            cls._validate_qrcode(qrcode)
+            return cls._build_result(qrcode=qrcode, user=user)
+
+        # After activation, the physical device QR becomes another entry point
+        # to the same device lifecycle. Keep the packaging lifecycle QR code as
+        # the canonical lifecycle identifier returned by the existing API.
+        device = Device.objects.filter(physical_device_code=code).first()
+        if not device:
+            raise QRCodeResolveError("未找到对应的设备二维码")
+        lifecycle_qrcode = cls._qrcode_queryset().filter(device=device).first()
+        return cls._build_result(
+            qrcode=lifecycle_qrcode,
+            device=device,
+            user=user,
+        )
 
     @classmethod
     def resolve_device(cls, *, device, user) -> dict:
@@ -85,8 +100,12 @@ class ScanService:
             raise QRCodeResolveError("该二维码尚未绑定设备")
 
     @classmethod
-    def _build_result(cls, *, qrcode, user):
-        device = qrcode.device
+    def _build_result(cls, *, qrcode=None, device=None, user):
+        if qrcode:
+            device = qrcode.device
+        if not device:
+            raise QRCodeResolveError("未找到对应的设备")
+        lifecycle_code = qrcode.code if qrcode else ""
         identity = get_active_identity(user)
         ownership = resolve_device_ownership(
             device=device,
@@ -100,7 +119,7 @@ class ScanService:
 
         ownership_payload = ownership.as_dict()
         payload = {
-            "qr_code": qrcode.code,
+            "qr_code": lifecycle_code,
             "view_mode": access.view_mode,
             "role": identity.role.code if identity else "tourist",
             "viewer_relation": ownership.viewer_relation,
@@ -110,7 +129,7 @@ class ScanService:
                 "viewer_relation_names"
             ],
             "capabilities": list(access.capabilities),
-            "device": cls._public_device(device),
+            "device": cls._public_device(device, lifecycle_code=lifecycle_code),
         }
 
         if access.allows("view_region_owner"):
@@ -140,12 +159,14 @@ class ScanService:
             return None
 
     @classmethod
-    def _public_device(cls, device):
+    def _public_device(cls, device, *, lifecycle_code=""):
         product_model = device.product_model
         state = cls._related_object(device, "state")
         return {
             "id": device.pk,
             "sn": device.sn,
+            "lifecycle_code": lifecycle_code,
+            "physical_device_code": device.physical_device_code or "",
             "manufacturer": device.batch.manufacturer.name,
             "product_model": {
                 "id": product_model.pk,
@@ -242,8 +263,24 @@ class ScanService:
         )
         if not invitation:
             return None
+
+        now = timezone.now()
+        remaining_seconds = max(
+            0,
+            int((invitation.expires_at - now).total_seconds()),
+        )
+        invitation_status = invitation.status
+        if (
+            invitation_status == InstallationInvitation.Status.PENDING
+            and remaining_seconds <= 0
+        ):
+            # 扫码结果是只读查询；按有效期返回过期状态，不在这里写数据库。
+            invitation_status = InstallationInvitation.Status.EXPIRED
+
         return {
-            "status": invitation.status,
+            "status": invitation_status,
+            "expires_at": invitation.expires_at.isoformat(),
+            "remaining_seconds": remaining_seconds,
             "accepted_at": (
                 invitation.accepted_at.isoformat()
                 if invitation.accepted_at
@@ -253,11 +290,81 @@ class ScanService:
 
     @staticmethod
     def _traceability(device):
+        from django.db.models import Prefetch
+
+        from sales.models import (
+            OrderPlanMaterialLotAllocation,
+            OrderPlanMaterialRequirement,
+            OrderPlanItemMaterialBatch,
+        )
+
         bom = device.batch.bom
-        items = (
+        items = list(
             bom.items.select_related("material", "material_spec", "supplier")
             .order_by("material__code", "id")
         )
+        receipt_codes_by_bom_item = {}
+        supplier_codes_by_bom_item = {}
+        if items:
+            item_ids = [item.pk for item in items]
+            item_by_id = {item.pk: item for item in items}
+            consumed_allocations = (
+                OrderPlanMaterialLotAllocation.objects.filter(consumed_milli__gt=0)
+                .select_related("material_lot")
+                .order_by("material_lot__received_at", "id")
+            )
+            requirements = (
+                OrderPlanMaterialRequirement.objects.filter(
+                    production_subplan_item__production_batch_id=device.batch_id,
+                    bom_item_id__in=item_ids,
+                )
+                .prefetch_related(
+                    Prefetch(
+                        "lot_allocations",
+                        queryset=consumed_allocations,
+                        to_attr="consumed_lot_allocations",
+                    )
+                )
+                .order_by("bom_item_id", "id")
+            )
+            for requirement in requirements:
+                codes = receipt_codes_by_bom_item.setdefault(
+                    requirement.bom_item_id, []
+                )
+                for allocation in requirement.consumed_lot_allocations:
+                    code = allocation.material_lot.batch_code
+                    if code and code not in codes:
+                        codes.append(code)
+
+            supplier_usages = (
+                OrderPlanItemMaterialBatch.objects.filter(
+                    order_plan_item__production_subplan_items__production_batch_id=(
+                        device.batch_id
+                    ),
+                    bom_item_id__in=item_ids,
+                )
+                .select_related("supplier_material_batch", "bom_item")
+                .order_by("bom_item_id", "id")
+            )
+            for usage in supplier_usages:
+                bom_item = item_by_id.get(usage.bom_item_id)
+                supplier_batch = usage.supplier_material_batch
+                if not bom_item or not supplier_batch:
+                    continue
+                # Historical data may contain manually linked inconsistent
+                # rows; never display a supplier lot for another BOM supplier,
+                # material, or specification.
+                if (
+                    supplier_batch.supplier_id != bom_item.supplier_id
+                    or supplier_batch.material_id != bom_item.material_id
+                    or supplier_batch.material_spec_id != bom_item.material_spec_id
+                ):
+                    continue
+                code = supplier_batch.batch_code
+                codes = supplier_codes_by_bom_item.setdefault(bom_item.pk, [])
+                if code and code not in codes:
+                    codes.append(code)
+
         return {
             "bom": {
                 "id": bom.pk,
@@ -274,6 +381,18 @@ class ScanService:
                     "supplier_name": item.supplier.name if item.supplier else "",
                     "quantity": item.quantity,
                     "remark": item.remark,
+                    "factory_receipt_batch_codes": receipt_codes_by_bom_item.get(
+                        item.pk, []
+                    ),
+                    "factory_receipt_batch_code_text": "、".join(
+                        receipt_codes_by_bom_item.get(item.pk, [])
+                    ),
+                    "supplier_production_batch_codes": supplier_codes_by_bom_item.get(
+                        item.pk, []
+                    ),
+                    "supplier_production_batch_code_text": "、".join(
+                        supplier_codes_by_bom_item.get(item.pk, [])
+                    ),
                 }
                 for item in items
             ],

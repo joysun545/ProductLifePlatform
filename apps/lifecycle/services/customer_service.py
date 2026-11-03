@@ -1,6 +1,7 @@
 import uuid
 from datetime import timedelta
 
+from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 from django.utils import timezone
 
@@ -26,9 +27,16 @@ from lifecycle.models import (
     LifecycleEvent,
     OrganizationDevice,
     ProductDocumentRead,
+    QRCode,
     VehicleDeviceAssignment,
 )
 from lifecycle.services.scan_service import ScanService
+from lifecycle.services.physical_device_code_service import (
+    PhysicalDeviceCodeError,
+    bind_device_code,
+    normalize_device_code,
+    verify_device_code_for_activation,
+)
 from integration.services.device_telemetry import DeviceTelemetryService
 from product.models import ProductDocument
 from quality_trace.services import enforce_device_operation, quality_gate_atomic
@@ -96,6 +104,7 @@ class CustomerDeviceService:
             InstallationInvitation.objects.select_related(
                 "device__product_model__category",
                 "device__batch__manufacturer",
+                "device__qrcode",
                 "installation",
                 "inviter",
                 "source_organization",
@@ -150,6 +159,10 @@ class CustomerDeviceService:
             "nickname": user.wx_nickname or user.username,
             "region": identity.organization.region if identity else "",
         }
+        try:
+            invitation_lifecycle_code = invitation.device.qrcode.code
+        except ObjectDoesNotExist:
+            invitation_lifecycle_code = ""
 
         return {
             "token": str(invitation.token),
@@ -165,6 +178,8 @@ class CustomerDeviceService:
             "device": {
                 "id": invitation.device_id,
                 "sn": invitation.device.sn,
+                "lifecycle_code": invitation_lifecycle_code,
+                "physical_device_code": invitation.device.physical_device_code or "",
                 "product_model": invitation.device.product_model.name,
                 "product_model_code": invitation.device.product_model.code,
                 "category": invitation.device.product_model.category.name,
@@ -274,6 +289,59 @@ class CustomerDeviceService:
         )
         return organization, identity
 
+    @classmethod
+    def _restore_inactive_customer_identity(cls, *, user, invitation):
+        """Reuse a compatible inactive customer slot instead of inserting a duplicate.
+
+        UserOrganization is one-to-one with User, including inactive historical rows.
+        A guest lookup can therefore return no active identity even though the account
+        still has a dormant customer-owner slot. Only restore that exact role when its
+        organization is active and belongs to the invitation's factory tenant.
+        """
+        identity = (
+            UserOrganization.objects.select_for_update()
+            .select_related(
+                "organization__organization_type",
+                "organization__factory_root",
+                "role__organization_type",
+            )
+            .filter(user_id=user.pk)
+            .first()
+        )
+        if identity is None:
+            return None
+
+        if identity.is_active:
+            raise CustomerFlowPermissionError(
+                "当前微信已有未能识别的组织身份，请联系管理员核实后再接受邀请"
+            )
+
+        organization = identity.organization
+        role = identity.role
+        if not (
+            invitation.target_role.code == "customer_owner"
+            and organization.organization_type.code == "CUSTOMER"
+            and organization.is_active
+            and organization.organization_type.is_active
+            and role.code == "customer_owner"
+            and role.is_active
+        ):
+            raise CustomerFlowPermissionError(
+                "当前微信保留有其他或已停用的历史身份，不能直接接受设备邀请；请联系管理员核实"
+            )
+
+        source_root = invitation.source_organization.get_factory_root()
+        customer_root = organization.get_factory_root()
+        if not source_root or not customer_root or source_root.pk != customer_root.pk:
+            raise CustomerFlowPermissionError(
+                "当前用户档案不属于该设备的厂家链路，不能接受此邀请"
+            )
+
+        identity.is_active = True
+        identity.full_clean()
+        identity.save(update_fields=("is_active", "updated_at"))
+        return identity
+
     @staticmethod
     def _ensure_sales_relation(*, source_organization, customer_organization):
         """记录每台设备真实来源；终端用户可从多个商家购买设备。"""
@@ -338,6 +406,12 @@ class CustomerDeviceService:
 
         identity = get_active_identity(user)
         existing_customer = bool(identity)
+        if identity is None:
+            identity = cls._restore_inactive_customer_identity(
+                user=user,
+                invitation=invitation,
+            )
+            existing_customer = bool(identity)
         profile_data = dict(customer_data)
         if identity:
             if not (
@@ -545,6 +619,7 @@ class CustomerDeviceService:
                 "device__batch__manufacturer",
                 "device__batch__bom",
                 "device__state",
+                "device__qrcode",
             )
             .order_by("-updated_at", "-id")
         )
@@ -565,6 +640,10 @@ class CustomerDeviceService:
         for record in records:
             device = record.device
             binding = bindings.get(device.id)
+            try:
+                lifecycle_code = device.qrcode.code
+            except ObjectDoesNotExist:
+                lifecycle_code = ""
             if allowed_vehicle_ids is not None and (
                 not binding or binding.vehicle_id not in allowed_vehicle_ids
             ):
@@ -573,6 +652,8 @@ class CustomerDeviceService:
                 {
                     "id": device.id,
                     "sn": device.sn,
+                    "lifecycle_code": lifecycle_code,
+                    "physical_device_code": device.physical_device_code or "",
                     "product_model": device.product_model.name,
                     "product_model_code": device.product_model.code,
                     "category": device.product_model.category.name,
@@ -795,10 +876,22 @@ class CustomerDeviceService:
     def _document_gate(cls, *, device, user, invitation):
         documents = cls._ordered_documents(device)
         current_versions = {(document.id, document.version) for document in documents}
+        # Same-user, same-version reading facts remain valid across replacement;
+        # do not fabricate new reads or bypass changed document versions.
+        from lifecycle.models import ReplacementFlow
+        reading_devices=[device.pk]
+        cursor=device.pk
+        for _ in range(50):
+            predecessor=ReplacementFlow.objects.filter(application__replacement_device_id=cursor,swapped_at__isnull=False).select_related('application__device').first()
+            if not predecessor or predecessor.application.device.product_model_id!=device.product_model_id:
+                break
+            cursor=predecessor.application.device_id
+            if cursor in reading_devices:break
+            reading_devices.append(cursor)
         read_versions = set(
             ProductDocumentRead.objects.filter(
                 user=user,
-                device=device,
+                device_id__in=reading_devices,
                 document_id__in=[document.id for document in documents],
             ).values_list("document_id", "document_version")
         )
@@ -955,6 +1048,9 @@ class CustomerDeviceService:
         if binding:
             profile["vehicle_no"] = binding.vehicle_no
         is_activated = device.state.activation_status == "ACTIVATED"
+        activation_record = getattr(device, "activation", None)
+        from lifecycle.models import ReplacementFlow
+        replacement = ReplacementFlow.objects.filter(application__replacement_device=device,swapped_at__isnull=False).first()
         product_model = device.product_model
         batch = device.batch
         events = list(
@@ -980,6 +1076,8 @@ class CustomerDeviceService:
             "asset": {
                 "device_id": device.id,
                 "sn": device.sn,
+                "lifecycle_code": scan_result.get("qr_code", ""),
+                "physical_device_code": device.physical_device_code or "",
                 "product_model_id": product_model.id,
                 "product_model": product_model.name,
                 "product_model_code": product_model.code,
@@ -1004,6 +1102,22 @@ class CustomerDeviceService:
                 {"label": "BOM版本", "value": batch.bom.version},
             ],
             "lifecycle": [cls._event_payload(event) for event in events],
+            "activation": {
+                "required_activation_method": 'DEVICE_CODE' if replacement and not activation_record else '',
+                "inherited_first_activation_at": replacement.first_activation_at.isoformat() if replacement else '',
+                "activation_method": (
+                    activation_record.activation_method if activation_record else (replacement.activation_method if replacement else "")
+                ),
+                "activated_at": (
+                    activation_record.activation_time.isoformat()
+                    if activation_record else ""
+                ),
+                "vehicle_no": activation_record.vehicle_no if activation_record else "",
+                "physical_device_code": (
+                    activation_record.physical_device_code_snapshot
+                    if activation_record else ""
+                ),
+            },
             "customer": {
                 "organization_id": identity.organization_id,
                 "organization_name": identity.organization.name,
@@ -1019,9 +1133,60 @@ class CustomerDeviceService:
             },
         }
 
+    @staticmethod
+    def normalize_physical_device_code(value):
+        try:
+            return normalize_device_code(value)
+        except PhysicalDeviceCodeError as exc:
+            raise CustomerFlowStateError(str(exc)) from exc
+
+    @classmethod
+    def verify_activation_device_code(cls, *, device_id, user, device_code):
+        identity, device, _invitation = cls._owned_device_context(
+            device_id=device_id,
+            user=user,
+        )
+        device = Device.objects.select_for_update().select_related(
+            "batch__manufacturer"
+        ).get(pk=device.pk)
+        state = DeviceState.objects.select_for_update().get(device=device)
+        owner_record = OrganizationDevice.objects.select_for_update().get(
+            device=device
+        )
+        if owner_record.organization_id != identity.organization_id:
+            raise CustomerFlowPermissionError("该设备不属于当前用户组织")
+        if state.install_status != "INSTALLED":
+            raise CustomerFlowStateError("设备尚未完成装车")
+        if state.activation_status == "ACTIVATED" or ActivationRecord.objects.filter(
+            device=device
+        ).exists():
+            raise CustomerFlowStateError("设备已经激活，不能再绑定设备编码")
+        try:
+            _entry, normalized_code = verify_device_code_for_activation(
+                device=device,
+                raw_code=device_code,
+            )
+        except PhysicalDeviceCodeError as exc:
+            raise CustomerFlowStateError(str(exc)) from exc
+        return {
+            "verified": True,
+            "device_code": normalized_code,
+            "status": "AVAILABLE",
+            "message": "设备编码已登记且可用于当前设备激活",
+        }
+
     @classmethod
     @quality_gate_atomic(CustomerFlowStateError)
-    def activate(cls, *, device_id, user, vehicle_no, location=""):
+    def activate(
+        cls,
+        *,
+        device_id,
+        user,
+        vehicle_no="",
+        activation_method="VEHICLE_PLATE",
+        physical_device_code="",
+        location="",
+    ):
         # 这里必须复用详情页的属主和司机车辆授权校验，避免同一用户组织中
         # 未获得车辆分享的司机绕过页面直接调用激活接口。
         identity, _, invitation = cls._owned_device_context(
@@ -1045,6 +1210,35 @@ class CustomerDeviceService:
         if ActivationRecord.objects.filter(device=device).exists():
             raise CustomerFlowStateError("设备已经存在激活记录")
 
+        from lifecycle.models import ReplacementFlow
+        inherited_flow = ReplacementFlow.objects.filter(application__replacement_device=device).first()
+        if inherited_flow and (not inherited_flow.swapped_at or inherited_flow.activation_method != 'DEVICE_CODE'
+                or str(activation_method).upper() != 'DEVICE_CODE'):
+            raise CustomerFlowStateError('换新设备必须先签收，并按原设备编码方式重新扫码激活售后')
+        activation_method = str(activation_method or "VEHICLE_PLATE").strip().upper()
+        vehicle_no = str(vehicle_no or "").strip()
+        normalized_device_code = ""
+        device_code_entry = None
+        if activation_method == ActivationRecord.ActivationMethod.VEHICLE_PLATE:
+            if not vehicle_no:
+                raise CustomerFlowStateError("请填写车辆牌号")
+            if physical_device_code:
+                raise CustomerFlowStateError("车牌号与设备编码只能选择一种激活方式")
+        elif activation_method == ActivationRecord.ActivationMethod.DEVICE_CODE:
+            if vehicle_no:
+                raise CustomerFlowStateError("设备编码与车牌号只能选择一种激活方式")
+            try:
+                device_code_entry, normalized_device_code = (
+                    verify_device_code_for_activation(
+                        device=device,
+                        raw_code=physical_device_code,
+                    )
+                )
+            except PhysicalDeviceCodeError as exc:
+                raise CustomerFlowStateError(str(exc)) from exc
+        else:
+            raise CustomerFlowStateError("激活方式无效")
+
         document_gate = cls._document_gate(
             device=device,
             user=user,
@@ -1060,11 +1254,24 @@ class CustomerDeviceService:
             context={
                 "source": "CUSTOMER_DEVICE_ACTIVATION",
                 "customer_organization_id": identity.organization_id,
+                "activation_method": activation_method,
                 "vehicle_no": vehicle_no,
+                "physical_device_code": normalized_device_code,
             },
         )
 
         now = timezone.now()
+        if device_code_entry:
+            try:
+                bind_device_code(
+                    entry=device_code_entry,
+                    device=device,
+                    user=user,
+                    code=normalized_device_code,
+                    bound_at=now,
+                )
+            except PhysicalDeviceCodeError as exc:
+                raise CustomerFlowStateError(str(exc)) from exc
         event = LifecycleEvent.objects.create(
             device=device,
             event_type="ACTIVATE",
@@ -1072,17 +1279,29 @@ class CustomerDeviceService:
             organization=identity.organization,
             from_organization=identity.organization,
             to_organization=identity.organization,
-            data={"vehicle_no": vehicle_no, "location": location or ""},
+            data={
+                "activation_method": activation_method,
+                "vehicle_no": vehicle_no,
+                "physical_device_code": normalized_device_code,
+                "location": location or "",
+            },
         )
-        ActivationRecord.objects.create(
+        new_activation = ActivationRecord.objects.create(
             device=device,
             organization=identity.organization,
             operator=user,
+            activation_method=activation_method,
+            physical_device_code_snapshot=normalized_device_code,
             vehicle_no=vehicle_no,
             location=location or "",
             lifecycle_event=event,
         )
 
+        if inherited_flow:
+            ActivationRecord.objects.filter(pk=new_activation.pk).update(activation_time=inherited_flow.first_activation_at)
+            event.data = {**event.data, 'first_activation_at':inherited_flow.first_activation_at.isoformat(),
+                          'replacement_application_id':inherited_flow.application_id, 'actual_reactivation_at':now.isoformat()}
+            event.save(update_fields=['data'])
         state.status = "ACTIVATED"
         state.activation_status = "ACTIVATED"
         state.last_event = event
@@ -1095,7 +1314,9 @@ class CustomerDeviceService:
 
         if invitation:
             data = dict(invitation.customer_data or {})
-            data["vehicle_no"] = vehicle_no
+            data["activation_method"] = activation_method
+            if activation_method == ActivationRecord.ActivationMethod.VEHICLE_PLATE:
+                data["vehicle_no"] = vehicle_no
             invitation.customer_data = data
             invitation.save(update_fields=("customer_data", "updated_at"))
 
@@ -1104,7 +1325,7 @@ class CustomerDeviceService:
             customer_organization=identity.organization,
             status=CustomerDeviceBinding.Status.ACTIVE,
         ).first()
-        if binding:
+        if binding and activation_method == ActivationRecord.ActivationMethod.VEHICLE_PLATE:
             vehicle = cls._vehicle(
                 organization=identity.organization, vehicle_no=vehicle_no,
             )

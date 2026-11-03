@@ -515,6 +515,10 @@ class SupplierSalesResponsibility(models.Model):
 
 # Physical warehouse stock is separate from supplier production-batch metadata.
 from .material_inventory_models import (  # noqa: E402,F401
-    FactoryMaterialStock, FactoryMaterialLot, MaterialWarrantyCase,
+    FactoryMaterialStock,
+    FactoryMaterialLot,
+    OrganizationMaterialStock,
+    OrganizationMaterialLot,
+    MaterialWarrantyCase,
     MaterialWarehouseDocument,
 )

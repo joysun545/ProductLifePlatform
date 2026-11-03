@@ -63,6 +63,9 @@ from sales.models import (
     FactoryMaterialSupplyPolicy,
     FactoryFinishedGoodsInventoryItem,
     OrderPlan,
+    OrderPlanAccessoryCompatibility,
+    OrderPlanAccessoryItem,
+    OrderPlanAccessoryLotAllocation,
     OrderPlanCancellationAudit,
     OrderPlanItem,
     OrderPlanItemBOMConfirmation,
@@ -75,6 +78,7 @@ from sales.models import (
     OrderPlanProductionSubplanItem,
     OrderPlanSalesBOMSelection,
     OrderPlanShipment,
+    OrderPlanShipmentAccessoryItem,
     OrderPlanShipmentDevice,
     OrderPlanShipmentItem,
     OrderPlanSupplyDelivery,
@@ -113,6 +117,8 @@ from supply_chain.models import (
     Material,
     MaterialSpec,
     MaterialSpecSupplier,
+    OrganizationMaterialStock,
+    OrganizationMaterialLot,
 )
 from supply_chain.services.supplier_responsibility_service import (
     SupplierResponsibilityError,
@@ -571,6 +577,237 @@ def _optional_positive_integer(value, label):
     return _positive_integer(value, label)
 
 
+def _positive_quantity_milli(value, label):
+    try:
+        amount = Decimal(str(value))
+    except Exception as exc:
+        raise OrderPlanMaterialFlowError(f"{label}必须是大于0且最多三位小数的数量。") from exc
+    if not amount.is_finite() or amount <= 0:
+        raise OrderPlanMaterialFlowError(f"{label}必须大于0。")
+    scaled = amount * Decimal("1000")
+    if scaled != scaled.to_integral_value():
+        raise OrderPlanMaterialFlowError(f"{label}最多只能填写三位小数。")
+    result = int(scaled)
+    if result <= 0:
+        raise OrderPlanMaterialFlowError(f"{label}必须大于0。")
+    return result
+
+
+def _quantity_from_milli(value):
+    return format((Decimal(int(value or 0)) / Decimal("1000")).normalize(), "f")
+
+
+def _accessory_stock_snapshot(*, factory_id, material_spec_ids):
+    spec_ids = {int(value) for value in material_spec_ids if value}
+    if not spec_ids:
+        return {}, {}
+    units_by_spec = defaultdict(set)
+    for row in FactoryMaterialStock.objects.filter(
+        factory_id=factory_id,
+        material_spec_id__in=spec_ids,
+    ).values("material_spec_id", "unit"):
+        units_by_spec[row["material_spec_id"]].add(row["unit"])
+    availability = {
+        row["stock__material_spec_id"]: int(row["available_milli"] or 0)
+        for row in FactoryMaterialLot.objects.filter(
+            stock__factory_id=factory_id,
+            stock__material_spec_id__in=spec_ids,
+        )
+        .values("stock__material_spec_id")
+        .annotate(available_milli=Sum(F("on_hand_milli") - F("reserved_milli")))
+    }
+    # A bad unit configuration for one spec should not block the whole order
+    # plan form. Such a spec is omitted from the catalog and rejected if a
+    # caller submits it; valid, unrelated accessory specs remain usable.
+    units = {
+        spec_id: next(iter(values))
+        for spec_id, values in units_by_spec.items()
+        if len(values) == 1
+    }
+    return units, availability
+
+
+def _serialize_accessory_catalog(factory_id):
+    compatibility = list(
+        OrderPlanAccessoryCompatibility.objects.filter(
+            factory_organization_id=factory_id,
+            is_active=True,
+        ).select_related(
+            "product_model__category",
+            "material_spec__material",
+        ).order_by(
+            "product_model__category__code",
+            "material_spec__material__code",
+            "material_spec__code",
+            "product_model__code",
+        )
+    )
+    spec_ids = {row.material_spec_id for row in compatibility}
+    units, availability = _accessory_stock_snapshot(
+        factory_id=factory_id,
+        material_spec_ids=spec_ids,
+    )
+    categories = {}
+    for row in compatibility:
+        # A stock record supplies the authoritative quantity unit. A mapped
+        # item without any factory stock record cannot be ordered yet.
+        unit = units.get(row.material_spec_id)
+        if not unit:
+            continue
+        category = row.product_model.category
+        category_row = categories.setdefault(
+            category.pk,
+            {"id": category.pk, "name": category.name, "specs": {}},
+        )
+        spec = row.material_spec
+        spec_row = category_row["specs"].setdefault(
+            spec.pk,
+            {
+                "id": spec.pk,
+                "material_id": spec.material_id,
+                "material_name": spec.material.name,
+                "material_spec_name": spec.name,
+                "material_spec_code": spec.code,
+                "display_name": f"{spec.material.name} · {spec.name}",
+                "unit": unit,
+                "available_milli": availability.get(spec.pk, 0),
+                "available_quantity": _quantity_from_milli(availability.get(spec.pk, 0)),
+                "models": [],
+            },
+        )
+        spec_row["models"].append(
+            {
+                "id": row.product_model_id,
+                "name": row.product_model.name,
+                "code": row.product_model.code,
+            }
+        )
+    return [
+        {
+            "id": category["id"],
+            "name": category["name"],
+            "specs": [
+                {**spec, "models": sorted(spec["models"], key=lambda item: (item["code"], item["id"]))}
+                for spec in sorted(category["specs"].values(), key=lambda item: (item["material_name"], item["material_spec_name"], item["id"]))
+            ],
+        }
+        for category in sorted(categories.values(), key=lambda item: (item["name"], item["id"]))
+    ]
+
+
+def _validated_accessory_entries(*, factory_id, raw_items):
+    if raw_items in (None, ""):
+        return []
+    if not isinstance(raw_items, list):
+        raise OrderPlanMaterialFlowError("配件计划数据格式不正确。")
+    if len(raw_items) > 50:
+        raise OrderPlanMaterialFlowError("单个订单计划最多包含50项配件。")
+    entries = []
+    seen = set()
+    required_by_spec = defaultdict(int)
+    for index, raw in enumerate(raw_items, start=1):
+        if not isinstance(raw, dict):
+            raise OrderPlanMaterialFlowError(f"第{index}项配件数据格式不正确。")
+        category_id = _positive_integer(raw.get("category_id"), f"第{index}项配件品类")
+        product_model_id = _positive_integer(raw.get("product_model_id"), f"第{index}项适配型号")
+        material_spec_id = _positive_integer(raw.get("material_spec_id"), f"第{index}项配件规格")
+        quantity_milli = _positive_quantity_milli(raw.get("quantity"), f"第{index}项配件数量")
+        key = (material_spec_id, product_model_id)
+        if key in seen:
+            raise OrderPlanMaterialFlowError("同一适配型号和物料规格不能重复添加。")
+        seen.add(key)
+        compatibility = OrderPlanAccessoryCompatibility.objects.select_related(
+            "material_spec__material", "product_model__category"
+        ).filter(
+            factory_organization_id=factory_id,
+            material_spec_id=material_spec_id,
+            product_model_id=product_model_id,
+            product_model__category_id=category_id,
+            is_active=True,
+        ).first()
+        if not compatibility:
+            raise OrderPlanMaterialFlowError(
+                f"第{index}项配件与所选厂家、品类或产品型号不匹配。"
+            )
+        entries.append(
+            {
+                "index": index,
+                "category": compatibility.product_model.category,
+                "product_model": compatibility.product_model,
+                "material_spec": compatibility.material_spec,
+                "quantity_milli": quantity_milli,
+            }
+        )
+        required_by_spec[material_spec_id] += quantity_milli
+
+    units, availability = _accessory_stock_snapshot(
+        factory_id=factory_id,
+        material_spec_ids=required_by_spec,
+    )
+    specs = {
+        row.pk: row
+        for row in MaterialSpec.objects.select_related("material").filter(pk__in=required_by_spec)
+    }
+    for spec_id, required in required_by_spec.items():
+        spec = specs[spec_id]
+        unit = units.get(spec_id)
+        if not unit:
+            raise OrderPlanMaterialFlowError(f"配件“{spec.material.name}·{spec.name}”尚未建立厂家库存单位。")
+        available = availability.get(spec_id, 0)
+        if required > available:
+            raise OrderPlanMaterialFlowError(
+                f"配件“{spec.material.name}·{spec.name}”库存不足："
+                f"需求{_quantity_from_milli(required)}{unit}，"
+                f"当前可用{_quantity_from_milli(available)}{unit}。"
+            )
+        for entry in entries:
+            if entry["material_spec"].pk == spec_id:
+                entry["unit_snapshot"] = unit
+    return entries
+
+
+def _reserve_accessory_item(*, accessory_item, actor):
+    remaining = accessory_item.quantity_milli
+    lots = list(
+        FactoryMaterialLot.objects.select_for_update()
+        .select_related("stock")
+        .filter(
+            stock__factory_id=accessory_item.order_plan.factory_organization_id,
+            stock__material_spec_id=accessory_item.material_spec_id,
+            on_hand_milli__gt=F("reserved_milli"),
+        )
+        .order_by("received_at", "id")
+    )
+    available = sum(max(0, lot.on_hand_milli - lot.reserved_milli) for lot in lots)
+    if available < remaining:
+        raise OrderPlanMaterialFlowError(
+            f"配件“{accessory_item.material_spec.material.name}·{accessory_item.material_spec.name}”库存刚刚变化，"
+            f"需要{_quantity_from_milli(remaining)}{accessory_item.unit_snapshot}，"
+            f"当前可用{_quantity_from_milli(available)}{accessory_item.unit_snapshot}。请刷新后重试。"
+        )
+    for lot in lots:
+        if remaining <= 0:
+            break
+        amount = min(remaining, lot.on_hand_milli - lot.reserved_milli)
+        if amount <= 0:
+            continue
+        changed = FactoryMaterialLot.objects.filter(
+            pk=lot.pk,
+            on_hand_milli__gte=F("reserved_milli") + amount,
+        ).update(reserved_milli=F("reserved_milli") + amount)
+        if changed != 1:
+            raise OrderPlanMaterialFlowError("配件库存正在更新，请刷新后重试。")
+        OrderPlanAccessoryLotAllocation.objects.create(
+            accessory_item=accessory_item,
+            material_lot=lot,
+            reserved_milli=amount,
+            reserved_by=actor,
+        )
+        remaining -= amount
+    if remaining:
+        raise OrderPlanMaterialFlowError("配件库存预占失败，请刷新后重试。")
+
+
 def _milli_per_device(value, *, material_name):
     try:
         decimal = Decimal(str(value))
@@ -818,6 +1055,7 @@ def get_material_flow_options(user, *, merchant_id=None):
 
     data["categories"] = category_rows
     data["bom_options_by_product_model"] = public_boms
+    data["accessory_categories"] = _serialize_accessory_catalog(identity.organization_id)
     data["selected_merchant_id"] = selected_merchant_id
     data["material_flow_version"] = 2
     return data
@@ -1193,10 +1431,7 @@ def _create_subplans_and_requirements(material_plan, production_rows, user):
                     production_subplan=subplan,
                     order_plan_item=order_item,
                     quantity=slice_row["quantity"],
-                    production_batch_code=_new_code(
-                        "PB",
-                        f"{material_plan.order_plan.plan_code}-{subplan.sequence_no}-{order_item.product_model.code}",
-                    ),
+                    production_batch_code=_new_code("PB"),
                 )
                 stock_units = {
                     stock.material_spec_id: stock.unit
@@ -1425,15 +1660,47 @@ def _dispatch_window_key(when):
     return local.strftime("%Y%m%d%H")
 
 
+def _serialize_order_accessory_item(row):
+    return {
+        "id": row.pk,
+        "category_id": row.category_id,
+        "category_name": row.category.name,
+        "product_model_id": row.product_model_id,
+        "product_model_name": row.product_model.name,
+        "material_id": row.material_spec.material_id,
+        "material_name": row.material_spec.material.name,
+        "material_spec_id": row.material_spec_id,
+        "material_spec_name": row.material_spec.name,
+        "quantity_milli": row.quantity_milli,
+        "quantity": _quantity_from_milli(row.quantity_milli),
+        "unit": row.unit_snapshot,
+        "status": row.status,
+        "status_name": row.get_status_display(),
+    }
+
+
+def _serialize_order_accessory_items(plan):
+    return [
+        _serialize_order_accessory_item(row)
+        for row in plan.accessory_items.select_related(
+            "category", "product_model", "material_spec__material"
+        ).order_by("id")
+    ]
+
+
 def _creation_result(plan):
     data = _serialize_plan(plan)
     data["flow_version"] = plan.flow_version
     data["detail_link"] = _plan_link(plan)
-    return {"plan": data}
+    data["accessory_items"] = _serialize_order_accessory_items(plan)
+    from lifecycle.services.replacement_flow_service import pending_for_plan
+    return {"plan": data, "pending_replacement_demands": pending_for_plan(plan)}
 
 
 @transaction.atomic
-def create_material_flow_order_plan(*, user, merchant_id, client_request_id, items, remark=""):
+def create_material_flow_order_plan(
+    *, user, merchant_id, client_request_id, items, accessories=None, remark=""
+):
     """Sales creates a V2 plan and immediately reserves finished goods/lots."""
 
     identity = _sales_identity(user)
@@ -1463,6 +1730,10 @@ def create_material_flow_order_plan(*, user, merchant_id, client_request_id, ite
     if not assignment:
         raise OrderPlanMaterialFlowError("请先为该直接商家指定负责区域和品牌。")
     entries = _validated_creation_items(items)
+    accessory_entries = _validated_accessory_entries(
+        factory_id=identity.organization_id,
+        raw_items=accessories,
+    )
     plan = OrderPlan.objects.create(
         plan_code=_new_code("OP"),
         client_request_id=client_request_id,
@@ -1479,6 +1750,17 @@ def create_material_flow_order_plan(*, user, merchant_id, client_request_id, ite
         status=OrderPlan.Status.MATCHING_PENDING,
         flow_version=OrderPlan.FlowVersion.MATERIAL_STOCK_V2,
     )
+
+    for entry in accessory_entries:
+        accessory_item = OrderPlanAccessoryItem.objects.create(
+            order_plan=plan,
+            category=entry["category"],
+            product_model=entry["product_model"],
+            material_spec=entry["material_spec"],
+            quantity_milli=entry["quantity_milli"],
+            unit_snapshot=entry["unit_snapshot"],
+        )
+        _reserve_accessory_item(accessory_item=accessory_item, actor=user)
 
     production_rows = []
     for entry in entries:
@@ -1663,6 +1945,8 @@ def create_material_flow_order_plan(*, user, merchant_id, client_request_id, ite
     )
 
     initialize_order_finance(plan, user=user)
+    from sales.services.replacement_supply_service import auto_attach
+    auto_attach(plan,user)
     return _creation_result(plan), True
 
 
@@ -1694,6 +1978,40 @@ def _shipment_quantity(shipment):
     return sum(shipment.items.values_list("quantity", flat=True))
 
 
+def _shipment_accessory_rows(shipment):
+    return [
+        {
+            "id": row.pk,
+            "order_plan_accessory_item_id": row.accessory_item_id,
+            "category_id": row.accessory_item.category_id,
+            "category_name": row.accessory_item.category.name,
+            "product_model_id": row.accessory_item.product_model_id,
+            "product_model_name": row.accessory_item.product_model.name,
+            "material_id": row.accessory_item.material_spec.material_id,
+            "material_name": row.accessory_item.material_spec.material.name,
+            "material_spec_id": row.accessory_item.material_spec_id,
+            "material_spec_name": row.accessory_item.material_spec.name,
+            "quantity_milli": row.quantity_milli,
+            "quantity": _quantity_from_milli(row.quantity_milli),
+            "unit": row.unit_snapshot,
+            "status": row.accessory_item.status,
+            "status_name": row.accessory_item.get_status_display(),
+        }
+        for row in shipment.accessory_items.select_related(
+            "accessory_item__category",
+            "accessory_item__product_model",
+            "accessory_item__material_spec__material",
+        ).order_by("id")
+    ]
+
+
+def _shipment_accessory_summary(accessory_rows):
+    return "；配件 " + "、".join(
+        f"{row['material_name']} {row['quantity']}{row['unit']}"
+        for row in accessory_rows
+    ) if accessory_rows else ""
+
+
 def _shipment_payload(shipment):
     shipment = (
         OrderPlanShipment.objects.select_related(
@@ -1707,9 +2025,13 @@ def _shipment_payload(shipment):
         .prefetch_related(
             "items__order_plan_item__product_model",
             "items__production_subplan_item",
+            "accessory_items__accessory_item__category",
+            "accessory_items__accessory_item__product_model",
+            "accessory_items__accessory_item__material_spec__material",
         )
         .get(pk=shipment.pk)
     )
+    accessory_rows = _shipment_accessory_rows(shipment)
     return {
         "shipment_id": shipment.pk,
         "status": shipment.status,
@@ -1748,7 +2070,45 @@ def _shipment_payload(shipment):
             }
             for row in shipment.items.all()
         ],
+        "accessory_items": accessory_rows,
+        "accessory_summary": _shipment_accessory_summary(accessory_rows),
     }
+
+
+def _attach_accessories_to_first_shipment(*, plan, shipment):
+    if not plan.accessory_items.exists():
+        return
+    if OrderPlanShipmentAccessoryItem.objects.filter(shipment__order_plan=plan).exists():
+        return
+    accessory_items = list(
+        plan.accessory_items.select_for_update()
+        .select_related("material_spec")
+        .order_by("id")
+    )
+    for accessory_item in accessory_items:
+        allocations = list(
+            OrderPlanAccessoryLotAllocation.objects.select_for_update()
+            .filter(
+                accessory_item=accessory_item,
+                status=OrderPlanAccessoryLotAllocation.Status.RESERVED,
+                shipment_item__isnull=True,
+            )
+            .order_by("material_lot__received_at", "id")
+        )
+        amount = sum(row.reserved_milli for row in allocations)
+        if amount != accessory_item.quantity_milli or not allocations:
+            raise OrderPlanMaterialFlowError(
+                f"配件“{accessory_item.material_spec}”批次预占记录不完整，不能安排首批发货。"
+            )
+        shipment_item = OrderPlanShipmentAccessoryItem.objects.create(
+            shipment=shipment,
+            accessory_item=accessory_item,
+            quantity_milli=amount,
+            unit_snapshot=accessory_item.unit_snapshot,
+        )
+        OrderPlanAccessoryLotAllocation.objects.filter(
+            pk__in=[row.pk for row in allocations]
+        ).update(shipment_item=shipment_item, updated_at=timezone.now())
 
 
 def _publish_shipment_authorization_task(*, plan, shipment, actor_openid):
@@ -1760,7 +2120,7 @@ def _publish_shipment_authorization_task(*, plan, shipment, actor_openid):
         stage_key=f"shipment:{shipment.pk}:authorization",
         title=f"{payload['shipment_label']}待授权发货",
         summary=(
-            f"{plan.merchant_organization.name}｜{payload['quantity']}台；"
+            f"{plan.merchant_organization.name}｜{payload['quantity']}台{payload.get('accessory_summary', '')}；"
             "授权后由厂家成品库管打码贴包，物流经理确认出库，再由成品库管确认发货。"
         ),
         recipients=(sales_openid,),
@@ -1811,7 +2171,7 @@ def _publish_shipment_logistics_task(*, plan, shipment, actor_openid):
         stage_key=f"shipment:{shipment.pk}:logistics-confirm",
         title=f"{payload['shipment_label']}待确认线下出库",
         summary=(
-            f"{plan.merchant_organization.name}｜{payload['quantity']}台；"
+            f"{plan.merchant_organization.name}｜{payload['quantity']}台{payload.get('accessory_summary', '')}；"
             "请填写物流公司、物流单号，可上传物流凭证；确认线下出库后推送成品库管发货。"
         ),
         recipients=recipients,
@@ -1843,7 +2203,7 @@ def _publish_shipment_outbound_task(*, plan, shipment, actor_openid):
         stage_key=f"shipment:{shipment.pk}:stock-outbound",
         title=f"{payload['shipment_label']}待确认发货",
         summary=(
-            f"{plan.merchant_organization.name}｜{payload['quantity']}台；"
+            f"{plan.merchant_organization.name}｜{payload['quantity']}台{payload.get('accessory_summary', '')}；"
             "物流经理已确认线下出库，请确认本批发货。"
         ),
         recipients=recipients,
@@ -1873,7 +2233,8 @@ def _publish_shipment_merchant_receipt_task(*, plan, shipment, actor_openid):
         title=f"{payload['shipment_label']}待到货入库",
         summary=(
             f"{plan.factory_organization.name}｜{plan.brand.name}｜"
-            f"本批{payload['quantity']}台已发货，实际收货后请由具备权限的负责人或库管确认入库。"
+            f"本批{payload['quantity']}台{payload.get('accessory_summary', '')}已发货，"
+            "实际收货后请由具备权限的负责人或库管确认入库。"
         ),
         recipients=recipients,
         need_action=True,
@@ -1998,6 +2359,7 @@ def _create_v2_shipment(
             for item, sub_item, quantity in normalized
         ]
     )
+    _attach_accessories_to_first_shipment(plan=plan, shipment=shipment)
     if publish_authorization:
         _publish_shipment_authorization_task(
             plan=plan,
@@ -2889,8 +3251,15 @@ def _consume_subplan_materials(subplan, user):
             )
             if changed != 1:
                 raise OrderPlanMaterialFlowError("物料库存已变化，不能确认生产完成，请刷新后重试。")
+            next_consumed_milli = allocation.consumed_milli + amount
+            update_fields = ["consumed_milli", "updated_at"]
+            if (
+                next_consumed_milli + allocation.released_milli >= allocation.reserved_milli
+            ):
+                allocation.status = OrderPlanMaterialLotAllocation.Status.CONSUMED
+                update_fields.append("status")
             allocation.consumed_milli = F("consumed_milli") + amount
-            allocation.save(update_fields=("consumed_milli", "updated_at"))
+            allocation.save(update_fields=tuple(update_fields))
             allocation.refresh_from_db(fields=("consumed_milli",))
             needed -= amount
         if needed:
@@ -3173,7 +3542,7 @@ def _update_open_shipment_authorization_task(*, plan, shipment):
         return
     workitem.title = f"{payload['shipment_label']}待授权发货"
     workitem.summary = (
-        f"{plan.merchant_organization.name}｜{payload['quantity']}台；"
+        f"{plan.merchant_organization.name}｜{payload['quantity']}台{payload.get('accessory_summary', '')}；"
         "授权后由厂家成品库管打码贴包，物流经理确认出库，再由成品库管确认发货。"
     )
     workitem.payload = _group_payload(plan, **payload)
@@ -4019,10 +4388,164 @@ def _publish_shipment_shipped_notice(*, plan, shipment, actor_openid):
         plan=plan, work_type="ORDER_PLAN_V2_SHIPPED_NOTICE",
         stage_key=f"shipment:{shipment.pk}:shipped-notice",
         title=f"{payload['shipment_label']}已发货",
-        summary=f"{plan.merchant_organization.name}｜本批{payload['quantity']}台已发货；商家实际收货后确认入库。",
+        summary=f"{plan.merchant_organization.name}｜本批{payload['quantity']}台{payload.get('accessory_summary', '')}已发货；商家实际收货后确认入库。",
         recipients=sorted(recipients), need_action=False, done_immediately=True,
         payload=payload, actor_openid=actor_openid,
     )
+
+
+def _ship_accessory_allocations(*, plan, shipment, user, now):
+    shipment_items = list(
+        OrderPlanShipmentAccessoryItem.objects.select_for_update()
+        .filter(shipment=shipment)
+        .select_related("accessory_item__material_spec__material")
+        .order_by("id")
+    )
+    if not shipment_items:
+        return 0
+    shipped_total = 0
+    for shipment_item in shipment_items:
+        allocations = list(
+            OrderPlanAccessoryLotAllocation.objects.select_for_update()
+            .select_related("material_lot__stock")
+            .filter(shipment_item=shipment_item)
+            .order_by("material_lot__received_at", "id")
+        )
+        if (
+            sum(row.reserved_milli for row in allocations) != shipment_item.quantity_milli
+            or any(row.status != OrderPlanAccessoryLotAllocation.Status.RESERVED for row in allocations)
+        ):
+            raise OrderPlanMaterialFlowError("本批配件批次预占记录不完整，不能确认发货。")
+        for allocation in allocations:
+            amount = allocation.reserved_milli
+            changed = FactoryMaterialLot.objects.filter(
+                pk=allocation.material_lot_id,
+                on_hand_milli__gte=amount,
+                reserved_milli__gte=amount,
+            ).update(
+                on_hand_milli=F("on_hand_milli") - amount,
+                reserved_milli=F("reserved_milli") - amount,
+            )
+            if changed != 1:
+                raise OrderPlanMaterialFlowError("厂家配件库存已变化，不能确认本批发货。")
+            request_hash = hashlib.sha256(
+                f"order-accessory:{plan.pk}:{shipment.pk}:{allocation.pk}:{amount}".encode("utf-8")
+            ).hexdigest()
+            MaterialWarehouseDocument.objects.create(
+                factory=plan.factory_organization,
+                stock_id=allocation.material_lot.stock_id,
+                document_no=_new_code("MD"),
+                request_id=uuid4(),
+                request_hash=request_hash,
+                kind=MaterialWarehouseDocument.Kind.ORDER_SHIPMENT,
+                quantity_milli=amount,
+                lot_id=allocation.material_lot_id,
+                created_by=user,
+            )
+            allocation.status = OrderPlanAccessoryLotAllocation.Status.SHIPPED
+            allocation.shipped_by = user
+            allocation.shipped_at = now
+            allocation.save(update_fields=("status", "shipped_by", "shipped_at", "updated_at"))
+            shipped_total += amount
+        shipment_item.accessory_item.status = OrderPlanAccessoryItem.Status.SHIPPED
+        shipment_item.accessory_item.save(update_fields=("status", "updated_at"))
+    return shipped_total
+
+
+def _receive_accessory_allocations(*, plan, shipment, user, now):
+    shipment_items = list(
+        OrderPlanShipmentAccessoryItem.objects.select_for_update()
+        .filter(shipment=shipment)
+        .select_related("accessory_item")
+        .order_by("id")
+    )
+    received_total = 0
+    for shipment_item in shipment_items:
+        allocations = list(
+            OrderPlanAccessoryLotAllocation.objects.select_for_update()
+            .select_related("material_lot__stock")
+            .filter(shipment_item=shipment_item)
+            .order_by("material_lot__received_at", "id")
+        )
+        if (
+            sum(row.reserved_milli for row in allocations) != shipment_item.quantity_milli
+            or any(row.status != OrderPlanAccessoryLotAllocation.Status.SHIPPED for row in allocations)
+        ):
+            raise OrderPlanMaterialFlowError("本批配件发货批次记录不完整，不能确认商家入库。")
+        for allocation in allocations:
+            source_lot = allocation.material_lot
+            stock, _created = OrganizationMaterialStock.objects.get_or_create(
+                organization=plan.merchant_organization,
+                source_factory=plan.factory_organization,
+                supplier=source_lot.stock.supplier,
+                material_spec_id=source_lot.stock.material_spec_id,
+                defaults={"unit": source_lot.stock.unit},
+            )
+            if stock.unit != source_lot.stock.unit:
+                raise OrderPlanMaterialFlowError("商家该配件库存单位与厂家来源批次不一致。")
+            reference = (
+                f"sales:order-plan:{plan.pk}:shipment:{shipment.pk}:"
+                f"accessory-allocation:{allocation.pk}"
+            )
+            _org_lot, lot_created = OrganizationMaterialLot.objects.get_or_create(
+                source_reference=reference,
+                defaults={
+                    "stock": stock,
+                    "source_factory_lot": source_lot,
+                    "source_order_plan_id": plan.pk,
+                    "source_shipment_id": shipment.pk,
+                    "source_accessory_item_id": allocation.accessory_item_id,
+                    "source_batch_code_snapshot": source_lot.batch_code,
+                    "received_milli": allocation.reserved_milli,
+                    "on_hand_milli": allocation.reserved_milli,
+                    "received_by": user,
+                    "received_at": now,
+                },
+            )
+            if lot_created:
+                OrganizationMaterialStock.objects.filter(pk=stock.pk).update(
+                    revision=F("revision") + 1
+                )
+            allocation.status = OrderPlanAccessoryLotAllocation.Status.RECEIVED
+            allocation.received_by = user
+            allocation.received_at = now
+            allocation.save(update_fields=("status", "received_by", "received_at", "updated_at"))
+            received_total += allocation.reserved_milli
+        if not OrderPlanAccessoryLotAllocation.objects.filter(
+            accessory_item=shipment_item.accessory_item
+        ).exclude(status=OrderPlanAccessoryLotAllocation.Status.RECEIVED).exists():
+            shipment_item.accessory_item.status = OrderPlanAccessoryItem.Status.RECEIVED
+            shipment_item.accessory_item.save(update_fields=("status", "updated_at"))
+    return received_total
+
+
+def _release_accessory_allocations(plan):
+    allocations = list(
+        OrderPlanAccessoryLotAllocation.objects.select_for_update()
+        .filter(
+            accessory_item__order_plan=plan,
+            status=OrderPlanAccessoryLotAllocation.Status.RESERVED,
+        )
+        .order_by("id")
+    )
+    released = 0
+    now = timezone.now()
+    for allocation in allocations:
+        amount = allocation.reserved_milli
+        if amount:
+            changed = FactoryMaterialLot.objects.filter(
+                pk=allocation.material_lot_id,
+                reserved_milli__gte=amount,
+            ).update(reserved_milli=F("reserved_milli") - amount)
+            if changed != 1:
+                raise OrderPlanMaterialFlowError("配件库存已变化，不能释放预占。")
+        allocation.status = OrderPlanAccessoryLotAllocation.Status.RELEASED
+        allocation.save(update_fields=("status", "updated_at"))
+        released += amount
+    plan.accessory_items.filter(
+        status=OrderPlanAccessoryItem.Status.RESERVED
+    ).update(status=OrderPlanAccessoryItem.Status.RELEASED, updated_at=now)
+    return released
 
 
 def _shipment_event(*, device, event_type, plan, shipment, user, now):
@@ -4113,6 +4636,7 @@ def confirm_material_flow_shipment_outbound(*, user, plan_id, shipment_id):
         actor_title=f"{_shipment_label(shipment)}已发货",
         peer_title=f"{_display_name(user)}已确认{_shipment_label(shipment)}发货",
     )
+    _ship_accessory_allocations(plan=plan, shipment=shipment, user=user, now=now)
     for mapping in mappings:
         event = _shipment_event(
             device=mapping.device,
@@ -4222,6 +4746,7 @@ def confirm_material_flow_merchant_receipt(*, user, plan_id, shipment_id):
             )
         ),
     )
+    _receive_accessory_allocations(plan=plan, shipment=shipment, user=user, now=now)
     for mapping in mappings:
         event = _shipment_event(
             device=mapping.device,
@@ -4535,6 +5060,7 @@ def _finalize_material_flow_cancellation(
         )
     released_milli, now = _release_material_allocations(material_plan)
     released_finished = _release_return_inventory(plan)
+    _release_accessory_allocations(plan)
     _cancel_nonphysical_shipments(plan=plan, now=now)
     material_plan.status = OrderPlanMaterialPlan.Status.CANCELLED
     material_plan.save(update_fields=("status", "updated_at"))
@@ -4573,6 +5099,8 @@ def _finalize_material_flow_cancellation(
         cursor_time=now,
         updated_at=now,
     )
+    from sales.services.replacement_supply_service import release_normal
+    release_normal(plan)
     plan.status = OrderPlan.Status.CANCELLED
     plan.save(update_fields=("status", "updated_at"))
     plan.items.update(status=OrderPlan.Status.CANCELLED, updated_at=now)
@@ -4737,6 +5265,7 @@ def cancel_material_flow_order_plan(*, user, plan_id, assembly_started_offline=N
     )
     now = timezone.now()
     _cancel_nonphysical_shipments(plan=plan, now=now)
+    _release_accessory_allocations(plan)
     _cancel_material_flow_finance_tasks(plan=plan, user=user)
     if production_completed:
         finished_goods_created = _record_cancelled_finished_goods(
@@ -4946,6 +5475,7 @@ def _serialize_plan_detail(plan, material_plan):
         "brand": {"id": plan.brand_id, "name": plan.brand.name},
         "region": plan.region_snapshot,
         "total_quantity": plan.total_quantity,
+        "accessory_items": _serialize_order_accessory_items(plan),
         "remark": plan.remark,
         "submitted_at": plan.submitted_at.isoformat(),
         "sales_manager": {"id": plan.created_by_id, "name": _display_name(plan.created_by)},
@@ -5531,6 +6061,9 @@ def _serialize_shipments(plan, identity):
         "items__production_subplan_item",
         "device_allocations__device__qrcode",
         "device_allocations__return_inventory_allocation__replacement_qr",
+        "accessory_items__accessory_item__category",
+        "accessory_items__accessory_item__product_model",
+        "accessory_items__accessory_item__material_spec__material",
     ).filter(order_plan=plan).order_by("sequence_no", "id")
     shipment_rows = []
     qrcode_batches = []
@@ -5548,6 +6081,7 @@ def _serialize_shipments(plan, identity):
         ]
         label = _shipment_label(shipment)
         actions = _shipment_actions(plan, shipment, identity)
+        accessory_rows = _shipment_accessory_rows(shipment)
         item_rows = [
             {
                 "id": item.pk,
@@ -5616,6 +6150,8 @@ def _serialize_shipments(plan, identity):
                 "received_at": shipment.received_at.isoformat() if shipment.received_at else None,
                 "received_by_name": _display_name(shipment.received_by) if shipment.received_by_id else "",
                 "items": item_rows,
+                "accessory_items": accessory_rows,
+                "accessory_summary": _shipment_accessory_summary(accessory_rows),
                 "device_count": len(qrcode_rows),
                 "available_actions": actions,
             }
@@ -5933,7 +6469,11 @@ def get_material_flow_detail(*, user, plan_id):
         identity=identity,
         available_actions=timeline_actions,
     )
+    from lifecycle.services.replacement_flow_service import pending_for_plan
+    # Kept outside sales shipment quantity, pricing, finance and receivable calculations.
+    replacement_demands = pending_for_plan(plan) if identity.organization_id in {plan.factory_organization_id,plan.merchant_organization_id} else []
     return {
+        "pending_replacement_demands": replacement_demands,
         "plan": _serialize_plan_detail(plan, material_plan),
         "viewer": {
             "role": identity.role.code,

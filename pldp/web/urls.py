@@ -48,6 +48,19 @@ urlpatterns = [
 
 
     # ==========================
+    # 厂家设备编码发行（与成品打印中心分开）
+    # ==========================
+
+    path(
+        "device-codes/",
+        include(
+            ("apps.lifecycle.web.device_code_registry.urls", "device_code_registry"),
+            namespace="device_code_registry"
+        )
+    ),
+
+
+    # ==========================
     # 打印中心
     # ==========================
 

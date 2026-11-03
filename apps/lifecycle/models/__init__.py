@@ -2,6 +2,11 @@
 
 
 from .device import Device
+from .physical_device_code import PhysicalDeviceCode
+from .device_code_registry_web import (
+    DeviceCodeRegistryLoginChallenge,
+    PhysicalDeviceCodePackagingInfo,
+)
 
 from .event import LifecycleEvent
 
@@ -54,6 +59,7 @@ from .factory_return import (
 )
 from .aftersales import (
     AfterSalesApplication,
+    AfterSalesDeviceCodeVerification,
     AfterSalesEvent,
     AfterSalesMedia,
     AfterSalesServiceStationApplication,
@@ -64,6 +70,9 @@ from .aftersales import (
 __all__ = [
 
     "Device",
+    "PhysicalDeviceCode",
+    "DeviceCodeRegistryLoginChallenge",
+    "PhysicalDeviceCodePackagingInfo",
 
     "LifecycleEvent",
 
@@ -113,6 +122,8 @@ __all__ = [
 
     "AfterSalesApplication",
 
+    "AfterSalesDeviceCodeVerification",
+
     "AfterSalesEvent",
 
     "AfterSalesMedia",
@@ -136,3 +147,7 @@ __all__ = [
     "FactoryReturnWarrantyDispatchItem",
 
 ]
+
+from .replacement import ReplacementFlow, ReplacementLeg, ReplacementInventoryEntry
+
+from .replacement import ReplacementTurnoverStock, ReplacementMaterialReturn

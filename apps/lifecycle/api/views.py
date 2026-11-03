@@ -29,6 +29,7 @@ from lifecycle.services.lifecycle_service import LifecycleService
 from .serializers import (
     AcceptInstallationInvitationSerializer,
     ActivateCustomerDeviceSerializer,
+    GeneratePhysicalDeviceCodeBatchSerializer,
     CreateLifecycleSerializer,
     InstallDeviceSerializer,
     RefreshInstallationInvitationSerializer,
@@ -39,10 +40,17 @@ from .serializers import (
     FactoryReturnProductionActionSerializer,
     ScanGoodsTransferDeviceSerializer,
     FactoryReturnPostingSerializer,
+    VerifyAfterSalesDeviceCodeSerializer,
+    VerifyActivationDeviceCodeSerializer,
 )
 
 
 from lifecycle.services.scan_service import QRCodeResolveError, ScanService
+from lifecycle.services.physical_device_code_service import (
+    PhysicalDeviceCodeError,
+    PhysicalDeviceCodePermissionError,
+    generate_device_code_batch,
+)
 from lifecycle.models import InstallationInvitation
 from lifecycle.services.installation_service import (
     InstallationPermissionError,
@@ -1360,7 +1368,7 @@ class CustomerDeviceResultAPI(APIView):
 
 
 class ActivateCustomerDeviceAPI(APIView):
-    """用户负责人确认车辆信息后激活已经装车的设备。"""
+    """用户确认一种设备识别方式后，激活已经装车的设备。"""
 
     authentication_classes = []
     permission_classes = []
@@ -1379,13 +1387,79 @@ class ActivateCustomerDeviceAPI(APIView):
             data = CustomerDeviceService.activate(
                 device_id=device_id,
                 user=user,
-                vehicle_no=serializer.validated_data["vehicle_no"],
+                activation_method=serializer.validated_data.get("activation_method", "VEHICLE_PLATE"),
+                vehicle_no=serializer.validated_data.get("vehicle_no", ""),
+                physical_device_code=serializer.validated_data.get("physical_device_code", ""),
                 location=serializer.validated_data.get("location", ""),
             )
         except (CustomerFlowPermissionError, CustomerFlowStateError) as exc:
             return _customer_flow_error_response(exc)
         return Response(
             {"code": 0, "msg": "设备激活成功", "data": data}
+        )
+
+
+class VerifyCustomerActivationDeviceCodeAPI(APIView):
+    """Verify a scanned manufacturer-issued code before activation."""
+
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, device_id):
+        serializer = VerifyActivationDeviceCodeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            user = authenticate_request(request)
+        except ApiAuthenticationError as exc:
+            return Response(
+                {"code": 401, "msg": str(exc), "data": {}},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+        try:
+            data = CustomerDeviceService.verify_activation_device_code(
+                device_id=device_id,
+                user=user,
+                device_code=serializer.validated_data["device_code"],
+            )
+        except (CustomerFlowPermissionError, CustomerFlowStateError) as exc:
+            return _customer_flow_error_response(exc)
+        return Response({"code": 0, "msg": "设备编码验证通过", "data": data})
+
+
+class FactoryPhysicalDeviceCodeBatchAPI(APIView):
+    """Issue a batch of unique physical-device QR codes for a factory root."""
+
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request):
+        serializer = GeneratePhysicalDeviceCodeBatchSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            user = authenticate_request(request)
+        except ApiAuthenticationError as exc:
+            return Response(
+                {"code": 401, "msg": str(exc), "data": {}},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+        try:
+            data = generate_device_code_batch(
+                user=user,
+                quantity=serializer.validated_data["quantity"],
+            )
+        except PhysicalDeviceCodePermissionError as exc:
+            return Response(
+                {"code": 403, "msg": str(exc), "data": {}},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        except PhysicalDeviceCodeError as exc:
+            return Response(
+                {"code": 409, "msg": str(exc), "data": {}},
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(
+            {"code": 0, "msg": "设备编码已生成", "data": data},
+            status=status.HTTP_201_CREATED,
         )
 
 
@@ -1540,6 +1614,29 @@ class AfterSalesRequestContextAPI(APIView):
         ) as exc:
             return _aftersales_error(exc)
         return Response({"code": 0, "msg": "success", "data": data})
+
+
+class AfterSalesDeviceCodePresenceAPI(APIView):
+    """Verify that the applicant scanned this device's bound physical QR code."""
+
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, device_id):
+        user, error = _authenticated_user(request)
+        if error:
+            return error
+        serializer = VerifyAfterSalesDeviceCodeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            data = AfterSalesService.verify_device_code_presence(
+                device_id=device_id,
+                user=user,
+                scanned_code=serializer.validated_data["device_code"],
+            )
+        except (AfterSalesError, CustomerFlowPermissionError, CustomerFlowStateError) as exc:
+            return _aftersales_error(exc)
+        return Response({"code": 0, "msg": "设备编码核验成功", "data": data})
 
 
 class AfterSalesApplicationListCreateAPI(APIView):
@@ -1736,6 +1833,13 @@ class AfterSalesTriageOptionsAPI(APIView):
             data = AfterSalesService.triage_options(
                 application_id=application_id,
                 user=user,
+                dispatch_route=request.query_params.get("dispatch_route", ""),
+                preliminary_fault_type=request.query_params.get(
+                    "preliminary_fault_type", ""
+                ),
+                preliminary_materials=request.query_params.get(
+                    "preliminary_materials", ""
+                ),
             )
         except AfterSalesError as exc:
             return _aftersales_error(exc)
@@ -2008,3 +2112,67 @@ class LifecycleCreateAPI(APIView):
             status=status.HTTP_201_CREATED
 
         )
+
+
+class AfterSalesEscalationAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, application_id):
+        user, error = _authenticated_user(request)
+        if error:
+            return error
+        from lifecycle.services.repair_escalation_service import execute
+        from quality_trace.services import quality_gate_atomic
+        try:
+            data = quality_gate_atomic(AfterSalesError)(execute)(application_id=application_id, user=user, data=request.data)
+        except AfterSalesError as exc:
+            return _aftersales_error(exc)
+        return Response({"code": 0, "msg": "售后处理变更已记录", "data": data})
+
+
+class ReplacementMaterialReturnAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self,request,part_id):
+        user,error=_authenticated_user(request)
+        if error:return error
+        from lifecycle.models import ReplacementMaterialReturn
+        from lifecycle.services.replacement_v6_service import material_detail
+        row=ReplacementMaterialReturn.objects.select_related('supplier','flow__application').filter(pk=part_id).first()
+        if not row:return _aftersales_error(AfterSalesError('退料记录不存在'))
+        try:data=material_detail(row,user)
+        except AfterSalesError as exc:return _aftersales_error(exc)
+        return Response({'code':0,'msg':'ok','data':data})
+
+    def post(self,request,part_id):
+        user,error=_authenticated_user(request)
+        if error:return error
+        from lifecycle.services.replacement_v6_service import receive_material
+        try:data=receive_material(part_id=part_id,user=user,data=request.data)
+        except AfterSalesError as exc:return _aftersales_error(exc)
+        return Response({'code':0,'msg':'三包退料已签收','data':data})
+
+
+class ReplacementRecoveredStockAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self,request):
+        user,error=_authenticated_user(request)
+        if error:return error
+        from lifecycle.models import ReplacementTurnoverStock
+        from account.services.role_delegation_service import identity_has_role
+        from sales.models import FactoryFinishedGoodsInventoryItem
+        identity=AfterSalesService._identity(user)
+        if not identity or identity.organization.organization_type.code!='OWNER' or not (
+            identity.role.is_owner_role or identity_has_role(identity,{'factory_aftersales','factory_stock','factory_logistics'})):
+            return _aftersales_error(AfterSalesError('仅厂家售后、物流、成品库及获授权管理人员可查询回收机库'))
+        finished=FactoryFinishedGoodsInventoryItem.objects.filter(factory_organization=identity.organization,replacement_flow__isnull=False).select_related('device__product_model','replacement_flow__application').order_by('-pk')[:200]
+        turnover=ReplacementTurnoverStock.objects.filter(factory=identity.organization).select_related('device__product_model','flow__application').order_by('-pk')[:200]
+        data=[{'kind':'成品库','device_sn':r.device.sn,'model':r.device.product_model.name,'status':r.get_stock_status_display(),
+            'application_id':r.replacement_flow.application_id} for r in finished]
+        data += [{'kind':'周转机库','device_sn':r.device.sn,'model':r.device.product_model.name,'status':'待用' if r.status=='AVAILABLE' else r.status,
+            'application_id':r.flow.application_id} for r in turnover]
+        return Response({'code':0,'msg':'ok','data':{'items':data,'limit_per_pool':200}})

@@ -17,6 +17,9 @@ BUILDERS = {
 
 def build_dashboard(identity, requested_domain=None):
     modules = modules_for_role(identity.role.code)
+    from lifecycle.services.aftersales_access import capabilities
+    if capabilities(identity.user)["can_view_repair_basis"] and "AFTERSALES" not in modules:
+        modules = modules + ("AFTERSALES",)
     if requested_domain:
         requested_domain = requested_domain.upper()
         modules = (requested_domain,) if requested_domain in modules else ()

@@ -672,14 +672,17 @@ class FactoryFinishedGoodsInventoryItem(models.Model):
         related_name="factory_finished_goods_inventory_item",
         verbose_name="成品设备",
     )
+    replacement_flow = models.OneToOneField("lifecycle.ReplacementFlow",null=True,blank=True,on_delete=models.PROTECT,related_name="finished_stock")
     source_order_plan = models.ForeignKey(
         "sales.OrderPlan",
+        null=True, blank=True,
         on_delete=models.PROTECT,
         related_name="cancelled_finished_goods_inventory_items",
         verbose_name="来源订单计划",
     )
     source_subplan_item = models.ForeignKey(
         OrderPlanProductionSubplanItem,
+        null=True, blank=True,
         on_delete=models.PROTECT,
         related_name="finished_goods_inventory_items",
         verbose_name="来源生产子计划产品项",
@@ -720,6 +723,10 @@ class FactoryFinishedGoodsInventoryItem(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
+        constraints=[models.CheckConstraint(condition=(
+            models.Q(replacement_flow__isnull=False,source_order_plan__isnull=True,source_subplan_item__isnull=True)
+            | models.Q(replacement_flow__isnull=True,source_order_plan__isnull=False,source_subplan_item__isnull=False)
+        ),name='sales_fg_valid_source')]
         ordering = ("stored_at", "id")
         indexes = [
             models.Index(

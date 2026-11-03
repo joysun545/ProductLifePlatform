@@ -4,7 +4,15 @@ from django.db.models import Count, Sum
 
 from account.models import OrganizationRelation, OrganizationRelationType
 from lifecycle.models import ActivationRecord, CustomerDeviceBinding, Device, InstallationRecord, OrganizationDevice
-from sales.models import OrderPlan, OrderPlanItem, OrderPlanShipment, OrderPlanShipmentDevice
+from sales.models import (
+    OrderPlan,
+    OrderPlanItem,
+    OrderPlanMaterialPlan,
+    OrderPlanProductionSubplan,
+    OrderPlanProductionSubplanItem,
+    OrderPlanShipment,
+    OrderPlanShipmentDevice,
+)
 
 from .query_scope import device_scope
 
@@ -12,6 +20,7 @@ from .query_scope import device_scope
 def _empty_counts():
     return {key: 0 for key in (
         "market_inventory_device_count", "activated_device_count",
+        "installed_device_count",
         "in_transit_device_count", "return_or_recall_device_count",
         "other_device_count", "market_device_count",
     )}
@@ -22,6 +31,8 @@ def _counts(rows):
     for row in rows:
         result[f"{row['market_status'].lower()}_device_count"] += 1
         result["market_device_count"] += 1
+        if row.get("is_installed"):
+            result["installed_device_count"] += 1
     return result
 
 
@@ -80,6 +91,9 @@ def _market_rows(factory_id):
     activated = set(ActivationRecord.objects.filter(
         device_id__in=ids, status="ACTIVATED",
     ).values_list("device_id", flat=True))
+    installed = set(InstallationRecord.objects.filter(
+        device_id__in=ids, status=InstallationRecord.Status.INSTALLED,
+    ).values_list("device_id", flat=True))
     sources = dict(CustomerDeviceBinding.objects.filter(
         device_id__in=activated, status=CustomerDeviceBinding.Status.ACTIVE,
     ).values_list("device_id", "source_organization_id"))
@@ -110,6 +124,7 @@ def _market_rows(factory_id):
             "sales_user_id": plan["sales_user_id"],
             "direct_merchant_id": plan["direct_merchant_id"],
             "channel_org_id": channel_org_id, "market_status": market_status,
+            "is_installed": device_id in installed,
         })
     return result
 
@@ -189,6 +204,7 @@ class ResponsibilityTreeBuilder:
         return {
             "node_type": "ORGANIZATION", "node_id": f"organization:{organization.id}",
             "organization_id": organization.id, "name": organization.name, "role_code": "",
+            "has_subordinate_organizations": bool(self.outgoing.get(organization.id)),
             "display_scope": "TOTAL",
             "show_organization_inventory": True,
             "own": _counts(own), "total": _counts(scoped), "children": children,
@@ -276,6 +292,146 @@ def _upstream_factory(organization):
     return next(iter(roots.values())) if len(roots) == 1 else None
 
 
+def _factory_sales_order_plan_metrics(identity):
+    """Return the sales manager's non-cancelled plan quantities by flow stage.
+
+    Production, physical outbound, carrier shipment, and accounting are
+    separate facts. Merchant receipt alone does not transfer title; the
+    factory sales assistant's accounting confirmation is recorded in
+    ``OrderPlan.accounted_at``.
+    """
+    plan_rows = list(OrderPlan.objects.filter(
+        factory_organization=identity.organization,
+        created_by=identity.user,
+    ).exclude(status=OrderPlan.Status.CANCELLED).values(
+        "id", "status", "total_quantity", "accounted_at",
+    ))
+    if not plan_rows:
+        return {
+            "order_plan_count": 0,
+            "order_plan_pending_production_device_count": 0,
+            "order_plan_produced_pending_outbound_device_count": 0,
+            "order_plan_outbounded_pending_ship_device_count": 0,
+            "order_plan_shipped_device_count": 0,
+            "order_plan_shipped_pending_accounting_device_count": 0,
+            "order_plan_accounted_device_count": 0,
+        }
+
+    plan_ids = [row["id"] for row in plan_rows]
+    plan_by_id = {row["id"]: row for row in plan_rows}
+    item_totals = {
+        row["plan_id"]: {
+            "production": row["production_total"] or 0,
+            "return_inventory": row["return_inventory_total"] or 0,
+        }
+        for row in OrderPlanItem.objects.filter(plan_id__in=plan_ids)
+        .values("plan_id")
+        .annotate(
+            production_total=Sum("production_quantity"),
+            return_inventory_total=Sum("return_inventory_quantity"),
+        )
+    }
+
+    material_plan_ids = set(OrderPlanMaterialPlan.objects.filter(
+        order_plan_id__in=plan_ids,
+    ).values_list("order_plan_id", flat=True))
+    completed_production = {
+        row["order_plan_item__plan_id"]: row["quantity_total"] or 0
+        for row in OrderPlanProductionSubplanItem.objects.filter(
+            order_plan_item__plan_id__in=material_plan_ids,
+            production_subplan__production_completed_at__isnull=False,
+        ).exclude(
+            production_subplan__status=OrderPlanProductionSubplan.Status.CANCELLED,
+        ).values("order_plan_item__plan_id")
+        .annotate(quantity_total=Sum("quantity"))
+    }
+
+    # Historical plans without subplans record production completion on the
+    # parent order; use their production quantities as the completed amount.
+    legacy_completed_ids = [
+        row["id"] for row in plan_rows
+        if row["id"] not in material_plan_ids
+        and row["status"] in {
+            OrderPlan.Status.PRODUCTION_COMPLETED,
+            OrderPlan.Status.SHIPPED,
+            OrderPlan.Status.RECEIVED,
+        }
+    ]
+    if legacy_completed_ids:
+        legacy_rows = (
+            OrderPlanItem.objects.filter(plan_id__in=legacy_completed_ids)
+            .values("plan_id")
+            .annotate(production_total=Sum("production_quantity"))
+        )
+        for row in legacy_rows:
+            completed_production[row["plan_id"]] = row["production_total"] or 0
+
+    shipment_quantities = {}
+    shipment_rows = OrderPlanShipmentDevice.objects.filter(
+        order_plan_id__in=plan_ids,
+        shipment__status__in=(
+            OrderPlanShipment.Status.OUTBOUNDED,
+            OrderPlanShipment.Status.SHIPPED,
+            OrderPlanShipment.Status.RECEIVED,
+        ),
+    ).values("order_plan_id", "shipment__status").annotate(quantity=Count("id"))
+    for row in shipment_rows:
+        shipment_quantities.setdefault(row["order_plan_id"], {})[
+            row["shipment__status"]
+        ] = row["quantity"]
+
+    plans_with_shipments = set(OrderPlanShipment.objects.filter(
+        order_plan_id__in=plan_ids,
+    ).values_list("order_plan_id", flat=True))
+
+    pending_production = 0
+    produced = 0
+    outbounded_pending_ship = 0
+    shipped = 0
+    shipped_pending_accounting = 0
+    accounted = 0
+    for plan_id, plan in plan_by_id.items():
+        item_total = item_totals.get(plan_id, {})
+        production_quantity = item_total.get("production", 0)
+        completed_quantity = completed_production.get(plan_id, 0)
+        return_inventory_quantity = item_total.get("return_inventory", 0)
+        plan_shipments = shipment_quantities.get(plan_id, {})
+        outbounded_quantity = plan_shipments.get(OrderPlanShipment.Status.OUTBOUNDED, 0)
+        shipped_quantity = (
+            plan_shipments.get(OrderPlanShipment.Status.SHIPPED, 0)
+            + plan_shipments.get(OrderPlanShipment.Status.RECEIVED, 0)
+        )
+
+        # Legacy orders have aggregate shipment state but no shipment devices.
+        if (
+            plan_id not in plans_with_shipments
+            and plan["status"] in {OrderPlan.Status.SHIPPED, OrderPlan.Status.RECEIVED}
+        ):
+            outbounded_quantity = plan["total_quantity"]
+            shipped_quantity = plan["total_quantity"]
+
+        pending_production += max(0, production_quantity - completed_quantity)
+        produced += return_inventory_quantity + completed_quantity
+        outbounded_pending_ship += outbounded_quantity
+        shipped += shipped_quantity
+        if plan["accounted_at"]:
+            accounted += plan["total_quantity"]
+        else:
+            shipped_pending_accounting += shipped_quantity
+
+    total = sum(row["total_quantity"] for row in plan_rows)
+    outbounded = outbounded_pending_ship + shipped
+    return {
+        "order_plan_count": total,
+        "order_plan_pending_production_device_count": pending_production,
+        "order_plan_produced_pending_outbound_device_count": max(0, produced - outbounded),
+        "order_plan_outbounded_pending_ship_device_count": outbounded_pending_ship,
+        "order_plan_shipped_device_count": shipped,
+        "order_plan_shipped_pending_accounting_device_count": shipped_pending_accounting,
+        "order_plan_accounted_device_count": accounted,
+    }
+
+
 def build_flow_statistics(identity):
     organization_type = identity.organization_type
     role_code = identity.role.code
@@ -332,19 +488,13 @@ def build_flow_statistics(identity):
         rate_base = totals["market_device_count"]
         metric_note = "入库设备为进入当前商家链路的设备；链路库存含本组织及全部下级；组织库存仅统计本组织。"
     elif organization_type == "OWNER" and role_code == "factory_sales":
-        # The card is labelled "订单计划", but its business unit is devices,
-        # not documents. Keep the existing all-created-plan scope (including
-        # cancelled historical plans) and sum each plan's declared quantity.
-        order_plan_device_count = OrderPlan.objects.filter(
-            factory_organization=identity.organization,
-            created_by=identity.user,
-        ).aggregate(total=Sum("total_quantity"))["total"] or 0
-        metrics = {
-            "order_plan_count": order_plan_device_count,
-            "channel_inventory_device_count": totals["market_inventory_device_count"],
-        }
+        metrics = _factory_sales_order_plan_metrics(identity)
+        metrics["channel_inventory_device_count"] = totals["market_inventory_device_count"]
         rate_base = totals["market_device_count"]
-        metric_note = "订单计划统计当前销售经理创建的全部订单计划设备数量合计；其余产品流转指标仅统计该销售经理负责的商家链路。"
+        metric_note = (
+            "仅统计未取消订单计划；累计已发货包含待下账与下账确认数量。"
+            "厂家向商家的物权转移以厂家销售助理确认下账为准。"
+        )
     else:
         metrics = {
             "produced_device_count": produced,

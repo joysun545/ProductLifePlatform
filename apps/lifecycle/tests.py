@@ -30,6 +30,7 @@ from lifecycle.models import (
     AfterSalesApplication,
     CustomerDeviceBinding,
     DeviceState,
+    PhysicalDeviceCode,
     DriverVehicleBinding,
     VehicleDeviceAssignment,
     InstallationInvitation,
@@ -2054,3 +2055,330 @@ class ScanOwnershipAndInstallationTests(TestCase):
                 uniq_key=f"aftersales:{non_material_case.id}:supplier-quality:{self.supplier.id}"
             ).exists()
         )
+
+    def test_device_code_activation_and_aftersales_presence_scan(self):
+        from lifecycle.models import ActivationRecord, Device, PhysicalDeviceCode
+
+        token = self._install_and_token()
+        accepted = self.client.post(
+            f"/pldp/api/lifecycle/scan/customer-invitations/{token}/accept/",
+            self._accept_payload(),
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(accepted.status_code, 201, accepted.json())
+
+        self._mark_required_documents_read(self.customer_user)
+        device_url = f"/pldp/api/lifecycle/customer/devices/{self.device.id}/"
+        verify_activation_code_url = (
+            f"{device_url}activation-code/verify/"
+        )
+        unknown_code = self.client.post(
+            verify_activation_code_url,
+            {"device_code": "PLDP_DEVICE|DC-UNREGISTERED-0001"},
+            content_type="application/json",
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(unknown_code.status_code, 409, unknown_code.json())
+        self.assertIn("未在厂家编码库登记", unknown_code.json()["msg"])
+
+        bypass_verification = self.client.post(
+            f"{device_url}activate/",
+            {
+                "activation_method": "DEVICE_CODE",
+                "physical_device_code": "PLDP_DEVICE|DC-UNREGISTERED-0001",
+            },
+            content_type="application/json",
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(
+            bypass_verification.status_code,
+            409,
+            bypass_verification.json(),
+        )
+        self.assertIn("未在厂家编码库登记", bypass_verification.json()["msg"])
+
+        lifecycle_code = self.client.post(
+            verify_activation_code_url,
+            {"device_code": self.device.qrcode.code},
+            content_type="application/json",
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(lifecycle_code.status_code, 409, lifecycle_code.json())
+        self.assertIn("包装生命周期二维码", lifecycle_code.json()["msg"])
+
+        other_factory = Organization.objects.create(
+            name="另一个测试厂家",
+            code="FACTORY-OTHER-DEVICE-CODE",
+            organization_type=self.factory.organization_type,
+            region="全国",
+        )
+        foreign_code = PhysicalDeviceCode.objects.create(
+            factory_root=other_factory,
+            code="BODY-QR-OTHER-0001",
+        )
+        wrong_factory_code = self.client.post(
+            verify_activation_code_url,
+            {"device_code": foreign_code.qr_payload},
+            content_type="application/json",
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(wrong_factory_code.status_code, 409, wrong_factory_code.json())
+        self.assertIn("不属于此设备对应的厂家", wrong_factory_code.json()["msg"])
+
+        registered_code = PhysicalDeviceCode.objects.create(
+            factory_root=self.factory,
+            code="BODY-QR-0001",
+            generated_by=self.factory_user,
+        )
+        verified_before_binding = self.client.post(
+            verify_activation_code_url,
+            {"device_code": "PLDP_DEVICE|BODY-QR-0001"},
+            content_type="application/json",
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(
+            verified_before_binding.status_code,
+            200,
+            verified_before_binding.json(),
+        )
+        self.assertTrue(verified_before_binding.json()["data"]["verified"])
+        self.assertEqual(
+            verified_before_binding.json()["data"]["device_code"],
+            "BODY-QR-0001",
+        )
+        registered_code.refresh_from_db()
+        self.assertEqual(registered_code.status, PhysicalDeviceCode.Status.GENERATED)
+        self.assertIsNone(registered_code.device_id)
+        activated = self.client.post(
+            f"{device_url}activate/",
+            {
+                "activation_method": "DEVICE_CODE",
+                "physical_device_code": "PLDP_DEVICE_CODE|BODY-QR-0001",
+            },
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(activated.status_code, 200, activated.json())
+        self.device.refresh_from_db()
+        activation = ActivationRecord.objects.get(device=self.device)
+        self.assertEqual(self.device.physical_device_code, "BODY-QR-0001")
+        self.assertEqual(activation.activation_method, "DEVICE_CODE")
+        self.assertEqual(activation.vehicle_no, "")
+        self.assertEqual(activation.physical_device_code_snapshot, "BODY-QR-0001")
+        registered_code.refresh_from_db()
+        self.assertEqual(registered_code.status, PhysicalDeviceCode.Status.BOUND)
+        self.assertEqual(registered_code.device_id, self.device.id)
+
+        # The on-device code must resolve to the same lifecycle record after
+        # activation while preserving the packaging QR as canonical code.
+        scan_response = self.client.post(
+            "/pldp/api/lifecycle/scan/resolve/",
+            {"qr_text": "PLDP_DEVICE|BODY-QR-0001"},
+            content_type="application/json",
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(scan_response.status_code, 200, scan_response.json())
+        scan_data = scan_response.json()["data"]
+        self.assertEqual(scan_data["device"]["id"], self.device.id)
+        self.assertEqual(scan_data["qr_code"], self.device.qrcode.code)
+        self.assertEqual(
+            scan_data["device"]["physical_device_code"], "BODY-QR-0001"
+        )
+
+        context_url = (
+            f"/pldp/api/lifecycle/customer/devices/{self.device.id}/after-sales/context/"
+        )
+        context = self.client.get(context_url, **self.auth(self.customer_user))
+        self.assertEqual(context.status_code, 200, context.json())
+        self.assertEqual(context.json()["data"]["activation"]["activation_method"], "DEVICE_CODE")
+
+        verify_url = (
+            f"/pldp/api/lifecycle/customer/devices/{self.device.id}/"
+            "after-sales/verify-device-code/"
+        )
+        mismatch = self.client.post(
+            verify_url,
+            {"device_code": "WRONG-CODE"},
+            content_type="application/json",
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(mismatch.status_code, 409)
+
+        draft_url = (
+            f"/pldp/api/lifecycle/customer/devices/{self.device.id}/after-sales/applications/"
+        )
+        draft_data = {
+            "fault_description": "设备无法启动",
+            "location_name": "测试现场",
+            "location_address": "重庆市渝北区",
+            "location_latitude": "29.6000000",
+            "location_longitude": "106.5000000",
+            "location_confirmed": True,
+        }
+        blocked = self.client.post(
+            draft_url,
+            draft_data,
+            content_type="application/json",
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(blocked.status_code, 409)
+        self.assertFalse(AfterSalesApplication.objects.filter(device=self.device).exists())
+
+        verified = self.client.post(
+            verify_url,
+            {"device_code": "BODY-QR-0001"},
+            content_type="application/json",
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(verified.status_code, 200, verified.json())
+        draft_data["device_code_verification_token"] = verified.json()["data"][
+            "verification_token"
+        ]
+        created = self.client.post(
+            draft_url,
+            draft_data,
+            content_type="application/json",
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(created.status_code, 201, created.json())
+        application = AfterSalesApplication.objects.get(device=self.device)
+        self.assertIsNotNone(application.device_presence_verified_at)
+        self.assertEqual(application.device_presence_code_snapshot, "BODY-QR-0001")
+        self.assertEqual(application.activation_snapshot["activation_method"], "DEVICE_CODE")
+
+        # Reopening a saved draft requires a fresh scan; the proof is consumed
+        # exactly once and refreshes the server-side presence timestamp.
+        from lifecycle.models import AfterSalesDeviceCodeVerification
+
+        second_verified = self.client.post(
+            verify_url,
+            {"device_code": "BODY-QR-0001"},
+            content_type="application/json",
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(second_verified.status_code, 200, second_verified.json())
+        second_token = second_verified.json()["data"]["verification_token"]
+        resumed = self.client.post(
+            draft_url,
+            {**draft_data, "device_code_verification_token": second_token},
+            content_type="application/json",
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(resumed.status_code, 200, resumed.json())
+        proof = AfterSalesDeviceCodeVerification.objects.get(token=second_token)
+        self.assertIsNotNone(proof.used_at)
+        replayed = self.client.post(
+            draft_url,
+            {**draft_data, "device_code_verification_token": second_token},
+            content_type="application/json",
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(replayed.status_code, 409)
+        self.assertIn("核验已失效", replayed.json()["msg"])
+
+    def test_factory_can_generate_pre_registered_physical_device_code_batch(self):
+        from lifecycle.models import PhysicalDeviceCode
+
+        response = self.client.post(
+            "/pldp/api/lifecycle/factory/device-codes/batches/",
+            {"quantity": 3},
+            content_type="application/json",
+            **self.auth(self.factory_user),
+        )
+        self.assertEqual(response.status_code, 201, response.json())
+        data = response.json()["data"]
+        self.assertEqual(data["count"], 3)
+        codes = [item["code"] for item in data["codes"]]
+        self.assertEqual(len(set(codes)), 3)
+        self.assertTrue(all(item["qr_payload"] == f"PLDP_DEVICE|{item['code']}" for item in data["codes"]))
+        records = list(PhysicalDeviceCode.objects.filter(code__in=codes))
+        self.assertEqual(len(records), 3)
+        self.assertTrue(all(record.factory_root_id == self.factory.pk for record in records))
+        self.assertTrue(all(record.status == PhysicalDeviceCode.Status.GENERATED for record in records))
+
+        denied = self.client.post(
+            "/pldp/api/lifecycle/factory/device-codes/batches/",
+            {"quantity": 1},
+            content_type="application/json",
+            **self.auth(self.direct_owner_user),
+        )
+        self.assertEqual(denied.status_code, 403, denied.json())
+
+    def test_plate_activation_requires_a_camera_photo_for_aftersales(self):
+        token = self._install_and_token()
+        accepted = self.client.post(
+            f"/pldp/api/lifecycle/scan/customer-invitations/{token}/accept/",
+            self._accept_payload(),
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(accepted.status_code, 201, accepted.json())
+        self._mark_required_documents_read(self.customer_user)
+
+        device_url = f"/pldp/api/lifecycle/customer/devices/{self.device.id}/"
+        activated = self.client.post(
+            f"{device_url}activate/",
+            {"activation_method": "VEHICLE_PLATE", "vehicle_no": "渝A12345"},
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(activated.status_code, 200, activated.json())
+
+        draft = self.client.post(
+            f"{device_url}after-sales/applications/",
+            {
+                "fault_description": "设备无法启动",
+                "location_name": "测试现场",
+                "location_address": "重庆市渝北区",
+                "location_latitude": "29.6000000",
+                "location_longitude": "106.5000000",
+                "location_confirmed": True,
+            },
+            content_type="application/json",
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(draft.status_code, 201, draft.json())
+        application_id = draft.json()["data"]["id"]
+
+        with tempfile.TemporaryDirectory() as media_root, override_settings(MEDIA_ROOT=media_root):
+            evidence = self.client.post(
+                f"/pldp/api/lifecycle/after-sales/applications/{application_id}/media/",
+                {
+                    "media_type": "IMAGE",
+                    "purpose": "APPLICATION_EVIDENCE",
+                    "file": SimpleUploadedFile(
+                        "fault.jpg", b"\xff\xd8\xff\xe0test-fault", content_type="image/jpeg"
+                    ),
+                },
+                **self.auth(self.customer_user),
+            )
+            self.assertEqual(evidence.status_code, 201, evidence.json())
+            blocked = self.client.post(
+                f"/pldp/api/lifecycle/after-sales/applications/{application_id}/submit/",
+                {},
+                content_type="application/json",
+                **self.auth(self.customer_user),
+            )
+            self.assertEqual(blocked.status_code, 409)
+            self.assertIn("车牌号", blocked.json()["msg"])
+
+            plate_photo = self.client.post(
+                f"/pldp/api/lifecycle/after-sales/applications/{application_id}/media/",
+                {
+                    "media_type": "IMAGE",
+                    "purpose": "PLATE_PRESENCE_EVIDENCE",
+                    "file": SimpleUploadedFile(
+                        "plate.jpg", b"\xff\xd8\xff\xe0test-plate", content_type="image/jpeg"
+                    ),
+                },
+                **self.auth(self.customer_user),
+            )
+            self.assertEqual(plate_photo.status_code, 201, plate_photo.json())
+            self.assertEqual(plate_photo.json()["data"]["purpose"], "PLATE_PRESENCE_EVIDENCE")
+            # With the required plate photo present, validation advances to the
+            # separate factory-recipient check instead of failing the proof gate.
+            advanced = self.client.post(
+                f"/pldp/api/lifecycle/after-sales/applications/{application_id}/submit/",
+                {},
+                content_type="application/json",
+                **self.auth(self.customer_user),
+            )
+            self.assertEqual(advanced.status_code, 409)
+            self.assertIn("厂家尚未配置", advanced.json()["msg"])

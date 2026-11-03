@@ -105,6 +105,12 @@ def metric_trends(request, metric_code):
     definition = MetricDefinition.objects.filter(code=metric_code, enabled=True).first()
     if not definition or definition.domain not in build_dashboard(identity)["modules"]:
         return _error("指标不存在或当前岗位无权查看。")
+    # Organization-only snapshots cannot represent an employee/driver's current scope.
+    if definition.domain == "AFTERSALES" and not (
+        identity.role.is_owner_role
+        or identity.role.code in {"factory_admin", "factory_owner", "factory_aftersales"}
+    ):
+        return _error("该售后专题按当前授权范围实时统计，暂不提供未区分岗位范围的组织历史趋势。")
     rows = DailyMetricSnapshot.objects.filter(
         organization=identity.organization, metric=definition, dimension_key="",
     ).order_by("snapshot_date")
@@ -114,3 +120,32 @@ def metric_trends(request, metric_code):
             "items": [{"date": row.snapshot_date.isoformat(), "value": float(row.value)} for row in rows],
         },
     })
+
+
+def aftersales_capabilities(request):
+    error = _get_only(request)
+    if error:
+        return error
+    identity, error = _identity(request)
+    if error:
+        return error
+    from lifecycle.services.aftersales_access import capabilities
+    return JsonResponse({"code": 0, "msg": "", "data": capabilities(identity.user)})
+
+
+def repair_basis(request):
+    error = _get_only(request)
+    if error:
+        return error
+    identity, error = _identity(request)
+    if error:
+        return error
+    from lifecycle.services.aftersales_access import capabilities
+    from lifecycle.services.repair_basis_service import catalog
+    if not capabilities(identity.user)["can_view_repair_basis"]:
+        return _error("当前岗位无权查看维修结算依据。")
+    try:
+        result = catalog(identity.user, request.GET.get("cursor"))
+    except ValueError as exc:
+        return _error(exc)
+    return JsonResponse({"code": 0, "msg": "", "data": result})

@@ -58,6 +58,16 @@ class Device(models.Model):
         verbose_name="设备序列号"
     )
 
+    physical_device_code = models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        default=None,
+        unique=True,
+        verbose_name="设备编码",
+        help_text="设备本体二维码编码；未绑定时为空。",
+    )
+
 
 
     product_model = models.ForeignKey(

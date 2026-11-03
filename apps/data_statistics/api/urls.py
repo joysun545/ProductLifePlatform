@@ -6,6 +6,8 @@ from . import views
 app_name = "data_statistics"
 
 urlpatterns = [
+    path("aftersales-capabilities/", views.aftersales_capabilities, name="aftersales_capabilities"),
+    path("repair-basis/", views.repair_basis, name="repair_basis"),
     path("dashboard/", views.dashboard, name="dashboard"),
     path("material/", views.material, name="material"),
     path("material-warehouse-lots/", views.material_warehouse_lots, name="material_warehouse_lots"),

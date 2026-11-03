@@ -87,3 +87,7 @@ private_quality_recall/
 
 # Deployment backups
 /backups/
+
+# Server deployment and role backups
+/.backup_role_chain_*/
+/PLDP_backend_backups/
