@@ -122,6 +122,40 @@ class ReplacementSupplyTests(TestCase):
         leg.refresh_from_db();self.assertEqual(leg.shipment_id,shipment.pk)
         self.assertEqual(leg.logistics['tracking_no'],'NORMAL-SF')
 
+    def test_delegated_factory_stock_receives_and_opens_only_the_linked_supply(self):
+        from account.models import SeniorManagerProfile
+        from lifecycle.services.aftersales_access import visible_cases
+
+        flow, _ = self.swap()
+        self.pickup(flow)
+        order, shipment = self.normal_shipment()
+        old_keeper = self.warehouse.organization_identity
+        old_keeper.is_active = False
+        old_keeper.save(update_fields=['is_active'])
+        manager, identity = self.user('supply-manager', self.factory, 'factory_senior_manager')
+        profile = SeniorManagerProfile.objects.create(identity=identity)
+        profile.managed_roles.add(old_keeper.role)
+        self.assertFalse(visible_cases(manager).filter(pk=self.case.pk).exists())
+
+        with transaction.atomic():
+            supply = R.auto_attach(order, self.factory_sales)
+        notice = self.work.call_args.kwargs
+        self.assertIn(manager.wx_openid, notice['recipients_openids'])
+        self.assertIn(self.factory_sales.wx_openid, notice['recipients_openids'])
+        self.assertNotIn(self.warehouse.wx_openid, notice['recipients_openids'])
+        self.assertEqual(notice['payload']['root_organization_id'], self.factory.pk)
+        self.assertTrue(visible_cases(manager).filter(pk=self.case.pk).exists())
+
+        leg = supply.items.get().leg
+        self.stock(self.factory, 'DELEGATED-SUPPLY')
+        self.raw(manager, action='SEND_REPLACEMENT_LEG', leg_id=leg.pk,
+                 qr_text='DELEGATED-SUPPLY', shipment_id=shipment.pk)
+        leg.refresh_from_db()
+        self.assertEqual(leg.sent_by_id, manager.pk)
+        self.assertEqual(leg.shipment_id, shipment.pk)
+        profile.managed_roles.clear()
+        self.assertFalse(visible_cases(manager).filter(pk=self.case.pk).exists())
+
     def test_real_receipt_notice_persists_once_for_sales_and_stock(self):
         from workflow.models import WorkItem
         original=real_publish_workitem

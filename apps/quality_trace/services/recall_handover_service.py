@@ -28,7 +28,7 @@ from .recall_collaboration_service import (
     FACTORY_PICKUP_REQUEST_ROLES,
     FACTORY_RECALL_COLLABORATION_ROLES,
     close_customer_pickup_dispatch_task,
-    organization_recipients,
+    organization_action_recipients,
     publish_factory_transport_tasks,
     publish_customer_pickup_dispatch_task,
     publish_factory_recall_progress,
@@ -128,7 +128,7 @@ def _close_factory_pickup_task(handover, *, user, reason):
 
 def _publish_factory_pickup_task(handover, *, user):
     factory = handover.campaign.factory_organization
-    recipients = organization_recipients(factory, FACTORY_PICKUP_REQUEST_ROLES)
+    recipients = organization_action_recipients(factory, FACTORY_PICKUP_REQUEST_ROLES)
     if not recipients:
         raise QualityRecallError("厂家没有可接收上门取件任务的总工程师或物流经理岗位。")
     payload = handover.method_payload if isinstance(handover.method_payload, dict) else {}

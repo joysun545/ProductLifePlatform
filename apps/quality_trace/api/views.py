@@ -305,6 +305,10 @@ def alert_detail(request, alert_id):
     evidence_rows = metric.device_evidence.order_by("device_id") if metric else []
     data = {
         "id": alert.pk,
+        "root_organization": {
+            "id": alert.factory_organization_id,
+            "name": alert.factory_organization.name,
+        },
         "rule_id": alert.rule_version.rule_id,
         "rule_name": alert.rule_version.rule.name,
         "rule_version": alert.rule_version.version,
@@ -420,7 +424,9 @@ def quality_cases(request):
     return JsonResponse({
         "code": 0,
         "msg": "",
-        "data": {"items": [serialize_case(row) for row in rows[:100]]},
+        "data": {"items": [
+            serialize_case(row) for row in rows.select_related("factory_organization")[:100]
+        ]},
     }, status=200)
 
 

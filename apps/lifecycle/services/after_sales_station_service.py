@@ -93,10 +93,6 @@ def _factory_sales_review_audience(organization):
         )
         .order_by("id")
     )
-    sales_openids = _active_openids(sales_identities)
-    if not sales_openids:
-        raise AfterSalesServiceStationError("所属厂家尚未设置有效的厂家销售经理，暂不能提交申请")
-
     # A delegated factory senior manager shares this exact actionable review
     # with factory sales. The manager's copy is a task copy, not a separate
     # review step; the first reviewer to decide closes every copy.
@@ -113,9 +109,10 @@ def _factory_sales_review_audience(organization):
         )
         .order_by("id")
     )
-    return root, sales_role, sales_identities, _active_openids(
-        [*sales_identities, *manager_identities]
-    )
+    recipients = _active_openids([*sales_identities, *manager_identities])
+    if not recipients:
+        raise AfterSalesServiceStationError("所属厂家尚未设置有效的厂家销售经理，暂不能提交申请")
+    return root, sales_role, sales_identities, recipients
 
 
 def _publish_station_review_task(application, *, actor_openid):
@@ -665,8 +662,10 @@ def get_service_station_review_context(*, user, application_id):
         and _is_factory_sales_reviewer(identity, application)
     )
     review_payload = review_item.payload if review_item and isinstance(review_item.payload, dict) else {}
+    root = application.organization.get_factory_root()
     return {
         "application": _review_application_payload(application),
+        "root_organization": {"id": root.pk, "name": root.name} if root else None,
         "can_review": can_review,
         "task_completed_by_name": review_payload.get("completed_by_name", ""),
     }

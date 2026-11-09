@@ -187,13 +187,32 @@ class AfterSalesMedia(models.Model):
     content_type = models.CharField(max_length=128, blank=True, default="")
     file_size = models.PositiveBigIntegerField(default=0)
     duration_seconds = models.PositiveIntegerField(null=True, blank=True)
+    # Transport evidence belongs to one immutable sending leg. Legacy and
+    # non-transport media intentionally keep these fields empty.
+    evidence_scope_key = models.CharField(max_length=160, null=True, blank=True)
+    scope_slot = models.PositiveSmallIntegerField(null=True, blank=True)
+    evidence_kind = models.CharField(max_length=16, null=True, blank=True, default="")
+    client_upload_id = models.UUIDField(null=True, blank=True)
+    content_sha256 = models.CharField(max_length=64, null=True, blank=True, default="")
     sequence = models.PositiveIntegerField(default=0)
     uploaded_by = models.ForeignKey("account.User", on_delete=models.PROTECT, related_name="after_sales_media")
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         ordering = ("sequence", "id")
-        indexes = [models.Index(fields=("application", "purpose"), name="life_as_media_purpose")]
+        indexes = [
+            models.Index(fields=("application", "purpose"), name="life_as_media_purpose"),
+            models.Index(fields=("application", "evidence_scope_key"), name="life_as_media_scope"),
+        ]
+        constraints = [
+            models.UniqueConstraint(fields=("application", "evidence_scope_key", "scope_slot"), name="life_as_scope_slot_unique"),
+            models.UniqueConstraint(fields=("application", "uploaded_by", "client_upload_id"), name="life_as_upload_request_unique"),
+            models.CheckConstraint(condition=(
+                Q(evidence_scope_key__isnull=True, scope_slot__isnull=True)
+                | (Q(evidence_scope_key__isnull=False, scope_slot__isnull=False,
+                     scope_slot__gte=1, scope_slot__lte=9) & ~Q(evidence_scope_key=""))
+            ), name="life_as_scope_slot_range"),
+        ]
 
 
 class AfterSalesDeviceCodeVerification(models.Model):

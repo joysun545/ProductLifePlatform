@@ -1,5 +1,5 @@
 """Read scopes shared by after-sales lists, details and settlement evidence."""
-from django.db.models import Q
+from django.db.models import F, Q
 from account.models import UserOrganization
 from account.services.auth_service import get_active_identity
 from account.services.role_delegation_service import (
@@ -77,6 +77,18 @@ def visible_cases(user, identity=None):
     if _org_user(user,org.pk):
         scope |= Q(replacement_flow__legs__from_organization=org)|Q(replacement_flow__legs__to_organization=org)
         for n in range(23):scope |= Q(**{f'escalation__factory_transport__participants__{n}':org.pk})
+    if org_type == 'OWNER' and role in SENIOR_MANAGER_ROLE_CODES and identity_has_role(identity, 'factory_stock'):
+        from sales.models import ReplacementSupplyPlanItem
+
+        supply_cases = ReplacementSupplyPlanItem.objects.filter(
+            status__in=('RESERVED', 'SENT'), plan__status='OPEN', plan__factory=org,
+            plan__normal_order__factory_organization=org,
+            plan__normal_order__merchant_organization_id=F('plan__merchant_id'),
+            leg__direction='SUPPLY', leg__sequence=1, leg__from_organization=org,
+            leg__to_organization_id=F('plan__merchant_id'), leg__flow__mode='LOCAL',
+            leg__flow__swapped_at__isnull=False,
+        ).values('leg__flow__application_id')
+        scope |= Q(pk__in=supply_cases)
     if org_type=='OWNER' and identity_has_role(identity,'factory_logistics'):
         scope |= Q(factory_organization=org,escalation__requires_replacement_flow_v6=True,escalation__decision='FACTORY_REPAIR')
     links = station_links(identity)

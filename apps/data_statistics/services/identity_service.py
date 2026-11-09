@@ -20,6 +20,10 @@ class StatisticsIdentity:
     def organization_type(self):
         return self.organization.organization_type.code
 
+    @property
+    def can_view_warehouse_lots(self):
+        return self.organization_type == "OWNER" and self.role.code == "factory_material_stock"
+
 
 def get_statistics_identity(user):
     identity = get_active_identity(user)

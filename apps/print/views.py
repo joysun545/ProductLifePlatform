@@ -24,9 +24,14 @@ from print.models import PrintLoginChallenge
 from sales.models import OrderPlanShipment
 from sales.services.order_plan_material_flow_service import (
     OrderPlanMaterialFlowError,
+    _has_open_shipment_task,
+    _shipment_task_key,
     confirm_material_flow_shipment_qrcode_print,
     prepare_material_flow_shipment_qrcodes,
 )
+from web_portal.access import GRANT, identity_can_access_module, require_web_identity
+from web_portal.views import clear_browser_session
+from workflow.models import UserTask
 
 CHALLENGE_SECONDS = 300
 SESSION_SECONDS = 1800
@@ -34,6 +39,8 @@ SESSION_SCOPE = "pldp.print.shipment.v2"
 GATE_SESSION_KEY = "pldp_print_gate"
 CHALLENGE_SESSION_KEY = "pldp_print_challenge"
 PREPARED_SESSION_KEY = "pldp_print_prepared"
+PRINT_TASK_TYPE = "ORDER_PLAN_V2_QRCODE_PRINT"
+PRINT_TASK_STAGE = "qrcode-print"
 
 
 class PrintAccessError(Exception):
@@ -52,14 +59,21 @@ def _digest(value):
 
 def _stock_identity(user):
     identity = get_active_identity(user) if user and user.is_active else None
-    if (not identity or identity.role.code != "factory_stock"
-            or identity.organization.organization_type.code != "OWNER"
-            or identity.role.organization_type_id != identity.organization.organization_type_id):
-        raise PrintAccessError("仅当前厂家成品库管账号可授权和操作打印中心。")
+    if (
+        not identity
+        or identity.role.code not in {"factory_stock", "factory_senior_manager"}
+        or not identity_can_access_module(identity, "print")
+    ):
+        raise PrintAccessError("请使用厂家成品库管或已获成品库管授权的厂家高级经理账号。")
     return identity
 
 
 def _gate(request):
+    if request.session.get(GRANT):
+        identity = require_web_identity(request, "print")
+        request.session[GATE_SESSION_KEY] = {"expires_at": request.session[GRANT]["expires_at"]}
+        return request.user, identity
+
     grant = request.session.get(GATE_SESSION_KEY) or {}
     if (grant.get("scope") != SESSION_SCOPE
             or not isinstance(grant.get("expires_at"), (int, float))
@@ -98,6 +112,11 @@ def _shipment(request, identity):
     ).first()
     if not shipment:
         raise OrderPlanMaterialFlowError("未找到本厂家发货批次。")
+    if identity.role.code == "factory_senior_manager" and not _has_open_shipment_task(
+        plan=shipment.order_plan, shipment=shipment, identity=identity,
+        work_type=PRINT_TASK_TYPE, stage_key=PRINT_TASK_STAGE,
+    ):
+        raise PrintAccessError("当前账号没有本发货批次的待打印任务。")
     return shipment
 
 
@@ -116,6 +135,17 @@ def print_center(request):
         status=OrderPlanShipment.Status.AUTHORIZED,
         qrcode_printed_at__isnull=True,
     ).order_by("order_plan_id", "sequence_no")
+    if identity.role.code == "factory_senior_manager":
+        task_keys = set(UserTask.objects.filter(
+            workitem__type=PRINT_TASK_TYPE,
+            workitem__status="OPEN",
+            to_openid=(user.wx_openid or "").strip(),
+            need_action=True,
+        ).exclude(state="DONE").values_list("workitem__uniq_key", flat=True))
+        shipments = [
+            shipment for shipment in shipments
+            if _shipment_task_key(shipment.order_plan_id, shipment.pk, PRINT_TASK_STAGE) in task_keys
+        ]
     return render(request, "print/print_center.html", {
         "shipments": shipments, "identity": identity,
         "grant_expires_at": request.session[GATE_SESSION_KEY]["expires_at"],
@@ -232,10 +262,11 @@ def login_status(request):
 @csrf_protect
 @require_POST
 def logout(request):
-    for key in (GATE_SESSION_KEY, CHALLENGE_SESSION_KEY, PREPARED_SESSION_KEY):
-        request.session.pop(key, None)
-    request.session.cycle_key()
-    return JsonResponse({"code": 0, "data": {}})
+    challenge_id = request.session.get(CHALLENGE_SESSION_KEY)
+    if challenge_id:
+        PrintLoginChallenge.objects.filter(pk=challenge_id).delete()
+    clear_browser_session(request)
+    return JsonResponse({"code": 0, "data": {"redirect_url": "/?login=1"}})
 
 
 @never_cache

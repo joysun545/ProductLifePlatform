@@ -7,7 +7,10 @@ from django.utils import timezone
 from django.db.models import Q
 from account.models import Organization, OrganizationRelation, UserOrganization
 from account.services.auth_service import get_active_identity
-from account.services.role_delegation_service import identity_has_role, identity_can_perform_shared_operation
+from account.services.role_delegation_service import (
+    identity_has_role, identity_can_perform_shared_operation,
+    shared_operation_recipient_role_codes, vacant_role_manager_openids,
+)
 from lifecycle.models import (AfterSalesApplication, ReplacementFlow, ReplacementLeg, ReplacementInventoryEntry,
     Device, DeviceState, OrganizationDevice, QRCode, ActivationRecord, InstallationRecord, CustomerDeviceBinding,
     LifecycleEvent, AfterSalesMedia, DriverVehicleBinding, VehicleDeviceAssignment)
@@ -45,13 +48,36 @@ def _org_user(user, org_id):
          or identity_has_role(i,'factory_aftersales')))
 
 
+def _order_supply_merchant(leg, organization):
+    if leg.direction != 'SUPPLY' or organization.organization_type.code != 'MERCHANT':
+        return False
+    return leg.flow.legs.filter(
+        direction='SUPPLY', sequence=1,
+        supply_plan_items__status__in=('RESERVED', 'SENT'),
+        supply_plan_items__plan__status='OPEN',
+        supply_plan_items__plan__normal_order__isnull=False,
+        supply_plan_items__plan__factory_id=leg.flow.application.factory_organization_id,
+    ).exists()
+
+
+def _handoff_user(leg, user, organization):
+    if not _order_supply_merchant(leg, organization):
+        return _org_user(user, organization.pk)
+    identity = get_active_identity(user)
+    return bool(
+        identity and user.is_active and identity.organization_id == organization.pk
+        and identity_can_perform_shared_operation(identity, 'goods_transfer_receipt')
+    )
+
+
 def _event(app, device, action, user, **data):
     i=get_active_identity(user)
     return LifecycleEvent.objects.create(device=device,event_type='AFTERSALE_TRANSFER',operator=user,
         organization=i.organization,data={'application_id':app.pk,'replacement_action':action,**data})
 
 
-def _notify(app, org_id, title, key, actor):
+@transaction.atomic
+def _notify(app, org_id, title, key, actor, *, leg=None):
     from lifecycle.services.aftersales_service import AfterSalesService as S
     if org_id==app.customer_organization_id:
         recipients=[app.applicant.wx_openid]
@@ -62,8 +88,47 @@ def _notify(app, org_id, title, key, actor):
     if v6 and org_id==app.factory_organization_id and ('-receive' in key or key=='factory-pickup'):
         recipients=list(UserOrganization.objects.filter(organization_id=org_id,is_active=True,user__is_active=True,
             role__is_active=True,role__code__in=['factory_aftersales','factory_logistics']).exclude(user__wx_openid='').values_list('user__wx_openid',flat=True))
-    S._publish_task(app,step='replacement-'+key,task_type='AFTERSALES_REPLACEMENT_CHANNEL',title=title,
-        summary=S._summary(app),recipients_openids=recipients,actor_openid=actor.wx_openid or '')
+        recipients.extend(vacant_role_manager_openids(
+            app.factory_organization, {"factory_aftersales", "factory_logistics"},
+        ))
+    payload = None
+    if leg is not None and leg.direction == 'SUPPLY':
+        organization = leg.to_organization if org_id == leg.to_organization_id else leg.from_organization
+        if _order_supply_merchant(leg, organization):
+            roles = shared_operation_recipient_role_codes(org_id, 'goods_transfer_receipt')
+            recipients = list(UserOrganization.objects.filter(
+                organization_id=org_id, is_active=True, user__is_active=True,
+                role__is_active=True, role__code__in=roles,
+            ).exclude(user__wx_openid='').values_list('user__wx_openid', flat=True))
+            recipients.extend(vacant_role_manager_openids(organization, roles))
+        payload = {'replacement_leg_id': leg.pk, 'root_organization_id': app.factory_organization_id}
+    from lifecycle.services.replacement_task_scope import notification_scope, split_recipients, split_scan_recipients
+    scope = notification_scope(app, org_id, key, leg)
+    if scope is None:
+        S._publish_task(app,step='replacement-'+key,task_type='AFTERSALES_REPLACEMENT_CHANNEL',title=title,
+            summary=S._summary(app),recipients_openids=recipients,actor_openid=actor.wx_openid or '',payload=payload)
+        return
+    # Keep the original action key so the real handoff still completes it.
+    # Other original recipients retain a separate knowledge copy in this case.
+    if scope['action'] == 'scan':
+        action_recipients, notice_recipients = split_scan_recipients(app, scope['flow'], recipients)
+        payload = {**(payload or {}), 'replacement_flow_id': scope['flow'].pk,
+                   'execution_organization_id': scope['flow'].execution_organization_id}
+    else:
+        recipients.extend(vacant_role_manager_openids(app.factory_organization, {scope['role']}))
+        action_recipients, notice_recipients = split_recipients(app, scope['role'], recipients)
+    payload = {**(payload or {}), 'root_organization_id': app.factory_organization_id}
+    if scope['leg'] is not None:
+        payload['replacement_leg_id'] = scope['leg'].pk
+    if action_recipients:
+        S._publish_task(app,step='replacement-'+key,task_type='AFTERSALES_REPLACEMENT_CHANNEL',title=title,
+            summary=S._summary(app),recipients_openids=action_recipients,actor_openid=actor.wx_openid or '',payload=payload,
+            need_action=True,mark_workitem_done_immediately=False)
+    if notice_recipients:
+        notice_title = '现场换新已获批准，服务人员待办理' if scope['action'] == 'scan' else title
+        S._publish_task(app,step='replacement-'+key+'-notice',task_type='AFTERSALES_REPLACEMENT_CHANNEL',title=notice_title,
+            summary=S._summary(app),recipients_openids=notice_recipients,actor_openid=actor.wx_openid or '',payload=payload,
+            need_action=False,mark_workitem_done_immediately=True)
 
 
 def _finish(app, leg, step, actor):
@@ -86,6 +151,7 @@ def _proof(app, purpose, user, after):
 
 
 def _old_return_evidence(flow,leg,user,data):
+    from lifecycle.services import aftersales_evidence_service as E
     # Explicit attachment IDs bind this submission to two distinct kinds of proof.
     def ids(name):
         raw=data.get(name)
@@ -94,11 +160,12 @@ def _old_return_evidence(flow,leg,user,data):
         return set(raw)
     images=ids('device_image_ids');documents=ids('logistics_document_ids')
     if images & documents:error('物流单和设备图片须分别上传，不能重复使用同一附件')
+    if len(images | documents)>E.LIMIT:error('本段物流单和设备图片合计最多9个')
     after=flow.created_at
     previous=flow.legs.filter(direction='OLD',sequence__lt=leg.sequence).order_by('-sequence').first()
     if previous and previous.received_at:after=max(after,previous.received_at)
-    rows=list(flow.application.media.filter(pk__in=images|documents,purpose='REPAIR_RETURN_SHIPMENT_DOCUMENT',uploaded_by=user,created_at__gte=after))
-    if {x.pk for x in rows}!=images|documents:error('退旧附件无效或不属于当前账号、本次交接，请重新上传')
+    rows=E.require_ids(flow.application,user,sorted(images),key=E.old_scope(leg),kind='DEVICE',after=after)
+    rows+=E.require_ids(flow.application,user,sorted(documents),key=E.old_scope(leg),kind='LOGISTICS',after=after)
     if any(x.media_type!='IMAGE' for x in rows if x.pk in images):error('设备凭证必须为图片')
     if any(x.media_type not in {'IMAGE','DOCUMENT'} for x in rows if x.pk in documents):error('物流单须为图片或单据')
     return {'method':'SHIPMENT','confirmation_basis':'RETURN_DOCUMENT_AND_DEVICE_IMAGE',
@@ -161,7 +228,7 @@ def can_send(leg,user):
     flow=leg.flow
     if leg.direction=='USER' or flow.application.status=='CANCELLED':return False
     if not Organization.objects.filter(pk=leg.to_organization_id,is_active=True).filter(Q(pk=flow.application.factory_organization_id)|Q(factory_root_id=flow.application.factory_organization_id)).exists():return False
-    sender = _org_user(user,leg.from_organization_id)
+    sender = _handoff_user(leg, user, leg.from_organization)
     if leg.direction=='SUPPLY' and leg.sequence==1:
         from sales.services.replacement_supply_service import can_dispatch
         sender=can_dispatch(leg,user)
@@ -182,7 +249,7 @@ def can_receive(leg,user):
     if leg.direction=='OLD' and leg.to_organization_id==app.factory_organization_id:
         from lifecycle.services.replacement_v6_service import logistics
         return leg.status=='SENT' and logistics(user,app.factory_organization_id)
-    return leg.status=='SENT' and _org_user(user,leg.to_organization_id)
+    return leg.status=='SENT' and _handoff_user(leg, user, leg.to_organization)
 
 
 @transaction.atomic
@@ -413,7 +480,7 @@ def execute(*,application_id,user,data):
                 _stock(flow,leg,leg.from_organization_id,leg.device,'OLD_OUT',-1,user)
                 DeviceState.objects.filter(device=leg.device).update(status='REPAIRING',last_event=event)
             _finish(app,leg,'send',user)
-            _notify(app,leg.to_organization_id,'换新交接待签收：'+leg.device.sn,str(leg.pk)+'-receive',user)
+            _notify(app,leg.to_organization_id,'换新交接待签收：'+leg.device.sn,str(leg.pk)+'-receive',user,leg=leg)
         elif action=='RECEIVE_REPLACEMENT_LEG':
             if not can_receive(leg,user) or data.get('confirmed') is not True:error('仅接收方可以明确签收，不能重复签收')
             note=str(data.get('receipt_note') or '').strip()
@@ -438,7 +505,7 @@ def execute(*,application_id,user,data):
                 returned(flow,user)
                 S._send_factory_close_task(app,actor_openid=user.wx_openid or '',title='旧机已返厂，请完成售后处理归因；补发独立安排')
             nextleg=flow.legs.filter(direction=leg.direction,sequence=leg.sequence+1).first()
-            if nextleg:_notify(app,nextleg.from_organization_id,'换新下一段待发出',str(nextleg.pk)+'-send',user)
+            if nextleg:_notify(app,nextleg.from_organization_id,'换新下一段待发出',str(nextleg.pk)+'-send',user,leg=nextleg)
             elif leg.direction=='OLD' and flow.mode=='FACTORY':_notify(app,flow.execution_organization_id,'旧机已返厂签收，请扫描新机换新','scan',user)
         else:error('未知换新操作')
     S._event(app,'REPLACEMENT_FLOW_'+str(action),user=user,payload={'flow_id':flow.pk,'leg_id':leg.pk})
@@ -446,6 +513,7 @@ def execute(*,application_id,user,data):
 
 
 def describe(app,user):
+    from lifecycle.services import aftersales_evidence_service as E
     flow=ReplacementFlow.objects.filter(application=app).first()
     if not flow:return None
     from lifecycle.services.aftersales_service import AfterSalesService as S
@@ -477,7 +545,7 @@ def describe(app,user):
         'can_send_old':any(l.direction=='OLD' and can_send(l,user) for l in legs),
         'old_return_complete':all(l.status=='RECEIVED' for l in legs if l.direction=='OLD'),
         'supply_complete':all(l.status=='RECEIVED' for l in legs if l.direction=='SUPPLY'),
-        'legs':[{'id':l.pk,'direction':l.direction,'sequence':l.sequence,'status':l.status,
+        'legs':[{'id':l.pk,**(E.describe(app,user,E.old_scope(l)) if l.direction=='OLD' else {}),'direction':l.direction,'sequence':l.sequence,'status':l.status,
             'from_name':l.from_organization.name,'to_name':l.to_organization.name,'device_sn':l.device.sn if l.device else '',
             'logistics':l.logistics,'received_at':l.received_at.isoformat() if l.received_at else '',
             'can_send':can_send(l,user),'can_receive':can_receive(l,user)} for l in legs]}
@@ -485,6 +553,10 @@ def describe(app,user):
     if (app.escalation or {}).get('factory_transport'):
         result.update(can_scan_swap=False,can_operate=False,needs_legacy_logistics=False,can_upgrade_protocol=False,can_confirm_factory_old=False,can_send_old=False)
         for row in result['legs']:row.update(can_send=False,can_receive=False)
+        from lifecycle.services.replacement_v6_service import decorate, transport_recovery_ready
+        if transport_recovery_ready(app, flow):
+            result = decorate(app, user, flow, result)
+            result['needs_logistics_controls'] = any(row['can_send'] for row in result['material_returns'])
         return result
     if flow.protocol_version>=6:
         from lifecycle.services.replacement_v6_service import decorate

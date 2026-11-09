@@ -9,7 +9,10 @@ from account.models import (
     OrganizationRole,
     OrganizationType,
     SeniorManagerProfile,
+    UserOrganization,
 )
+from account.services.auth_service import issue_access_token
+from channel.models import MerchantChannelAssignment
 from django.db.models import Sum
 from django.test import TestCase
 from django.utils import timezone
@@ -47,18 +50,20 @@ from sales.services.order_plan_material_flow_service import (
     confirm_material_flow_shipment_logistics,
     confirm_material_flow_shipment_qrcode_print,
     get_material_flow_detail,
+    prepare_material_flow_shipment_qrcodes,
     refresh_material_reservations_for_stock,
     release_material_ready_for_production,
     warehouse_review_material_plan,
 )
 from sales.services.order_plan_list_service import get_order_plan_list
 from sales.test_v2_fixture import V2OrderPlanFixture
-from product.models import BOMItem
+from product.models import BOM, BOMItem
 from supply_chain.models import (
     FactoryMaterialLot,
     FactoryMaterialStock,
     MaterialSpec,
     MaterialSpecSupplier,
+    MaterialWarehouseDocument,
     SupplierResponsibilityScope,
     SupplierSalesResponsibility,
 )
@@ -128,6 +133,135 @@ class OrderPlanMaterialFlowTests(TestCase):
         self.assertTrue(created)
         plan = OrderPlan.objects.get(pk=result["plan"]["id"])
         return plan
+
+    def _second_merchant_for_same_salesperson(self):
+        merchant = Organization.objects.create(
+            code="V2-RETRY-MERCHANT", name="重试测试第二商家",
+            organization_type=self.merchant.organization_type,
+        )
+        owner = self._user_with_identity(
+            "v2-retry-second-owner", "v2-retry-second-owner-openid",
+            merchant, self.merchant_owner_role,
+        )
+        relation = self._accepted_direct_relation(self.sales_user, owner, merchant)
+        MerchantChannelAssignment.objects.create(
+            relation=relation, brand=self.brand, region="重庆", assigned_by=self.sales_user,
+        )
+        return merchant
+
+    def test_order_creation_retry_cannot_return_another_merchant_order(self):
+        second = self._second_merchant_for_same_salesperson()
+        payload = {
+            "client_request_id": "v2-retry-merchant-guard",
+            "merchant_id": self.merchant.pk,
+            "items": [{
+                "category_id": self.generator_category.pk,
+                "product_model_id": self.generator.pk,
+                "quantity": 2,
+                "source_bom_id": self.generator_bom.pk,
+            }],
+        }
+        url = "/pldp/api/sales/order-plans/material-flow/"
+        auth = {"HTTP_AUTHORIZATION": self.authorization}
+        response = self.client.post(url, payload, content_type="application/json", **auth)
+        first = response.json()
+        self.assertEqual(first["code"], 0, first)
+        first_order_id = first["data"]["plan"]["id"]
+        before = (OrderPlan.objects.count(), WorkItem.objects.count(), OrderPlanFinance.objects.count())
+
+        response = self.client.post(
+            url, {**payload, "merchant_id": second.pk}, content_type="application/json", **auth,
+        )
+        rejected = response.json()
+        self.assertEqual(rejected["code"], 1, rejected)
+        self.assertIn("已用于其他商家的订单", rejected["msg"])
+        self.assertEqual(before, (OrderPlan.objects.count(), WorkItem.objects.count(), OrderPlanFinance.objects.count()))
+
+        retry = self.client.post(url, payload, content_type="application/json", **auth).json()
+        self.assertEqual(retry["code"], 0, retry)
+        self.assertEqual(retry["data"]["plan"]["id"], first_order_id)
+        self.assertEqual(before, (OrderPlan.objects.count(), WorkItem.objects.count(), OrderPlanFinance.objects.count()))
+
+        fresh = self.client.post(
+            url, {**payload, "merchant_id": second.pk, "client_request_id": "v2-fresh-second"},
+            content_type="application/json", **auth,
+        ).json()
+        self.assertEqual(fresh["code"], 0, fresh)
+        self.assertNotEqual(fresh["data"]["plan"]["id"], first_order_id)
+        self.assertEqual(OrderPlan.objects.get(pk=fresh["data"]["plan"]["id"]).merchant_organization_id, second.pk)
+
+    def test_order_creation_retry_requires_original_content_for_the_same_merchant(self):
+        payload = {
+            "client_request_id": "v2-retry-content-guard",
+            "merchant_id": self.merchant.pk,
+            "remark": "原订单备注",
+            "items": [{
+                "category_id": self.generator_category.pk,
+                "product_model_id": self.generator.pk,
+                "quantity": 10,
+                "source_bom_id": self.generator_bom.pk,
+                "use_return_inventory": False,
+            }],
+        }
+        url = "/pldp/api/sales/order-plans/material-flow/"
+        auth = {"HTTP_AUTHORIZATION": self.authorization}
+
+        def submit(data):
+            return self.client.post(url, data, content_type="application/json", **auth).json()
+
+        first = submit(payload)
+        self.assertEqual(first["code"], 0, first)
+        plan = OrderPlan.objects.get(pk=first["data"]["plan"]["id"])
+        watched_models = (
+            OrderPlan, OrderPlanFinance, OrderPlanMaterialLotAllocation, WorkItem,
+        )
+        before = tuple(model.objects.count() for model in watched_models)
+
+        def expect_original(data):
+            replay = submit(data)
+            self.assertEqual(replay["code"], 0, replay)
+            self.assertEqual(replay["data"]["plan"]["id"], plan.pk)
+
+        def expect_conflict(data):
+            response = submit(data)
+            self.assertEqual(response["code"], 1, response)
+            self.assertIn("当前内容与原订单不同", response["msg"])
+            self.assertEqual(tuple(model.objects.count() for model in watched_models), before)
+
+        expect_original({**payload, "accessories": []})
+        for field, value in (
+            ("quantity", 12),
+            ("product_model_id", self.air_conditioner.pk),
+            ("source_bom_id", self.air_conditioner.boms.get(version="active-v2").pk),
+            ("use_return_inventory", True),
+            ("materials", [{"material_id": self.generator_material[0].pk, "deleted": True}]),
+        ):
+            with self.subTest(field=field):
+                expect_conflict({**payload, "items": [{**payload["items"][0], field: value}]})
+        expect_conflict({**payload, "remark": "已改备注"})
+        expect_conflict({**payload, "accessories": [{
+            "category_id": self.generator_category.pk,
+            "product_model_id": self.generator.pk,
+            "material_spec_id": self.generator_material[1].pk,
+            "quantity": "1",
+        }]})
+
+        selection = OrderPlanSalesBOMSelection.objects.get(order_plan_item__plan=plan)
+        self.assertTrue(selection.selection_snapshot.pop("creation_request_fingerprint"))
+        selection.save(update_fields=["selection_snapshot"])
+        expect_original(payload)
+        expect_conflict({**payload, "items": [{**payload["items"][0], "quantity": 12}]})
+        self.assertEqual(plan.items.get().quantity, 10)
+
+        invalid = deepcopy(payload)
+        invalid["client_request_id"] = "v2-retry-never-created"
+        invalid["items"][0]["quantity"] = 0
+        self.assertEqual(submit(invalid)["code"], 1)
+        self.assertFalse(OrderPlan.objects.filter(client_request_id=invalid["client_request_id"]).exists())
+        invalid["items"][0]["quantity"] = 12
+        fresh = submit(invalid)
+        self.assertEqual(fresh["code"], 0, fresh)
+        self.assertEqual(OrderPlan.objects.get(pk=fresh["data"]["plan"]["id"]).items.get().quantity, 12)
 
     def _requirements(self, plan):
         return OrderPlanMaterialRequirement.objects.filter(
@@ -273,6 +407,81 @@ class OrderPlanMaterialFlowTests(TestCase):
             get_material_flow_detail(user=self.sales_user, plan_id=plan.pk)["finance"]
         )
 
+    def test_order_choices_and_create_exclude_supplier_from_another_root(self):
+        other_factory = Organization.objects.create(
+            code="ORDER-OTHER-ROOT", name="另一厂家", organization_type=self.factory.organization_type,
+        )
+        other_supplier = Organization.objects.create(
+            code="ORDER-OTHER-ROOT-SUPPLIER", name="另一链路供应商",
+            organization_type=self.supplier.organization_type,
+        )
+        OrganizationRelation.objects.create(
+            source_organization=other_factory, target_organization=other_supplier,
+            relation_type=OrganizationRelationType.SUPPLY,
+        )
+        material, spec = self.generator_material
+        MaterialSpecSupplier.objects.create(material_spec=spec, supplier=other_supplier)
+        foreign_bom = BOM.objects.create(
+            product_model=self.generator, version="other-root", version_no=999, is_active=True,
+        )
+        BOMItem.objects.create(
+            bom=foreign_bom, material=material, material_spec=spec, supplier=other_supplier, quantity=1,
+        )
+        auth = {"HTTP_AUTHORIZATION": self.authorization}
+        url = V2OrderPlanFixture.list_url + "material-flow/"
+        options = self.client.get(url + "options/", {"merchant_id": self.merchant.pk}, **auth).json()
+        self.assertEqual(options["code"], 0, options)
+        bom_options = options["data"]["bom_options_by_product_model"][str(self.generator.pk)]
+        self.assertIn(self.generator_bom.pk, {row["id"] for row in bom_options})
+        self.assertNotIn(foreign_bom.pk, {row["id"] for row in bom_options})
+
+        item = {
+            "category_id": self.generator_category.pk, "product_model_id": self.generator.pk,
+            "source_bom_id": foreign_bom.pk, "quantity": 5, "use_return_inventory": False,
+        }
+        payload = {"merchant_id": self.merchant.pk, "client_request_id": "supply-root-boundary", "items": [item]}
+        rejected = self.client.post(url, payload, content_type="application/json", **auth).json()
+        self.assertEqual(rejected["code"], 1, rejected)
+        self.assertIn("当前厂家链路", rejected["msg"])
+        self.assertFalse(OrderPlan.objects.filter(client_request_id=payload["client_request_id"]).exists())
+
+        item["source_bom_id"] = self.generator_bom.pk
+        created = self.client.post(url, payload, content_type="application/json", **auth).json()
+        self.assertEqual(created["code"], 0, created)
+        plan_id = created["data"]["plan"]["id"]
+        warehouse_review_material_plan(user=self.material_keeper, plan_id=plan_id)
+        task = WorkItem.objects.get(biz_ref=f"sales.OrderPlan:{plan_id}", type="ORDER_PLAN_SUPPLIER_DELIVERY")
+        self.assertEqual(task.payload["factory_id"], self.factory.pk)
+        self.assertTrue(task.user_tasks.filter(to_openid=self.supplier_owner.wx_openid).exists())
+        self.assertEqual(task.payload["supplier_id"], self.supplier.pk)
+
+    def test_dispatch_rechecks_supplier_relation_after_order_creation(self):
+        plan = self._create_v2_plan(request_id="supply-relation-revoked-before-dispatch")
+        relation = OrganizationRelation.objects.get(source_organization=self.factory, target_organization=self.supplier)
+        relation.is_active = False
+        relation.save(update_fields=["is_active"])
+
+        warehouse_review_material_plan(user=self.material_keeper, plan_id=plan.pk)
+        delivery = OrderPlanSupplyDelivery.objects.get(material_plan__order_plan=plan)
+        self.assertEqual(delivery.status, OrderPlanSupplyDelivery.Status.QUEUED)
+        result = dispatch_due_supply_deliveries(force=True, delivery_ids=[delivery.pk])
+        self.assertEqual(result["dispatched"], 0)
+        self.assertIn("没有有效供货关系", result["errors"][0]["reason"])
+        self.assertFalse(WorkItem.objects.filter(
+            biz_ref=f"sales.OrderPlan:{plan.pk}", type="ORDER_PLAN_SUPPLIER_DELIVERY",
+        ).exists())
+
+        relation.is_active = True
+        relation.save(update_fields=["is_active"])
+        self.assertEqual(dispatch_due_supply_deliveries(force=True, delivery_ids=[delivery.pk])["dispatched"], 1)
+        relation.is_active = False
+        relation.save(update_fields=["is_active"])
+        with self.assertRaisesMessage(OrderPlanMaterialFlowError, "有权参与的厂家链路"):
+            confirm_supplier_material_delivery(user=self.supplier_owner, plan_id=plan.pk, delivery_id=delivery.pk)
+        self.assertNotIn(plan.pk, {row["id"] for row in get_order_plan_list(self.supplier_owner)["items"]})
+        delivery.refresh_from_db()
+        self.assertEqual(delivery.status, OrderPlanSupplyDelivery.Status.DISPATCHED)
+
     def test_timeline_lights_only_current_actor_or_awareness_recipient(self):
         """Global progress must never turn into every viewer's green dot."""
 
@@ -317,6 +526,57 @@ class OrderPlanMaterialFlowTests(TestCase):
                 for action in supplier_detail["available_actions"]
             )
         )
+
+    def test_order_delivery_receipt_updates_only_its_own_order(self):
+        first = self._create_v2_plan(request_id="receipt-first", quantity=5)
+        second = self._create_v2_plan(request_id="receipt-second", quantity=5)
+        for plan in (first, second):
+            warehouse_review_material_plan(user=self.material_keeper, plan_id=plan.pk)
+            confirm_supplier_material_delivery(user=self.supplier_owner, plan_id=plan.pk)
+        first_delivery = OrderPlanSupplyDelivery.objects.get(material_plan__order_plan=first)
+        second_delivery = OrderPlanSupplyDelivery.objects.get(material_plan__order_plan=second)
+        auth = {"HTTP_AUTHORIZATION": self.material_stock_authorization}
+        first_url = V2OrderPlanFixture.list_url + f"{first.pk}/material-flow/order-delivery-receipt/"
+        second_url = V2OrderPlanFixture.list_url + f"{second.pk}/material-flow/order-delivery-receipt/"
+
+        result = self.client.post(second_url, {}, content_type="application/json", **auth).json()
+        self.assertEqual(result["code"], 0, result)
+        first_delivery.refresh_from_db()
+        second_delivery.refresh_from_db()
+        self.assertEqual(first_delivery.lines.get().received_milli, 0)
+        self.assertEqual(first_delivery.status, OrderPlanSupplyDelivery.Status.SUPPLIER_CONFIRMED)
+        self.assertEqual(second_delivery.lines.get().received_milli, 5_000)
+        self.assertEqual(second_delivery.status, OrderPlanSupplyDelivery.Status.SATISFIED)
+        self.assertTrue(self.client.get(first_url, **auth).json()["data"]["can_submit"])
+        self.assertFalse(self.client.get(second_url, **auth).json()["data"]["can_submit"])
+
+        # Shared stock still reserves oldest demand first. That reservation is
+        # not a receipt for the first order or production stock for the second.
+        lot = FactoryMaterialLot.objects.get(stock=self.material_stock)
+        self.assertEqual(lot.received_milli, 5_000)
+        self.assertEqual(lot.reserved_milli, 5_000)
+        self.assertEqual(MaterialWarehouseDocument.objects.get(stock=self.material_stock).lot_id, lot.pk)
+        allocation = OrderPlanMaterialLotAllocation.objects.get(material_lot=lot)
+        self.assertEqual(allocation.requirement_id, self._requirements(first).get().pk)
+        self.assertEqual(allocation.reserved_milli, lot.received_milli)
+        self.assertEqual(self._requirements(second).get().reserved_milli, 0)
+        with self.assertRaisesMessage(OrderPlanMaterialFlowError, "所需物料尚未全部到位"):
+            release_material_ready_for_production(user=self.material_keeper, plan_id=second.pk)
+
+        repeated = self.client.post(second_url, {}, content_type="application/json", **auth).json()
+        self.assertNotEqual(repeated["code"], 0, repeated)
+        self.assertEqual(FactoryMaterialLot.objects.filter(stock=self.material_stock).count(), 1)
+        self.assertEqual(MaterialWarehouseDocument.objects.filter(stock=self.material_stock).count(), 1)
+
+        result = self.client.post(first_url, {}, content_type="application/json", **auth).json()
+        self.assertEqual(result["code"], 0, result)
+        first_delivery.refresh_from_db()
+        self.assertEqual(first_delivery.lines.get().received_milli, 5_000)
+        self.assertEqual(first_delivery.status, OrderPlanSupplyDelivery.Status.SATISFIED)
+        self.assertEqual(second_delivery.lines.get().received_milli, 5_000)
+        self.assertEqual(FactoryMaterialLot.objects.filter(stock=self.material_stock).count(), 2)
+        self.assertEqual(MaterialWarehouseDocument.objects.filter(stock=self.material_stock).count(), 2)
+        self.assertEqual(self._requirements(second).get().reserved_milli, 5_000)
 
     def test_warehouse_dispatch_then_receipt_hook_reserves_without_advancing_and_ready_pushes_production(self):
         plan = self._create_v2_plan(request_id="v2-review-receipt-ready")
@@ -1066,6 +1326,128 @@ class OrderPlanMaterialFlowTests(TestCase):
                 for action in sales_detail["available_actions"]
             )
         )
+
+    def test_vacant_order_roles_can_complete_shared_task_handoffs(self):
+        manager = self._user_with_identity(
+            "vacant-order-factory-manager",
+            "openid-vacant-order-factory-manager",
+            self.factory,
+            OrganizationRole.objects.get(code="factory_senior_manager"),
+        )
+        factory_roles = (
+            self.factory_material_stock_role,
+            self.factory_production_role,
+            self.factory_stock_role,
+            self.factory_logistics_role,
+            self.factory_sales_assistant_role,
+        )
+        SeniorManagerProfile.objects.create(
+            identity=manager.organization_identity,
+        ).managed_roles.add(*factory_roles)
+        UserOrganization.objects.filter(
+            organization=self.factory, role__in=factory_roles,
+        ).update(is_active=False)
+        merchant_manager = self.merchant_senior_manager
+        SeniorManagerProfile.objects.create(
+            identity=merchant_manager.organization_identity,
+        ).managed_roles.add(self.merchant_stock_role)
+        UserOrganization.objects.filter(
+            organization=self.merchant, role=self.merchant_stock_role,
+        ).update(is_active=False)
+
+        plan = self._create_v2_plan(request_id="vacant-role-order-handoffs", quantity=5)
+
+        def assert_task_for(work_type, actor):
+            work = WorkItem.objects.get(
+                biz_ref=f"sales.OrderPlan:{plan.pk}", type=work_type,
+            )
+            self.assertEqual(work.status, "OPEN")
+            self.assertEqual(
+                list(work.user_tasks.filter(need_action=True).values_list("to_openid", flat=True)),
+                [actor.wx_openid],
+            )
+            self.assertEqual(work.payload["factory_id"], self.factory.pk)
+
+        assert_task_for("ORDER_PLAN_MATERIAL_REVIEW", manager)
+        detail = get_material_flow_detail(user=manager, plan_id=plan.pk)
+        self.assertIn("warehouse-review", {row["code"] for row in detail["available_actions"]})
+        warehouse_review_material_plan(user=manager, plan_id=plan.pk)
+        confirm_supplier_material_delivery(user=self.supplier_owner, plan_id=plan.pk)
+        receipt_url = (
+            f"/pldp/api/sales/order-plans/{plan.pk}/material-flow/order-delivery-receipt/"
+        )
+        auth = {"HTTP_AUTHORIZATION": f"Bearer {issue_access_token(manager)}"}
+        form = self.client.get(receipt_url, **auth).json()
+        self.assertEqual(form["code"], 0, form)
+        self.assertTrue(form["data"]["can_submit"])
+        receipt = self.client.post(receipt_url, {}, content_type="application/json", **auth).json()
+        self.assertEqual(receipt["code"], 0, receipt)
+
+        release_material_ready_for_production(user=manager, plan_id=plan.pk)
+        assert_task_for("ORDER_PLAN_V2_PRODUCTION_CONFIRM", manager)
+        material_plan = OrderPlanMaterialPlan.objects.get(order_plan=plan)
+        self.assertEqual(material_plan.warehouse_reviewed_by_id, manager.pk)
+        self.assertEqual(material_plan.material_ready_by_id, manager.pk)
+        subplan = material_plan.production_subplans.get()
+        confirm_material_flow_production(user=manager, plan_id=plan.pk, subplan_id=subplan.pk)
+        subplan.refresh_from_db()
+        self.assertEqual(subplan.production_completed_by_id, manager.pk)
+
+        shipment = OrderPlanShipment.objects.get(order_plan=plan)
+        assert_task_for("ORDER_PLAN_V2_SHIPMENT_AUTHORIZATION", self.sales_user)
+        authorize_material_flow_shipment(user=self.sales_user, plan_id=plan.pk, shipment_id=shipment.pk)
+        assert_task_for("ORDER_PLAN_V2_QRCODE_PRINT", manager)
+        print_batch = prepare_material_flow_shipment_qrcodes(
+            user=manager, plan_id=plan.pk, shipment_id=shipment.pk,
+        )
+        self.assertEqual(len(print_batch["qrcodes"]), 5)
+        confirm_material_flow_shipment_qrcode_print(
+            user=manager, plan_id=plan.pk, shipment_id=shipment.pk,
+        )
+        assert_task_for("ORDER_PLAN_V2_SHIPMENT_LOGISTICS_CONFIRM", manager)
+        confirm_material_flow_shipment_logistics(
+            user=manager, plan_id=plan.pk, shipment_id=shipment.pk,
+            logistics_company="缺岗交接测试", tracking_no="VACANT-ROLE-ORDER",
+        )
+        assert_task_for("ORDER_PLAN_V2_STOCK_OUTBOUND", manager)
+        confirm_material_flow_shipment_outbound(
+            user=manager, plan_id=plan.pk, shipment_id=shipment.pk,
+        )
+        assert_task_for("ORDER_PLAN_V2_MERCHANT_RECEIPT", merchant_manager)
+        confirm_material_flow_merchant_receipt(
+            user=merchant_manager, plan_id=plan.pk, shipment_id=shipment.pk,
+        )
+        assert_task_for("ORDER_PLAN_V2_ACCOUNTING_CONFIRM", manager)
+        confirm_material_flow_accounting(user=manager, plan_id=plan.pk)
+
+        shipment.refresh_from_db()
+        plan.refresh_from_db()
+        self.assertEqual(shipment.logistics_confirmed_by_id, manager.pk)
+        self.assertEqual(shipment.shipped_by_id, manager.pk)
+        self.assertEqual(shipment.received_by_id, merchant_manager.pk)
+        self.assertEqual(plan.accounted_by_id, manager.pk)
+
+    def test_stock_manager_cannot_prepare_staffed_print_task_without_copy(self):
+        manager = self._user_with_identity(
+            "unassigned-stock-manager", "openid-unassigned-stock-manager", self.factory,
+            OrganizationRole.objects.get(code="factory_senior_manager"),
+        )
+        SeniorManagerProfile.objects.create(
+            identity=manager.organization_identity,
+        ).managed_roles.add(self.factory_stock_role)
+        plan, _subplan, shipment = self._ready_production_shipment(
+            request_id="stock-manager-without-print-task", quantity=5,
+        )
+        authorize_material_flow_shipment(user=self.sales_user, plan_id=plan.pk, shipment_id=shipment.pk)
+        work = WorkItem.objects.get(type="ORDER_PLAN_V2_QRCODE_PRINT")
+        self.assertFalse(work.user_tasks.filter(to_openid=manager.wx_openid).exists())
+        with self.assertRaisesMessage(OrderPlanMaterialFlowError, "不是本批打码任务的处理人"):
+            prepare_material_flow_shipment_qrcodes(user=manager, plan_id=plan.pk, shipment_id=shipment.pk)
+        self.assertFalse(shipment.device_allocations.exists())
+        prepared = prepare_material_flow_shipment_qrcodes(
+            user=self.factory_stock, plan_id=plan.pk, shipment_id=shipment.pk,
+        )
+        self.assertEqual(len(prepared["qrcodes"]), 5)
 
     def test_v2_stock_senior_manager_can_confirm_receipt_without_task(self):
         plan, _subplan, shipment = self._ready_production_shipment(

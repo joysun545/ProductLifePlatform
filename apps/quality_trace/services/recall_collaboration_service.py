@@ -2,6 +2,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from account.models import UserOrganization
+from account.services.role_delegation_service import vacant_role_manager_openids
 from lifecycle.models import CustomerDeviceBinding, DriverVehicleBinding
 from workflow.models import UserTask, WorkItem
 from workflow.services.workflow_service import publish_workitem
@@ -58,6 +59,13 @@ def organization_recipients(organization, roles):
         .values_list("user__wx_openid", flat=True)
         .distinct()
     )
+
+
+def organization_action_recipients(organization, roles):
+    return [
+        *organization_recipients(organization, roles),
+        *vacant_role_manager_openids(organization, roles),
+    ]
 
 
 def customer_device_recipients(handover):
@@ -267,7 +275,7 @@ def publish_factory_transport_tasks(leg, *, user):
         "/pages/quality_trace/recall_detail/recall_detail"
         f"?campaign_id={leg.campaign_id}&recall_device_id={leg.recall_device_id}"
     )
-    logistics = organization_recipients(factory, FACTORY_LOGISTICS_ROLES)
+    logistics = organization_action_recipients(factory, FACTORY_LOGISTICS_ROLES)
     if not logistics:
         raise ValueError("厂家没有有效的厂家物流经理账号。")
     action = publish_workitem(
@@ -305,7 +313,7 @@ def publish_factory_transport_tasks(leg, *, user):
 
 
 def publish_inventory_posting_task(leg, *, user):
-    recipients = organization_recipients(
+    recipients = organization_action_recipients(
         leg.to_organization, FACTORY_INVENTORY_POSTING_ROLES,
     )
     if not recipients:

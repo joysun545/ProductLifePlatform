@@ -19,6 +19,7 @@ from quality_trace.models import (
 from workflow.models import WorkItem
 from workflow.services.workflow_service import publish_workitem
 
+from .recall_collaboration_service import organization_action_recipients
 from .recall_service import QualityRecallError
 
 
@@ -220,11 +221,11 @@ def start_recall_post_disposition(*, user, campaign_id, method,
         raise QualityRecallError("只有已完成返厂入库记账的设备才能分配处置方式。")
     if campaign.post_dispositions.filter(recall_device_id__in=requested_ids).exists():
         raise QualityRecallError("所选设备中已有设备完成处置方式分配，不能重复覆盖。")
-    production_openids = _role_openids(campaign.factory_organization, {"factory_production"})
+    production_openids = organization_action_recipients(campaign.factory_organization, {"factory_production"})
     if not production_openids:
         raise QualityRecallError("厂家缺少有效生产经理账号。")
     if method == QualityRecallPostDisposition.Method.REPAIR_WITH_PARTS:
-        if not _role_openids(campaign.factory_organization, {"factory_matching"}):
+        if not organization_action_recipients(campaign.factory_organization, {"factory_matching"}):
             raise QualityRecallError("厂家缺少有效配套经理账号。")
         for row in rows:
             suppliers = list(row.device.batch.bom.items.exclude(supplier=None)
@@ -273,7 +274,7 @@ def start_recall_post_disposition(*, user, campaign_id, method,
             _publish_action(
                 item, task_type=TASK_MATCHING, suffix="matching",
                 title="召回换件维修待配套处理（等待供应商负责人确认）",
-                recipients=_role_openids(
+                recipients=organization_action_recipients(
                     item.campaign.factory_organization, {"factory_matching"},
                 ), actor=user, payload={"blocked_by_supplier": True},
             )
@@ -311,7 +312,7 @@ def confirm_recall_disposition_supplier(*, user, confirmation_id, note=""):
         _publish_action(
             item, task_type=TASK_MATCHING, suffix="matching",
             title="召回设备换件维修待配套确认",
-            recipients=_role_openids(item.campaign.factory_organization, {"factory_matching"}),
+            recipients=organization_action_recipients(item.campaign.factory_organization, {"factory_matching"}),
             actor=user,
         )
     return confirmation
@@ -347,7 +348,7 @@ def confirm_recall_disposition_matching(*, user, disposition_id,
     _publish_action(
         item, task_type=TASK_PRODUCTION, suffix="production",
         title="召回设备待完成换件维修",
-        recipients=_role_openids(item.campaign.factory_organization, {"factory_production"}),
+        recipients=organization_action_recipients(item.campaign.factory_organization, {"factory_production"}),
         actor=user,
     )
     return item
@@ -388,7 +389,7 @@ def complete_recall_disposition_production(*, user, disposition_id,
         _publish_action(
             item, task_type=TASK_CHIEF, suffix="chief",
             title="召回维修完成，待总工程师确认处置",
-            recipients=_role_openids(item.campaign.factory_organization,
+            recipients=organization_action_recipients(item.campaign.factory_organization,
                                      {"factory_chief_engineer"}),
             actor=user,
         )
@@ -521,7 +522,7 @@ def sync_recall_disposition_execution_tasks(*, campaign_id=None):
             _publish_action(
                 item, task_type=TASK_MATCHING, suffix="matching",
                 title="召回换件维修待配套处理（等待供应商负责人确认）",
-                recipients=_role_openids(
+                recipients=organization_action_recipients(
                     item.campaign.factory_organization, {"factory_matching"},
                 ), actor=actor, payload={"blocked_by_supplier": True},
             )
@@ -532,7 +533,7 @@ def sync_recall_disposition_execution_tasks(*, campaign_id=None):
                 item, task_type=TASK_PRODUCTION, suffix="production",
                 title=("召回设备待拆机" if item.method == "DISASSEMBLE"
                        else "召回设备待不换件维修"),
-                recipients=_role_openids(
+                recipients=organization_action_recipients(
                     item.campaign.factory_organization, {"factory_production"},
                 ), actor=actor,
             )

@@ -428,12 +428,8 @@ def invitation_detail(request):
     if error_response:
         return error_response
 
-    token = (request.GET.get("token") or "").strip()
-    if not token:
-        return JsonResponse({"code": 1, "msg": "邀请token缺失"}, status=200)
-
     try:
-        result = get_invitation_detail(token=token, viewer=user)
+        result = get_invitation_detail(token=request.GET.get("token"), viewer=user)
     except InvitationError as exc:
         return JsonResponse({"code": 1, "msg": str(exc)}, status=200)
 
@@ -450,14 +446,10 @@ def accept_invitation(request):
         return error_response
 
     data = _request_data(request)
-    token = (data.get("token") or "").strip()
-    if not token:
-        return JsonResponse({"code": 1, "msg": "邀请token缺失"}, status=200)
-
     try:
         result = accept_staff_invitation(
             invitee=user,
-            token=token,
+            token=data.get("token"),
             nickname=data.get("nickname", ""),
             avatar=data.get("avatar", ""),
             phone=data.get("phone", ""),

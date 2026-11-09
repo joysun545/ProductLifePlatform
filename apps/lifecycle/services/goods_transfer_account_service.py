@@ -17,6 +17,7 @@ from account.services.role_delegation_service import (
     SENIOR_MANAGER_ROLE_CODES,
     has_open_action_task_copy,
     identity_has_role,
+    vacant_role_manager_openids,
 )
 from lifecycle.models import (
     GoodsTransfer,
@@ -26,6 +27,7 @@ from lifecycle.models import (
     GoodsTransferPayment,
     GoodsTransferSettlement,
 )
+from lifecycle.services.goods_transfer_service import goods_transfer_root_payload
 from workflow.models import WorkItem
 from workflow.services.workflow_service import publish_workitem
 from .goods_transfer_receivable_service import financial_write_errors
@@ -33,6 +35,9 @@ from .goods_transfer_receivable_service import financial_write_errors
 
 class GoodsTransferAccountError(Exception):
     pass
+
+
+MERCHANT_ACCOUNTING_DISABLED = "商家向下发货不再形成应收账款，相关货款往来操作已停用。"
 
 
 MERCHANT_ACCOUNT_ROLES = {
@@ -147,6 +152,11 @@ def _role_openids(organization):
         .values_list("user__wx_openid", flat=True)
         .distinct()
     )
+
+
+def _action_openids(organization):
+    return (*_role_openids(organization),
+            *vacant_role_manager_openids(organization, _role_codes_for_org(organization)))
 
 
 def _is_direct_distribution(upper, lower):
@@ -265,7 +275,7 @@ def _confirmer_org(case):
 
 
 def _publish_submit_task(case, actor_openid=""):
-    recipients = _role_openids(_submitter_org(case))
+    recipients = _action_openids(_submitter_org(case))
     if not recipients:
         return None
     return_title = (
@@ -300,7 +310,7 @@ def _publish_submit_task(case, actor_openid=""):
 
 
 def _publish_confirm_task(case, actor_openid=""):
-    recipients = _role_openids(_confirmer_org(case))
+    recipients = _action_openids(_confirmer_org(case))
     if not recipients:
         return None
     amount_text = "本次无款项" if case.proposed_amount is None else f"¥{case.proposed_amount:.2f}"
@@ -348,7 +358,7 @@ def _publish_notice(case, organization, title, summary, actor_openid=""):
 
 
 def _publish_payment_upload_task(case, sequence_no, actor_openid=""):
-    recipients = _role_openids(case.lower_organization)
+    recipients = _action_openids(case.lower_organization)
     if not recipients:
         return None
     return publish_workitem(
@@ -371,7 +381,7 @@ def _publish_payment_upload_task(case, sequence_no, actor_openid=""):
 
 def _publish_payment_confirm_task(payment, actor_openid=""):
     case = payment.account_case
-    recipients = _role_openids(case.upper_organization)
+    recipients = _action_openids(case.upper_organization)
     if not recipients:
         return None
     return publish_workitem(
@@ -481,6 +491,10 @@ def initialize_goods_transfer_accounts(*, transfer, actor=None):
     cases = []
     any_created = False
     for definition in definitions:
+        # Merchant distribution is a physical/document flow, not another debt.
+        # Factory-owned return credit remains part of the existing return flow.
+        if definition[1].organization_type.code == "MERCHANT":
+            continue
         case, created = _create_case(transfer, *definition)
         cases.append(case)
         any_created = any_created or created
@@ -558,6 +572,8 @@ def _authorized_case(user, transfer_id, case_id=None, case_type=None, lock=False
     case = query.first()
     if not case:
         raise GoodsTransferAccountError("往来账记录不存在。")
+    if case.upper_organization.organization_type.code == "MERCHANT":
+        raise GoodsTransferAccountError(MERCHANT_ACCOUNTING_DISABLED)
     if identity.organization_id not in {
         case.upper_organization_id,
         case.lower_organization_id,
@@ -870,12 +886,13 @@ def get_goods_transfer_accounts(*, user, transfer_id):
             "submitted_by",
             "confirmed_by",
             "rejected_by",
-        ).filter(transfer=transfer).filter(
+        ).filter(transfer=transfer, upper_organization__organization_type__code="OWNER").filter(
             Q(upper_organization=identity.organization)
             | Q(lower_organization=identity.organization)
         )
     )
     return {
+        "root_organization": goods_transfer_root_payload(transfer),
         "goods_transfer": {
             "id": transfer.pk,
             "flow_no": transfer.flow_no,
@@ -893,6 +910,11 @@ def get_goods_transfer_accounts(*, user, transfer_id):
             "role_name": identity.role.name,
         },
         "cases": [_serialize_case(case, user, identity) for case in cases],
+        "merchant_accounts_enabled": bool(
+            (transfer.flow_type == GoodsTransfer.FlowType.RETURN and transfer.to_organization.organization_type.code == "OWNER")
+            or (transfer.flow_type == GoodsTransfer.FlowType.TRANSFER and transfer.instruction_organization.organization_type.code == "OWNER")
+        ),
+        "disabled_reason": MERCHANT_ACCOUNTING_DISABLED if not cases else "",
     }
 
 

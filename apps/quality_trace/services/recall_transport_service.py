@@ -34,9 +34,10 @@ from .recall_collaboration_service import (
     publish_factory_transport_tasks,
     publish_inventory_posted_notice,
     publish_inventory_posting_task,
-    organization_recipients,
+    organization_action_recipients,
 )
 from .recall_service import QualityRecallError
+from .recall_evidence_service import confirmed_recall_evidence
 
 
 MERCHANT_ROLES = {
@@ -54,16 +55,9 @@ def _identity(user):
     return identity
 
 
-def _require_manager_task_copy(identity, *uniq_keys):
-    if not has_open_action_task_copy(identity, uniq_keys):
+def _require_manager_task_copy(identity, *uniq_keys, action_workitem_ids=()):
+    if not has_open_action_task_copy(identity, uniq_keys, workitem_ids=action_workitem_ids):
         raise QualityRecallError("当前高级经理没有收到这项召回协同任务。")
-
-
-def _evidence(value, label):
-    data = dict(value or {})
-    if not str(data.get("storage_key") or "").strip():
-        raise QualityRecallError(f"请上传{label}凭证。")
-    return data
 
 
 def _snapshot(organization):
@@ -213,8 +207,8 @@ def _locked_transport_leg(leg_id):
 def _reserve_inventory_for_recall(row, current, user):
     if getattr(row, "customer_handover", None) or row.transport_legs.exclude(status="CANCELLED").exists():
         return
-    ownership = OrganizationDevice.objects.select_for_update().get(device_id=row.device_id)
-    if ownership.organization_id != current.pk or ownership.status != "IN_STOCK":
+    ownership = OrganizationDevice.objects.select_for_update().filter(device_id=row.device_id).first()
+    if not ownership or ownership.organization_id != current.pk or ownership.status != "IN_STOCK":
         raise QualityRecallError("设备库存状态已变化，请刷新后重试。")
     event = LifecycleEvent.objects.create(
         device_id=row.device_id, event_type="RETURN", operator=user,
@@ -228,7 +222,7 @@ def _reserve_inventory_for_recall(row, current, user):
 
 
 @transaction.atomic
-def create_next_recall_transport_leg(*, user, recall_device_id, notify=True):
+def create_next_recall_transport_leg(*, user, recall_device_id, notify=True, action_workitem_ids=()):
     identity = _identity(user)
     row = _locked_recall_device(recall_device_id)
     current = _current_custodian(row)
@@ -238,6 +232,7 @@ def create_next_recall_transport_leg(*, user, recall_device_id, notify=True):
         identity,
         f"quality-recall-merchant-return:{row.pk}:org:{current.pk}",
         f"quality-recall:{row.campaign_id}:org:{current.pk}",
+        action_workitem_ids=action_workitem_ids,
     )
     if row.transport_legs.exclude(
         status__in=(QualityRecallTransportLeg.Status.RECEIVED, QualityRecallTransportLeg.Status.CANCELLED),
@@ -317,7 +312,9 @@ def create_next_recall_transport_leg(*, user, recall_device_id, notify=True):
 
 
 @transaction.atomic
-def dispatch_recall_transport_leg(*, user, leg_id, logistics_provider, tracking_no, evidence, notify=True):
+def dispatch_recall_transport_leg(
+    *, user, leg_id, logistics_provider, tracking_no, evidence, notify=True, action_workitem_ids=(),
+):
     identity = _identity(user)
     leg = _locked_transport_leg(leg_id)
     if identity.organization_id != leg.from_organization_id or not identity_has_role(identity, MERCHANT_ROLES):
@@ -326,6 +323,7 @@ def dispatch_recall_transport_leg(*, user, leg_id, logistics_provider, tracking_
         identity,
         f"quality-recall-merchant-return:{leg.recall_device_id}:org:{leg.from_organization_id}",
         f"quality-recall:{leg.campaign_id}:org:{leg.from_organization_id}",
+        action_workitem_ids=action_workitem_ids,
     )
     if leg.status != QualityRecallTransportLeg.Status.PREPARING:
         raise QualityRecallError("当前召回运输程次不能重复发出。")
@@ -333,11 +331,12 @@ def dispatch_recall_transport_leg(*, user, leg_id, logistics_provider, tracking_
     number = str(tracking_no or "").strip()
     if not provider or not number:
         raise QualityRecallError("请填写物流承运方和物流单号。")
+    proof = confirmed_recall_evidence(submitted=evidence, identity=identity, campaign=leg.campaign)
     now = timezone.now()
     leg.status = QualityRecallTransportLeg.Status.IN_TRANSIT
     leg.logistics_provider = provider
     leg.tracking_no = number
-    leg.dispatch_evidence = _evidence(evidence, "发出")
+    leg.dispatch_evidence = proof
     leg.dispatched_by = user
     leg.dispatched_at = now
     leg.save(update_fields=(
@@ -387,7 +386,9 @@ def dispatch_recall_transport_leg(*, user, leg_id, logistics_provider, tracking_
 
 
 @transaction.atomic
-def receive_recall_transport_leg(*, user, leg_id, evidence, receipt_note="", notify=True):
+def receive_recall_transport_leg(
+    *, user, leg_id, evidence, receipt_note="", notify=True, action_workitem_ids=(),
+):
     identity = _identity(user)
     leg = _locked_transport_leg(leg_id)
     roles = FACTORY_RECEIPT_ROLES if leg.is_factory_destination else MERCHANT_ROLES
@@ -396,12 +397,14 @@ def receive_recall_transport_leg(*, user, leg_id, evidence, receipt_note="", not
     _require_manager_task_copy(
         identity,
         f"quality-recall-transport:{leg.pk}:receive",
+        action_workitem_ids=action_workitem_ids,
     )
     if leg.status != QualityRecallTransportLeg.Status.IN_TRANSIT:
         raise QualityRecallError("只有运输中的召回设备可以验收。")
+    proof = confirmed_recall_evidence(submitted=evidence, identity=identity, campaign=leg.campaign)
     now = timezone.now()
     leg.status = QualityRecallTransportLeg.Status.RECEIVED
-    leg.receipt_evidence = _evidence(evidence, "验收")
+    leg.receipt_evidence = proof
     leg.received_by = user
     leg.received_at = now
     leg.custody_snapshot = {
@@ -473,7 +476,9 @@ def receive_recall_transport_leg(*, user, leg_id, evidence, receipt_note="", not
 
 
 @transaction.atomic
-def isolate_recalled_device(*, user, leg_id, disposition, isolation_location, evidence, notify=True):
+def isolate_recalled_device(
+    *, user, leg_id, disposition, isolation_location, evidence, notify=True, action_workitem_ids=(),
+):
     identity = _identity(user)
     leg = _locked_transport_leg(leg_id)
     if (
@@ -485,6 +490,7 @@ def isolate_recalled_device(*, user, leg_id, disposition, isolation_location, ev
     _require_manager_task_copy(
         identity,
         f"quality-recall-transport:{leg.pk}:inventory-posting",
+        action_workitem_ids=action_workitem_ids,
     )
     if leg.status != QualityRecallTransportLeg.Status.RECEIVED:
         raise QualityRecallError("厂家物流经理确认收货后才能入库记账。")
@@ -494,6 +500,7 @@ def isolate_recalled_device(*, user, leg_id, disposition, isolation_location, ev
     location = str(isolation_location or "").strip()
     if not location:
         raise QualityRecallError("请填写召回隔离位置。")
+    proof = confirmed_recall_evidence(submitted=evidence, identity=identity, campaign=leg.campaign)
     now = timezone.now()
     row = leg.recall_device
     receipt, created = QualityRecallIsolationReceipt.objects.get_or_create(
@@ -502,7 +509,7 @@ def isolate_recalled_device(*, user, leg_id, disposition, isolation_location, ev
             "campaign": row.campaign, "transport_leg": leg,
             "factory_organization": leg.to_organization,
             "disposition": disposition, "isolation_location": location,
-            "evidence_snapshot": _evidence(evidence, "隔离"),
+            "evidence_snapshot": proof,
             "isolated_by": user, "isolated_at": now,
             "source_activation_preserved": True,
             "ordinary_inventory_created": False,
@@ -553,7 +560,7 @@ def isolate_recalled_device(*, user, leg_id, disposition, isolation_location, ev
 def publish_batch_posting_confirmation(campaign, *, user):
     accounted = campaign.isolation_receipts.count()
     if accounted == campaign.device_count and not hasattr(campaign, "inventory_batch_confirmation"):
-        recipients = organization_recipients(
+        recipients = organization_action_recipients(
             campaign.factory_organization, {"factory_sales_assistant"},
         )
         if recipients:
@@ -576,7 +583,9 @@ def publish_batch_posting_confirmation(campaign, *, user):
 @transaction.atomic
 def confirm_recall_inventory_batch(*, user, campaign_id, note=""):
     identity = _identity(user)
-    campaign = QualityRecallCampaign.objects.select_for_update().get(pk=campaign_id)
+    campaign = QualityRecallCampaign.objects.select_for_update().filter(pk=campaign_id).first()
+    if not campaign:
+        raise QualityRecallError("召回批次不存在，请刷新召回详情。")
     if (
         identity.organization_id != campaign.factory_organization_id
         or not identity_has_role(identity, {"factory_sales_assistant"})
@@ -587,6 +596,11 @@ def confirm_recall_inventory_batch(*, user, campaign_id, note=""):
         f"quality-recall:{campaign.pk}:batch-posting-confirm",
         f"quality-recall:{campaign.pk}:org:{campaign.factory_organization_id}",
     )
+    if campaign.status != QualityRecallCampaign.Status.ACTIVE:
+        confirmation = getattr(campaign, "inventory_batch_confirmation", None)
+        if confirmation:
+            return confirmation
+        raise QualityRecallError("该召回批次当前不能确认入库记账，请刷新召回详情。")
     accounted = campaign.isolation_receipts.count()
     if accounted != campaign.device_count:
         raise QualityRecallError(
@@ -605,7 +619,7 @@ def confirm_recall_inventory_batch(*, user, campaign_id, note=""):
         f"quality-recall:{campaign.pk}:batch-posting-confirm", user=user,
         reason="RECALL_BATCH_INVENTORY_POSTING_CONFIRMED",
     )
-    recipients = organization_recipients(
+    recipients = organization_action_recipients(
         campaign.factory_organization, {"factory_chief_engineer"},
     )
     if not recipients:

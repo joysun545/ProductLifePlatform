@@ -7,7 +7,7 @@ from django.db.models import Q
 from django.utils import timezone
 from account.models import UserOrganization, Organization
 from account.services.auth_service import get_active_identity
-from account.services.role_delegation_service import identity_has_role
+from account.services.role_delegation_service import identity_has_role, vacant_role_manager_openids
 from lifecycle.models import (ReplacementFlow,ReplacementLeg,ReplacementMaterialReturn,ReplacementTurnoverStock,
     AfterSalesApplication,DeviceState,OrganizationDevice,LifecycleEvent,QRCode)
 from lifecycle.services import replacement_flow_service as B
@@ -15,6 +15,24 @@ from lifecycle.services.aftersales_service import AfterSalesService as S, AfterS
 
 ACTIONS={'UPGRADE_REPLACEMENT_PROTOCOL','CONFIRM_REPLACEMENT_SERVICE','FACTORY_PICKUP','RECOVERY_DECIDE','RECOVERY_REPAIR_COMPLETE',
          'RECOVERY_DISASSEMBLY_COMPLETE','SEND_WARRANTY_PART'}
+RECOVERY_ACTIONS = {
+    'RECOVERY_DECIDE', 'RECOVERY_REPAIR_COMPLETE',
+    'RECOVERY_DISASSEMBLY_COMPLETE', 'SEND_WARRANTY_PART',
+}
+
+
+def transport_recovery_ready(app, flow):
+    """Recovery can continue after a confirmed direct factory replacement."""
+    transport = (app.escalation or {}).get('factory_transport') or {}
+    return bool(
+        flow and flow.mode == 'FACTORY' and flow.protocol_version == 6
+        and flow.swapped_at and app.status == 'CLOSED'
+        and transport.get('kind') == 'REPLACEMENT'
+        and transport.get('route') == 'DIRECT'
+        and transport.get('state') == 'DELIVERED'
+        and transport.get('factory_received_at')
+        and flow.recovery.get('picked_up_at')
+    )
 
 
 def logistics(user,root):
@@ -28,6 +46,8 @@ def factory(user,app):return S._is_factory_aftersales(app,user)
 def _role_task(app,roles,title,key,user,need_action=True):
     ids=list(UserOrganization.objects.filter(organization_id=app.factory_organization_id,is_active=True,
         user__is_active=True,role__is_active=True,role__code__in=roles).exclude(user__wx_openid='').values_list('user__wx_openid',flat=True))
+    if need_action:
+        ids.extend(vacant_role_manager_openids(app.factory_organization, roles))
     S._publish_task(app,step='replacement-'+key,task_type='AFTERSALES_REPLACEMENT_RECOVERY',title=title,
         summary=S._summary(app),recipients_openids=ids,actor_openid=user.wx_openid or '',need_action=need_action,
         mark_workitem_done_immediately=not need_action)
@@ -43,8 +63,7 @@ def _offline(data):
 def can_send(leg,user):
     app=leg.flow.application
     if app.status=='CANCELLED' or leg.direction=='USER' or leg.status!='PENDING' or not B._previous_done(leg):return False
-    i=get_active_identity(user)
-    sender=B._org_user(user,leg.from_organization_id)
+    sender=B._handoff_user(leg, user, leg.from_organization)
     if leg.direction=='SUPPLY' and leg.sequence==1:
         from sales.services.replacement_supply_service import can_dispatch
         sender=can_dispatch(leg,user)
@@ -61,7 +80,7 @@ def can_receive(leg,user):
     if app.status=='CANCELLED' or leg.status!='SENT':return False
     if leg.direction=='OLD' and leg.to_organization_id==app.factory_organization_id:return logistics(user,app.factory_organization_id)
     if leg.direction=='USER':return user.pk==app.applicant_id
-    return B._org_user(user,leg.to_organization_id)
+    return B._handoff_user(leg, user, leg.to_organization)
 
 
 @transaction.atomic
@@ -79,7 +98,7 @@ def _finish_recovery(flow,user,data):
     recovery=deepcopy(flow.recovery);recovery.update(state='CLOSED',closed_at=timezone.now().isoformat(),closed_by=user.pk,**data)
     flow.recovery=recovery;flow.save(update_fields=['recovery'])
     S._complete_tasks(flow.application,steps=['replacement-recovery'],actor_openid=user.wx_openid or '')
-    if flow.swapped_at:
+    if flow.swapped_at and flow.application.status != 'CLOSED':
         S._send_factory_close_task(flow.application,actor_openid=user.wx_openid or '',title='旧机处置已完成，待最终归因结案')
 
 
@@ -143,8 +162,12 @@ def execute(*,application_id,user,data):
             first=flow.legs.filter(direction='OLD').first()
             B._notify(app,first.from_organization_id if first else app.factory_organization_id,'旧机返厂交接待处理',str(first.pk)+'-send' if first else 'factory-pickup',user)
         return S.serialize(app)
-    if (app.escalation or {}).get('factory_transport'):B.error('本单由厂家物流返件流程办理，请使用对应交接入口')
     flow=ReplacementFlow.objects.select_for_update().filter(application=app,protocol_version=6).first()
+    direct_transport = (app.escalation or {}).get('factory_transport')
+    if direct_transport and (
+        data.get('action') not in RECOVERY_ACTIONS or not transport_recovery_ready(app, flow)
+    ):
+        B.error('直接返厂旧机须完成厂家物流收货和新机签收后才能处置')
     if not flow or app.status=='CANCELLED':B.error('当前售后流程不能执行此操作')
     data={key:value for key,value in data.items() if not key.startswith('_')}
     action=data.get('action');now=timezone.now()
@@ -208,6 +231,9 @@ def execute(*,application_id,user,data):
         if not factory(user,app) or flow.recovery.get('state')!='WAIT_DECISION':B.error('请先由厂家物流取货确认，再由售后经理研判')
         decision=data.get('decision');note=str(data.get('note') or '').strip()
         if decision not in {'REPAIR','DISASSEMBLE'} or not note:B.error('请选择维修或拆机并填写研判说明')
+        if direct_transport:
+            event = B._event(app, app.device, 'FACTORY_RECOVERY_CUSTODY_CONFIRMED', user)
+            B._stock_state(app.device, app.factory_organization_id, 'RETURNED_TO_FACTORY', event)
         flow.recovery={**flow.recovery,'state':'REPAIRING' if decision=='REPAIR' else 'DISASSEMBLING','decision':decision,
             'diagnosed_by':user.pk,'diagnosed_at':now.isoformat(),'diagnosis_note':note};flow.save(update_fields=['recovery'])
         if decision=='DISASSEMBLE':_notify_disassembly(flow,user)
@@ -316,7 +342,9 @@ def pending_for_route(source,target):
 def material_detail(row,user):
     i=get_active_identity(user)
     if not i or not i.user.is_active or i.organization_id!=row.supplier_id or not i.organization.get_factory_root() or i.organization.get_factory_root().pk!=row.flow.application.factory_organization_id or not (i.role.is_owner_role or i.role.code=='supplier_sales'):B.error('仅原配套供应商可查看自己的三包退料')
-    return {'id':row.pk,'supplier':row.supplier.name,'device_sn':row.snapshot.get('device_sn'),
+    root = row.flow.application.factory_organization
+    return {'id':row.pk,'root_organization':{'id':root.pk,'name':root.name},
+        'supplier':row.supplier.name,'device_sn':row.snapshot.get('device_sn'),
         'material':row.snapshot.get('material_name'),'specification':row.snapshot.get('specification'),'quantity':str(row.quantity),
         'status':row.status,'logistics':{k:v for k,v in row.logistics.items() if k not in {'evidence_ids'}},
         'purpose':'售后三包退料，无关销售结算','can_receive':row.status=='SENT'}

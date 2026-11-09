@@ -91,3 +91,14 @@ private_quality_recall/
 # Server deployment and role backups
 /.backup_role_chain_*/
 /PLDP_backend_backups/
+# PLDP local runtime and deployment files
+/.deploy_backups/
+/private_after_sales/
+*.before_*
+*.orig
+/*.zip
+/*.tar
+/*.tar.gz
+/*.tgz
+/*.7z
+/*.rar

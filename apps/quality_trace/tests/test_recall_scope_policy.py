@@ -15,10 +15,11 @@ from workflow.models import WorkItem, UserTask
 from workflow.services.workflow_service import publish_workitem
 from workflow.services.task_query import get_task_list, get_task_group, get_task_summary
 from workflow.services.task_action import open_task
+from .test_recall_batch import RecallEvidenceUploadMixin
 from . import test_recall_role_interactions as fixtures
 
 
-class RecallScopePolicyTests(TestCase):
+class RecallScopePolicyTests(RecallEvidenceUploadMixin, TestCase):
     make_user = classmethod(fixtures.RecallRoleInteractionTests.make_user.__func__)
     setUpTestData = classmethod(fixtures.RecallRoleInteractionTests.setUpTestData.__func__)
     get, detail, assert_scope = fixtures.RecallRoleInteractionTests.get, fixtures.RecallRoleInteractionTests.detail, fixtures.RecallRoleInteractionTests.assert_scope

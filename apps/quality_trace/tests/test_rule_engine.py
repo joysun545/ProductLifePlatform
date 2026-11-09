@@ -132,7 +132,10 @@ from quality_trace.services.recall_disposition_service import (
 from workflow.models import WorkItem, UserTask
 
 
-class QualityRuleEngineTests(TestCase):
+from .test_recall_batch import RecallEvidenceUploadMixin
+
+
+class QualityRuleEngineTests(RecallEvidenceUploadMixin, TestCase):
     @classmethod
     def setUpTestData(cls):
         owner_type = OrganizationType.objects.get(code="OWNER")
@@ -142,6 +145,7 @@ class QualityRuleEngineTests(TestCase):
         )
         cls.merchant = Organization.objects.create(
             name="R131测试商家", code="R131-MERCHANT", organization_type=merchant_type,
+            factory_root=cls.factory,
         )
         cls.manager = User.objects.create_user(
             username="r131-manager", wx_openid="r131-manager-openid",
@@ -1374,6 +1378,7 @@ class QualityRuleEngineTests(TestCase):
         )
         customer_org = Organization.objects.create(
             name="R13831用户范围", code="R13831-CUSTOMER", organization_type=customer_type,
+            factory_root=self.factory,
         )
         customer = User.objects.create_user(
             username="r13831-customer", wx_openid="r13831-customer-openid",
@@ -1565,6 +1570,7 @@ class QualityRuleEngineTests(TestCase):
         )
         customer_org = Organization.objects.create(
             name="R1384协同用户", code="R1384-CUSTOMER", organization_type=customer_type,
+            factory_root=self.factory,
         )
         owner = User.objects.create_user(
             username="r1384-owner", wx_openid="r1384-owner-openid",
@@ -1691,14 +1697,14 @@ class QualityRuleEngineTests(TestCase):
             leg_id=leg.pk,
             logistics_provider="召回专线",
             tracking_no="R1385-MERCHANT-001",
-            evidence={"storage_key": "recall/r1385-merchant-dispatch.jpg"},
+            evidence=self.upload_evidence(self.applicant),
         )
         progress.refresh_from_db()
         self.assertEqual(progress.payload["stage"], "RETURN_IN_TRANSIT")
         receive_recall_transport_leg(
             user=self.logistics,
             leg_id=leg.pk,
-            evidence={"storage_key": "recall/r1385-factory-receipt.jpg"},
+            evidence=self.upload_evidence(self.logistics),
         )
         progress.refresh_from_db()
         self.assertEqual(progress.payload["stage"], "FACTORY_RECEIVED_PENDING_POSTING")
@@ -1707,7 +1713,7 @@ class QualityRuleEngineTests(TestCase):
             leg_id=leg.pk,
             disposition=QualityRecallIsolationReceipt.Disposition.PENDING_INSPECTION,
             isolation_location="R1385召回隔离区",
-            evidence={"storage_key": "recall/r1385-isolation.jpg"},
+            evidence=self.upload_evidence(self.viewer),
         )
         progress.refresh_from_db()
         self.assertEqual(progress.status, "DONE")
@@ -1722,6 +1728,7 @@ class QualityRuleEngineTests(TestCase):
         )
         customer_org = Organization.objects.create(
             name="R1384直寄用户", code="R1384-DIRECT", organization_type=customer_type,
+            factory_root=self.factory,
         )
         customer = User.objects.create_user(
             username="r1384-direct", wx_openid="r1384-direct-openid",
@@ -1817,6 +1824,7 @@ class QualityRuleEngineTests(TestCase):
         )
         customer_org = Organization.objects.create(
             name="R1384取件用户", code="R1384-PICKUP", organization_type=customer_type,
+            factory_root=self.factory,
         )
         customer = User.objects.create_user(
             username="r1384-pickup", wx_openid="r1384-pickup-openid",
@@ -1919,6 +1927,7 @@ class QualityRuleEngineTests(TestCase):
         )
         customer_org = Organization.objects.create(
             name="R1364测试用户", code="R1364-CUSTOMER", organization_type=customer_type,
+            factory_root=self.factory,
         )
         customer = User.objects.create_user(
             username="r1364-customer", wx_openid="r1364-customer-openid",
@@ -2016,12 +2025,12 @@ class QualityRuleEngineTests(TestCase):
             leg_id=leg.pk,
             logistics_provider="R1365测试物流",
             tracking_no="R1365-TRACK-001",
-            evidence={"storage_key": "private/recall/r1365-dispatch.jpg"},
+            evidence=self.upload_evidence(self.applicant),
         )
         receive_recall_transport_leg(
             user=self.logistics,
             leg_id=leg.pk,
-            evidence={"storage_key": "private/recall/r1365-receipt.jpg"},
+            evidence=self.upload_evidence(self.logistics),
             receipt_note="设备序列号及外观已核对",
         )
         recall_device.refresh_from_db()
@@ -2044,7 +2053,7 @@ class QualityRuleEngineTests(TestCase):
             leg_id=leg.pk,
             disposition=QualityRecallIsolationReceipt.Disposition.PENDING_INSPECTION,
             isolation_location="R1365召回隔离区-A01",
-            evidence={"storage_key": "private/recall/r1365-isolation.jpg"},
+            evidence=self.upload_evidence(self.viewer),
         )
         recall_device.refresh_from_db()
         self.assertEqual(recall_device.status, QualityRecallDevice.Status.RECEIVED)
@@ -2299,8 +2308,8 @@ class QualityRuleEngineTests(TestCase):
         material = Material.objects.create(
             code="R1396-MATERIAL",
             name="R1396换件物料",
-            product_category=self.product_model.category,
         )
+        material.product_categories.add(self.product_model.category)
         material_spec = MaterialSpec.objects.create(
             material=material,
             code="R1396-MATERIAL-SPEC",

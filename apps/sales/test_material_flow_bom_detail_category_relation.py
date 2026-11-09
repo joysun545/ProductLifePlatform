@@ -15,6 +15,7 @@ class MaterialFlowBomDetailCategoryRelationTests(SimpleTestCase):
         queryset = _material_queryset(
             SimpleNamespace(category_id=1),
             bom,
+            factory_id=1,
         )
 
         self.assertIn("product_categories", str(queryset.query))

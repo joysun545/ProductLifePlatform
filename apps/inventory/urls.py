@@ -1,94 +1,20 @@
-# apps/inventory/urls.py
+"""Retired aggregate inventory URLs."""
 
-"""
-PLDP - Inventory URL Configuration
-
-库存模块接口路由
-
-
-"""
-
-
-
+from django.http import JsonResponse
 from django.urls import path
 
 
-from .views import (
-
-    InventoryOutboundAPI,
-
-    InventoryInboundAPI,
-
-    InventoryTransferAPI,
-
-    InventoryReturnAPI,
-
-    InventoryQueryAPI,
-
-)
-
+def retired_inventory(request):
+    return JsonResponse(
+        {"code": 410, "msg": "旧库存接口已停用，请使用当前库存业务入口。", "data": {}},
+        status=410,
+    )
 
 
 urlpatterns = [
-
-
-    path(
-
-        "outbound/",
-
-        InventoryOutboundAPI.as_view(),
-
-        name="inventory-outbound"
-
-    ),
-
-
-
-    path(
-
-        "inbound/",
-
-        InventoryInboundAPI.as_view(),
-
-        name="inventory-inbound"
-
-    ),
-
-
-
-    path(
-
-        "transfer/",
-
-        InventoryTransferAPI.as_view(),
-
-        name="inventory-transfer"
-
-    ),
-
-
-
-    path(
-
-        "return/",
-
-        InventoryReturnAPI.as_view(),
-
-        name="inventory-return"
-
-    ),
-
-
-
-    path(
-
-        "query/",
-
-        InventoryQueryAPI.as_view(),
-
-        name="inventory-query"
-
-    ),
-
-
+    path("outbound/", retired_inventory, name="inventory-outbound"),
+    path("inbound/", retired_inventory, name="inventory-inbound"),
+    path("transfer/", retired_inventory, name="inventory-transfer"),
+    path("return/", retired_inventory, name="inventory-return"),
+    path("query/", retired_inventory, name="inventory-query"),
 ]

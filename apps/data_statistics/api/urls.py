@@ -14,6 +14,7 @@ urlpatterns = [
     path("flow/", views.flow, name="flow"),
     path("aftersales/", views.aftersales, name="aftersales"),
     path("quality/", views.quality, name="quality"),
+    path("finance/", views.finance, name="finance"),
     path("metric-definitions/", views.metric_definitions, name="metric_definitions"),
     path("metric-trends/<str:metric_code>/", views.metric_trends, name="metric_trends"),
 ]

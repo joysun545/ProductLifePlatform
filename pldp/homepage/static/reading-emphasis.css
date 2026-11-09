@@ -1,0 +1,13 @@
+/* PLDP_READING_EMPHASIS_V1 — two distinct, opaque reading cards. */
+#explore .demo .domain-link{margin-top:22px;padding:18px 17px 17px;border:1px solid #b7d6c6;border-left:5px solid #00775f;border-radius:12px;background:#edf6ef;box-shadow:0 4px 14px #17362a09}
+#explore .demo .domain-link>small{display:flex;align-items:center;gap:8px;font-size:14px;line-height:1.5;font-weight:750;color:#00654f;letter-spacing:.03em}
+#explore .demo .domain-link>small::before{content:'↗';display:grid;place-items:center;width:25px;height:25px;flex:0 0 25px;border-radius:7px;background:#00775f;color:white;font-size:17px;font-weight:700}
+#explore .demo .domain-link #linkText{margin:13px 0 0;color:#203e33;font-size:15px;font-weight:500;line-height:1.95;text-align:left;overflow-wrap:anywhere}
+#explore .demo .handover-inline .boundary{margin:8px 0 0;padding:16px 19px;border:1px solid #dfcda5;border-left:5px solid #99702b;border-radius:12px;background:#faf3e5;box-shadow:0 4px 14px #40331a06}
+#explore .demo .handover-inline .boundary>small{display:flex;align-items:center;gap:8px;font-size:14px;line-height:1.5;font-weight:750;color:#765318;letter-spacing:.03em}
+#explore .demo .handover-inline .boundary>small::before{content:'i';display:grid;place-items:center;width:23px;height:23px;flex:0 0 23px;border:1.5px solid #99702b;border-radius:50%;font-family:Georgia,serif;font-size:16px;font-weight:700}
+#explore .demo .handover-inline .boundary #boundary{margin:10px 0 0;color:#514328;font-size:14px;font-weight:500;line-height:1.85;overflow-wrap:anywhere}
+#explore .domain-link ::selection{background:#c0dfca;color:#123e2f}#explore .boundary ::selection{background:#ecd7a7;color:#47330f}
+/* Keep boundary information available in compact layouts too. */
+@media(max-width:680px){#explore .stage .handover-inline{display:grid}#explore .stage .handover-inline>#evidence,#explore .stage .handover-inline>.next{display:none}#explore .demo .domain-link{padding:16px}#explore .demo .domain-link #linkText{font-size:15px}#explore .demo .handover-inline .boundary{padding:15px 16px}#explore .demo .handover-inline .boundary #boundary{font-size:14px}}
+@media print{#explore .demo .domain-link,#explore .demo .handover-inline .boundary{box-shadow:none;break-inside:avoid}}

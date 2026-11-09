@@ -162,12 +162,14 @@ class ScanService:
     def _public_device(cls, device, *, lifecycle_code=""):
         product_model = device.product_model
         state = cls._related_object(device, "state")
+        manufacturer = device.batch.manufacturer
         return {
             "id": device.pk,
+            "root_organization": {"id": manufacturer.pk, "name": manufacturer.name},
             "sn": device.sn,
             "lifecycle_code": lifecycle_code,
             "physical_device_code": device.physical_device_code or "",
-            "manufacturer": device.batch.manufacturer.name,
+            "manufacturer": manufacturer.name,
             "product_model": {
                 "id": product_model.pk,
                 "code": product_model.code,

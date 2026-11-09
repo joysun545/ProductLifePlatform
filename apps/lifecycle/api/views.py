@@ -669,7 +669,7 @@ class GoodsTransferSettlementStatementAPI(APIView):
             )
         except GoodsTransferSettlementError as exc:
             return _goods_transfer_settlement_error(exc)
-        return Response({"code": 0, "msg": "货品清单和应收金额已提交", "data": data})
+        return Response({"code": 0, "msg": "货品清单已提交", "data": data})
 
 
 class GoodsTransferSettlementLogisticsDocumentsAPI(APIView):
@@ -1008,8 +1008,10 @@ def _invitation_payload(request, invitation):
         "pldp:api:lifecycle:installation_invitation_qrcode",
         kwargs={"token": invitation.token},
     )
+    root = invitation.device.batch.manufacturer.get_factory_root()
     return {
         "token": str(invitation.token),
+        "root_organization": {"id": root.pk, "name": root.name} if root else None,
         "status": invitation.status,
         "expires_at": invitation.expires_at.isoformat(),
         "remaining_seconds": max(
@@ -1253,12 +1255,14 @@ class AcceptInstallationInvitationAPI(APIView):
         except (CustomerFlowPermissionError, CustomerFlowStateError) as exc:
             return _customer_flow_error_response(exc)
 
+        root = invitation.device.batch.manufacturer.get_factory_root()
         return Response(
             {
                 "code": 0,
                 "msg": "接受邀请成功",
                 "data": {
                     "device_id": invitation.device_id,
+                    "root_organization": {"id": root.pk, "name": root.name} if root else None,
                     "role": identity.role.code,
                     "role_name": identity.role.name,
                     "organization_id": identity.organization_id,
@@ -1764,6 +1768,10 @@ class AfterSalesApplicationMediaAPI(APIView):
                 purpose=request.data.get("purpose"),
                 duration_seconds=request.data.get("duration_seconds"),
                 caption=request.data.get("caption"),
+                evidence_context={key: request.data.get(key) for key in (
+                    "evidence_action", "transport_id", "direction", "index", "leg_id",
+                    "evidence_kind", "client_upload_id",
+                )},
             )
         except AfterSalesError as exc:
             return _aftersales_error(exc)

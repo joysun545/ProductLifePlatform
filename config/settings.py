@@ -161,3 +161,13 @@ USE_X_FORWARDED_HOST = True
 # PLDP 上传媒体文件
 MEDIA_URL = "/pldp/media/"
 MEDIA_ROOT = Path("/var/www/productlifeplatform_media")
+
+# PLDP_UNIFIED_WEB_LOGIN_SETTINGS_V1
+INSTALLED_APPS = list(INSTALLED_APPS) + ['web_portal']
+MIDDLEWARE = list(MIDDLEWARE)
+MIDDLEWARE.insert(MIDDLEWARE.index('django.contrib.auth.middleware.AuthenticationMiddleware') + 1, 'web_portal.middleware.PortalAccessMiddleware')
+
+# PLDP_WEB_LAYOUT_V1
+for _pldp_template_engine in TEMPLATES:
+    if _pldp_template_engine.get('BACKEND') == 'django.template.backends.django.DjangoTemplates':
+        _pldp_template_engine['DIRS'] = [BASE_DIR / 'pldp/web_templates'] + list(_pldp_template_engine.get('DIRS', []))

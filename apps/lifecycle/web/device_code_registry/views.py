@@ -74,7 +74,8 @@ def _qr_image_data_uri(value):
 
 def _issuer_identity(user):
     identity = get_active_identity(user) if user and user.is_active else None
-    if not identity_can_issue_device_codes(identity):
+    from web_portal.access import identity_can_access_module
+    if not identity_can_access_module(identity, "device_codes"):
         raise DeviceCodeRegistryAccessError(
             "仅厂家生产经理、无生产分管高级经理时的厂家负责人，或分管生产经理的厂家高级经理可操作。"
         )
@@ -82,6 +83,10 @@ def _issuer_identity(user):
 
 
 def _gate(request):
+    from web_portal.access import GRANT, require_web_identity
+    if request.session.get(GRANT):
+        return request.user, require_web_identity(request, "device_codes")
+
     grant = request.session.get(GATE_SESSION_KEY) or {}
     if (
         grant.get("scope") != LOGIN_SCOPE
@@ -280,9 +285,16 @@ def login_status(request):
 @csrf_protect
 @require_POST
 def logout(request):
-    request.session.pop(GATE_SESSION_KEY, None)
-    request.session.pop(CHALLENGE_SESSION_KEY, None)
-    request.session.cycle_key()
+    from web_portal.access import GRANT
+
+    if request.session.get(GRANT):
+        from web_portal.views import clear_browser_session
+
+        clear_browser_session(request)
+    else:
+        request.session.pop(GATE_SESSION_KEY, None)
+        request.session.pop(CHALLENGE_SESSION_KEY, None)
+        request.session.cycle_key()
     return JsonResponse({"code": 0, "data": {}})
 
 
@@ -341,7 +353,7 @@ def generate_batch(request):
         if quantity < 1 or quantity > MAX_BATCH_SIZE:
             raise ValueError("单次生成数量须为1至1000个。")
 
-        result = generate_device_code_batch(user=user, quantity=quantity)
+        result = generate_device_code_batch(user=user, quantity=quantity, web_authorized=True)
         result["codes"] = result["codes"][:30]
         result["codes_preview_truncated"] = quantity > 30
         return JsonResponse({"code": 0, "data": result}, status=201)

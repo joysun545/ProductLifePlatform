@@ -8,7 +8,6 @@ from django.db import IntegrityError, OperationalError, transaction
 from django.db.models import Count, F, Q, Sum
 from django.utils import timezone
 
-from account.models import OrganizationRelation
 from account.services.auth_service import get_active_identity
 from account.services.role_delegation_service import identity_has_role
 from supply_chain.models import (
@@ -16,6 +15,7 @@ from supply_chain.models import (
     MaterialWarehouseDocument, MaterialWarrantyCase,
 )
 from supply_chain.services.supplier_responsibility_service import get_responsible_material_ids
+from supply_chain.services.supply_scope import active_supplier_ids
 
 
 class MaterialInventoryError(ValueError):
@@ -203,12 +203,9 @@ def inventory_warranty_list(*, user, query="", cursor=None):
 
 
 def _supply_options(factory_id):
-    suppliers = OrganizationRelation.objects.filter(
-        source_organization_id=factory_id, relation_type="SUPPLY", is_active=True,
-        target_organization__organization_type__code="SUPPLIER",
-        target_organization__organization_type__is_active=True, target_organization__is_active=True,
-    ).values_list("target_organization_id", flat=True)
-    return MaterialSpecSupplier.objects.filter(supplier_id__in=suppliers).select_related("supplier", "material_spec__material")
+    return MaterialSpecSupplier.objects.filter(
+        supplier_id__in=active_supplier_ids(factory_id),
+    ).select_related("supplier", "material_spec__material")
 
 
 def inventory_form(*, user, kind, stock_id=None, lot_id=None, case_id=None):

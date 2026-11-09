@@ -1,8 +1,13 @@
 from contextlib import ExitStack
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
+import uuid
+from django.core.files.storage import FileSystemStorage
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 from django.utils import timezone
-from account.models import OrganizationRelation
+from account.models import OrganizationRelation, UserOrganization
+from account.services.auth_service import issue_access_token
 from lifecycle.models import AfterSalesMedia,ReplacementFlow,ReplacementLeg,ReplacementInventoryEntry,OrganizationDevice,ActivationRecord,AfterSalesEvent
 from lifecycle.services import factory_transport_service as F
 from lifecycle.services import replacement_flow_service as B
@@ -17,13 +22,60 @@ class FactoryTransportTests(TestCase):
     setUpTestData=classmethod(fixture.ReplacementV6Tests.setUpTestData.__func__)
     def setUp(self):
         self.stack=ExitStack();self.addCleanup(self.stack.close)
+        media_root=self.stack.enter_context(TemporaryDirectory())
+        self.stack.enter_context(patch.object(AfterSalesMedia._meta.get_field('file'),
+            'storage',FileSystemStorage(location=media_root)))
         self.notices={}
         for name in ['_publish_task','_publish_factory_workorder','_publish_assignee_workorder','_publish_applicant_workorder','_publish_applicant_notice','_publish_factory_aftersales_notice','_complete_tasks','_complete_assignee_workorder','_complete_factory_workorder','_complete_applicant_workorder','_send_factory_close_task','_publish_supplier_quality_notices']:
             self.notices[name]=self.stack.enter_context(patch.object(S,name))
         self.stack.enter_context(patch('lifecycle.services.replacement_flow_service.enforce_device_operation',return_value={'allowed':True}))
     def refresh(self):self.case.refresh_from_db();return F.get(self.case)
     def call(self,action,user=None,**data):return api(application_id=self.case.pk,user=user or self.af,data={'action':action,**data})
-    def proof(self,user):return AfterSalesMedia.objects.create(application=self.case,purpose='REPAIR_RETURN_SHIPMENT_DOCUMENT',media_type='IMAGE',file='waybill.jpg',uploaded_by=user)
+    def proof(self,user,direction=None,index=None,*,foreign_uploader=False):
+        """Upload a real current-scope file before testing the business action.
+
+        Invalid send actors/early legs must fail in send, rather than making
+        their upload fail first and accidentally satisfying assertRaises.
+        Such calls use a legal sender/current leg, or a previously uploaded
+        real file when no new sending leg is ready.
+        """
+        t=self.refresh()
+        ready=[]
+        for candidate_direction in ['inbound','outbound']:
+            if candidate_direction=='outbound' and not t.get('attribution'):continue
+            for candidate_index,leg in enumerate(t[candidate_direction]):
+                if leg['status']!='PENDING' or (candidate_index and t[candidate_direction][candidate_index-1]['status']!='RECEIVED'):continue
+                if leg['from']==self.case.customer_organization_id:sender=self.case.applicant
+                elif leg['from']==self.factory.pk:sender=self.logistics
+                elif F.actor(self.case,user,leg['from']):sender=user
+                else:
+                    sender=next((identity.user for identity in UserOrganization.objects.filter(
+                        organization_id=leg['from'],is_active=True,user__is_active=True,
+                        role__is_active=True).select_related('user') if F.actor(self.case,identity.user,leg['from'])),None)
+                if sender:ready.append((candidate_direction,candidate_index,sender))
+        selected=next((row for row in ready if row[:2]==(direction,index)),None) or next(iter(ready),None)
+        if selected is None:
+            existing=next((row for row in self.case.media.filter(
+                purpose='REPAIR_RETURN_SHIPMENT_DOCUMENT',evidence_scope_key__isnull=False)
+                if row.file and row.file.storage.exists(row.file.name)),None)
+            self.assertIsNotNone(existing,'negative send requires an already uploaded real proof')
+            return existing
+        selected_direction,selected_index,sender=selected
+        response=self.client.post(f'/pldp/api/lifecycle/after-sales/applications/{self.case.pk}/media/',{
+            'purpose':'REPAIR_RETURN_SHIPMENT_DOCUMENT','media_type':'IMAGE',
+            'file':SimpleUploadedFile('waybill.jpg',b'\xff\xd8\xff\xe0transport-test',content_type='image/jpeg'),
+            'evidence_action':'FACTORY_TRANSPORT_SEND','transport_id':t['transport_id'],
+            'direction':selected_direction,'index':selected_index,'evidence_kind':'LOGISTICS',
+            'client_upload_id':str(uuid.uuid4()),
+        },HTTP_AUTHORIZATION='Bearer '+issue_access_token(sender))
+        self.assertEqual(response.status_code,201,response.json())
+        result=AfterSalesMedia.objects.get(pk=response.json()['data']['id'])
+        if foreign_uploader:
+            # Negative authorship fault only: the file/scope were created by
+            # the real API, then its uploader is made foreign to the sender.
+            # This row is never used for a successful business transition.
+            result.uploaded_by=user;result.save(update_fields=['uploaded_by'])
+        return result
     def begin(self,kind='REPAIR',route='DIRECT',source=None):
         self.case.dispatch_route='FACTORY_AFTERSALES';self.case.assigned_user=self.af;self.case.assigned_organization=self.factory
         self.case.escalation.update(decision='FACTORY_REPAIR' if kind=='REPAIR' else 'REPLACEMENT',holder='APPLICANT' if source is None else 'EXECUTOR')
@@ -36,7 +88,7 @@ class FactoryTransportTests(TestCase):
         else:F.begin(self.case,self.af,kind,route)
         return self.refresh()
     def send(self,direction,index,user):
-        proof=self.proof(user)
+        proof=self.proof(user,direction,index)
         return self.call('FACTORY_TRANSPORT_SEND',user,direction=direction,index=index,document_ids=[proof.pk],logistics_company='顺丰',tracking_no='SF-'+direction+str(index))
     def receive(self,direction,index,user):return self.call('FACTORY_TRANSPORT_RECEIVE',user,direction=direction,index=index,confirmed=True)
     def pickup(self):self.send('inbound',0,self.customer_owner);self.receive('inbound',0,self.logistics)
@@ -108,7 +160,7 @@ class FactoryTransportTests(TestCase):
         for method in [S.repair_receipt,S.return_shipment,S.factory_close]:
             with self.assertRaises(AfterSalesError):method(application_id=self.case.pk,user=self.af,data={})
     def test_invalid_and_foreign_proofs_or_duplicate_receipt_roll_back(self):
-        self.begin();proof=self.proof(self.af)
+        self.begin();proof=self.proof(self.af,foreign_uploader=True)
         with self.assertRaises(AfterSalesError):self.call('FACTORY_TRANSPORT_SEND',self.customer_owner,direction='inbound',index=0,document_ids=[proof.pk],logistics_company='顺丰',tracking_no='S1')
         self.assertEqual(self.refresh()['inbound'][0]['status'],'PENDING')
         self.pickup()

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 import hashlib
+import json
 from datetime import datetime, time, timedelta
 from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
@@ -33,8 +34,9 @@ from uuid import uuid4
 
 from PIL import Image, UnidentifiedImageError
 
-from django.db import transaction
-from django.db.models import F, Max, Prefetch, Q, Sum
+from django.core.serializers.json import DjangoJSONEncoder
+from django.db import OperationalError, connection, transaction
+from django.db.models import Exists, F, Max, OuterRef, Prefetch, Q, Sum
 from django.utils import timezone
 
 from account.models import UserOrganization
@@ -43,9 +45,11 @@ from account.services.role_delegation_service import (
     SENIOR_MANAGER_ROLE_CODES,
     delegated_role_user_ids,
     effective_role_codes,
+    has_open_action_task_copy,
     identity_can_perform_shared_operation,
     identity_has_role,
     shared_operation_recipient_role_codes,
+    vacant_role_manager_openids,
 )
 from channel.models import MerchantChannelAssignment
 from lifecycle.models import (
@@ -127,6 +131,7 @@ from supply_chain.services.supplier_responsibility_service import (
     get_supplier_task_recipients,
     get_v2_supplier_delivery_snapshot_access,
 )
+from supply_chain.services.supply_scope import active_supplier_ids, supplier_can_supply
 from workflow.models import UserTask, WorkItem
 from workflow.services.workflow_service import publish_workitem
 
@@ -246,6 +251,15 @@ def _role_openids(organization, role_codes: Iterable[str]):
         .values_list("user__wx_openid", flat=True)
         .distinct()
     )
+
+
+def _action_role_openids(organization, role_codes):
+    """Keep staffed role recipients and route vacant shared roles to managers."""
+    recipients = (
+        _role_openids(organization, role_codes)
+        + vacant_role_manager_openids(organization, role_codes)
+    )
+    return list(dict.fromkeys(openid.strip() for openid in recipients if openid.strip()))
 
 
 def _factory_identity(user, role_codes, *, message):
@@ -835,14 +849,12 @@ def _serialize_bom_option(bom, *, default=False, source=""):
     }
 
 
-def _material_queryset(item, bom):
+def _material_queryset(item, bom, *, factory_id):
     bom_material_ids = bom.items.values_list("material_id", flat=True)
     supplier_queryset = MaterialSpecSupplier.objects.select_related(
         "supplier", "supplier__organization_type"
     ).filter(
-        supplier__is_active=True,
-        supplier__organization_type__is_active=True,
-        supplier__organization_type__code="SUPPLIER",
+        supplier_id__in=active_supplier_ids(factory_id),
     ).order_by("supplier__name", "supplier_id")
     spec_queryset = MaterialSpec.objects.prefetch_related(
         Prefetch("suppliers", queryset=supplier_queryset)
@@ -854,15 +866,17 @@ def _material_queryset(item, bom):
     ).order_by("code", "id")
 
 
-def _serialize_materials(item, bom):
+def _serialize_materials(item, bom, *, factory_id):
+    supplier_ids = set(active_supplier_ids(factory_id))
     bom_items = {
         row.material_id: row for row in bom.items.select_related(
             "material", "material_spec", "supplier"
         )
     }
     rows = []
-    for material in _material_queryset(item, bom):
+    for material in _material_queryset(item, bom, factory_id=factory_id):
         bom_item = bom_items.get(material.pk)
+        supplier = bom_item.supplier if bom_item and bom_item.supplier_id in supplier_ids else None
         rows.append({
             "id": material.pk,
             "code": material.code,
@@ -871,8 +885,8 @@ def _serialize_materials(item, bom):
             "deleted": bom_item is None,
             "selected_spec_id": bom_item.material_spec_id if bom_item else None,
             "selected_spec_name": bom_item.material_spec.name if bom_item and bom_item.material_spec else "",
-            "selected_supplier_id": bom_item.supplier_id if bom_item else None,
-            "selected_supplier_name": bom_item.supplier.name if bom_item and bom_item.supplier else "",
+            "selected_supplier_id": supplier.pk if supplier else None,
+            "selected_supplier_name": supplier.name if supplier else "",
             "quantity": bom_item.quantity if bom_item else 1,
             "remark": bom_item.remark if bom_item else "",
             "specs": [{
@@ -889,7 +903,11 @@ def _serialize_materials(item, bom):
 def _normalize_material_override(item, source_bom, raw_materials):
     if not isinstance(raw_materials, list):
         raise OrderPlanMaterialFlowError(f"{item.product_model.name}的物料数据格式无效。")
-    materials = {material.pk: material for material in _material_queryset(item, source_bom)}
+    factory_id = item.plan.factory_organization_id
+    materials = {
+        material.pk: material
+        for material in _material_queryset(item, source_bom, factory_id=factory_id)
+    }
     submitted = {}
     for raw in raw_materials:
         if not isinstance(raw, dict):
@@ -917,10 +935,9 @@ def _normalize_material_override(item, source_bom, raw_materials):
                 raise OrderPlanMaterialFlowError(f"{material.name}的物料规格不匹配。")
             if not MaterialSpecSupplier.objects.filter(
                 material_spec_id=spec_id, supplier_id=supplier_id,
-                supplier__is_active=True, supplier__organization_type__code="SUPPLIER",
-                supplier__organization_type__is_active=True,
+                supplier_id__in=active_supplier_ids(factory_id),
             ).exists():
-                raise OrderPlanMaterialFlowError(f"{material.name}所选供应商没有有效供应关系。")
+                raise OrderPlanMaterialFlowError(f"{material.name}所选供应商在当前厂家链路内没有有效供应关系。")
         normalized.append({
             "material_id": material_id,
             "material_spec_id": spec_id,
@@ -981,7 +998,7 @@ def get_material_flow_options(user, *, merchant_id=None):
     except Exception as exc:
         raise OrderPlanMaterialFlowError(str(exc)) from exc
 
-    # A selected merchant changes only the *suggested* BOM.  The public list
+    # A selected merchant changes only the *suggested* BOM.  The factory's list
     # of active BOMs stays the same, and creation still validates the selected
     # ID again inside the transaction.  Keeping this as a suggestion prevents
     # a stale mini-program page from silently changing a sales decision.
@@ -1007,7 +1024,11 @@ def get_material_flow_options(user, *, merchant_id=None):
         if model.get("id")
     ]
     boms_by_model = defaultdict(list)
+    unavailable_supplier_lines = BOMItem.objects.filter(
+        bom_id=OuterRef("pk"), supplier_id__isnull=False,
+    ).exclude(supplier_id__in=active_supplier_ids(identity.organization_id))
     for bom in BOM.objects.filter(
+        ~Exists(unavailable_supplier_lines),
         product_model_id__in=model_ids,
         is_active=True,
     ).order_by("product_model_id", "version_no", "id"):
@@ -1070,7 +1091,7 @@ def get_material_flow_bom_detail(
     submitted changes become a new frozen BOM version for this order.
     """
 
-    _sales_identity(user)
+    identity = _sales_identity(user)
     category_id = _positive_integer(category_id, "产品品类")
     product_model_id = _positive_integer(product_model_id, "产品型号")
     source_bom_id = _positive_integer(source_bom_id, "BOM版本")
@@ -1099,7 +1120,7 @@ def get_material_flow_bom_detail(
             "name": product_model.name,
         },
         "bom": _serialize_bom_option(bom),
-        "materials": _serialize_materials(draft_item, bom),
+        "materials": _serialize_materials(draft_item, bom, factory_id=identity.organization_id),
     }
 
 
@@ -1178,7 +1199,7 @@ def _bom_snapshot(bom):
     }
 
 
-def _validate_bom_supply_lines(bom, product_name):
+def _validate_bom_supply_lines(bom, product_name, *, factory_id):
     lines = list(
         bom.items.select_related("material", "material_spec", "supplier").order_by("id")
     )
@@ -1196,13 +1217,11 @@ def _validate_bom_supply_lines(bom, product_name):
         supplied = MaterialSpecSupplier.objects.filter(
             material_spec_id=line.material_spec_id,
             supplier_id=line.supplier_id,
-            supplier__is_active=True,
-            supplier__organization_type__code="SUPPLIER",
-            supplier__organization_type__is_active=True,
+            supplier_id__in=active_supplier_ids(factory_id),
         ).exists()
         if not supplied:
             raise OrderPlanMaterialFlowError(
-                f"{product_name}的BOM物料“{line.material.name}”没有有效供应关系。"
+                f"{product_name}的BOM物料“{line.material.name}”在当前厂家链路内没有有效供应关系。"
             )
         _milli_per_device(line.quantity, material_name=line.material.name)
     return lines
@@ -1232,8 +1251,8 @@ def _normalize_optional_material_override(order_item, source_bom, raw_materials,
         raise OrderPlanMaterialFlowError(str(exc)) from exc
 
 
-def _candidate_first_subplan_quantity(production_rows):
-    """Choose an optional small-tail-stock production slice.
+def _candidate_first_subplan_decision(production_rows):
+    """Choose a tail slice together with the exact lots that justify it.
 
     A product model is normally one production plan, irrespective of its
     quantity.  Splitting is an exception used only to clear a remaining lot
@@ -1276,7 +1295,7 @@ def _candidate_first_subplan_quantity(production_rows):
         available = lot.on_hand_milli - lot.reserved_milli
         if available > 0:
             lots_by_key[(lot.stock.supplier_id, lot.stock.material_spec_id)].append(
-                (available, lot.pk)
+                (available, lot.pk, lot.stock_id, lot.stock.revision)
             )
 
     # Only the tail-clearing child is constrained to 5--50.  The remaining
@@ -1305,19 +1324,29 @@ def _candidate_first_subplan_quantity(production_rows):
         # completely present.  Any short material means this split would only
         # create a second task without enabling earlier production.
         if not first_required or any(
-            not any(available >= required for available, _lot_id in lots_by_key[key])
+            not any(lot[0] >= required for lot in lots_by_key[key])
             for key, required in first_required.items()
         ):
             continue
 
         cleared_lot_sizes = []
+        selected_materials = {}
+        cleared_lot_ids = []
         for key, required in first_required.items():
-            selected_available, _selected_lot_id = min(
+            selected_available, selected_lot_id, stock_id, stock_revision = min(
                 (lot for lot in lots_by_key[key] if lot[0] >= required),
                 key=lambda lot: (lot[0], lot[1]),
             )
+            selected_materials[key] = {
+                "lot_id": selected_lot_id,
+                "stock_id": stock_id,
+                "stock_revision": stock_revision,
+                "available_milli": selected_available,
+                "required_milli": required,
+            }
             if selected_available == required:
                 cleared_lot_sizes.append(selected_available)
+                cleared_lot_ids.append(selected_lot_id)
         # Do not create a second production operation unless this first child
         # clears at least one complete small-tail lot.  A partial use of every
         # lot is not a meaningful inventory-consolidation split.
@@ -1332,7 +1361,11 @@ def _candidate_first_subplan_quantity(production_rows):
             -candidate,
         )
         if best is None or score > best[0]:
-            best = (score, candidate)
+            best = (score, {
+                "quantity": candidate,
+                "materials": selected_materials,
+                "cleared_lot_ids": tuple(cleared_lot_ids),
+            })
     if best:
         return best[1]
     return None
@@ -1405,9 +1438,11 @@ def _subplan_slice_totals_are_valid(slice_totals):
 
 def _create_subplans_and_requirements(material_plan, production_rows, user):
     result = []
+    reservation_result = {"requirements": 0, "reserved_milli": 0}
     next_sequence_no = 1
     for model_rows in _production_rows_by_product_model(production_rows):
-        first_total = _candidate_first_subplan_quantity(model_rows)
+        decision = _candidate_first_subplan_decision(model_rows)
+        first_total = decision["quantity"] if decision else None
         slices = _split_item_quantities(model_rows, first_total)
         slice_totals = [sum(row["quantity"] for row in slice_rows) for slice_rows in slices]
         product_name = model_rows[0]["order_item"].product_model.name
@@ -1416,7 +1451,7 @@ def _create_subplans_and_requirements(material_plan, production_rows, user):
                 f"产品型号“{product_name}”生产子计划数量无效；"
                 "常规生产为一个计划，消解尾货时仅允许拆为5至50台的尾货计划加一个主计划。"
             )
-        for slice_rows in slices:
+        for slice_index, slice_rows in enumerate(slices):
             subplan = OrderPlanProductionSubplan.objects.create(
                 material_plan=material_plan,
                 sequence_no=next_sequence_no,
@@ -1457,7 +1492,18 @@ def _create_subplans_and_requirements(material_plan, production_rows, user):
                         quantity_milli_per_device=per_device,
                         required_milli=per_device * slice_row["quantity"],
                     )
-    return result
+            # Reserve each model before deciding the next one. Shared BOM
+            # materials must see these real reservations, not an earlier stock
+            # snapshot from when all models were selected together.
+            if decision and slice_index == 0:
+                amounts = _reserve_tail_subplan(subplan=subplan, decision=decision, actor=user)
+            else:
+                amounts = _reserve_open_requirements(
+                    material_plan=material_plan, actor=user, subplan=subplan,
+                )
+            for key in reservation_result:
+                reservation_result[key] += amounts[key]
+    return result, reservation_result
 
 
 def _allocation_available(allocation):
@@ -1473,6 +1519,7 @@ def _reserve_requirement(
     actor,
     receipt_lot_id=None,
     receipt_requirement_deltas=None,
+    selected_lot_id=None,
 ):
     """Reserve one complete material lot for one subplan requirement.
 
@@ -1484,7 +1531,7 @@ def _reserve_requirement(
     remaining = requirement.required_milli - requirement.reserved_milli
     if remaining <= 0:
         return 0
-    lot_rows = list(
+    lot_rows = (
         FactoryMaterialLot.objects.select_for_update()
         .select_related("stock")
         .filter(
@@ -1495,6 +1542,11 @@ def _reserve_requirement(
         )
         .order_by("on_hand_milli", "received_at", "id")
     )
+    if selected_lot_id is not None:
+        # Only a deliberately selected tail child supplies this constraint.
+        # Ordinary requirements keep their existing lot selection policy.
+        lot_rows = lot_rows.filter(pk=selected_lot_id)
+    lot_rows = list(lot_rows)
     # Choose the smallest complete lot, which preserves the original inventory
     # reduction preference without breaking one-lot traceability.
     for lot in lot_rows:
@@ -1534,7 +1586,52 @@ def _reserve_requirement(
     return 0
 
 
-def _reserve_open_requirements(*, material_plan, actor, stock=None, receipt_lot=None):
+def _reserve_tail_subplan(*, subplan, decision, actor):
+    """Strictly realize a tail decision, or abort the whole order creation."""
+
+    selected = decision["materials"]
+    stocks = {choice["stock_id"]: choice["stock_revision"] for choice in selected.values()}
+    for stock_id, revision in sorted(stocks.items()):
+        # The warehouse uses this same real write fence on SQLite. A stale
+        # decision cannot silently turn into a different selection on retry.
+        changed = FactoryMaterialStock.objects.filter(pk=stock_id, revision=revision).update(
+            revision=F("revision") + 1,
+        )
+        if changed != 1:
+            raise OrderPlanMaterialFlowError("物料库存正在更新，请刷新后重试。")
+    requirements = OrderPlanMaterialRequirement.objects.select_related(
+        "production_subplan_item__production_subplan__material_plan__order_plan",
+        "material", "material_spec", "supplier",
+    ).filter(production_subplan_item__production_subplan=subplan).order_by("id")
+    totals = {"requirements": 0, "reserved_milli": 0}
+    required_by_key = defaultdict(int)
+    for requirement in requirements:
+        key = (requirement.supplier_id, requirement.material_spec_id)
+        choice = selected.get(key)
+        if choice is None:
+            raise OrderPlanMaterialFlowError("尾货物料计划已变化，请刷新后重试。")
+        amount = _reserve_requirement(
+            requirement, actor=actor, selected_lot_id=choice["lot_id"],
+        )
+        if requirement.reserved_milli != requirement.required_milli:
+            raise OrderPlanMaterialFlowError("选定尾货批次已不足齐套，请刷新后重试。")
+        required_by_key[key] += requirement.required_milli
+        if amount:
+            totals["requirements"] += 1
+            totals["reserved_milli"] += amount
+    if dict(required_by_key) != {key: choice["required_milli"] for key, choice in selected.items()}:
+        raise OrderPlanMaterialFlowError("尾货物料计划已变化，请刷新后重试。")
+    if not FactoryMaterialLot.objects.filter(
+        pk__in=decision["cleared_lot_ids"], on_hand_milli=F("reserved_milli"),
+    ).exists():
+        # Cancellations can increase availability after candidate selection.
+        # Even sufficient stock is not a tail split unless a chosen tail is
+        # actually cleared by the first child. Never keep an extra empty split.
+        raise OrderPlanMaterialFlowError("选定尾货批次未能完整清尾，请刷新后重试。")
+    return totals
+
+
+def _reserve_open_requirements(*, material_plan, actor, stock=None, receipt_lot=None, subplan=None):
     requirements = OrderPlanMaterialRequirement.objects.select_for_update().select_related(
         "production_subplan_item__production_subplan__material_plan__order_plan",
         "material",
@@ -1549,6 +1646,8 @@ def _reserve_open_requirements(*, material_plan, actor, stock=None, receipt_lot=
             supplier_id=stock.supplier_id,
             material_spec_id=stock.material_spec_id,
         )
+    if subplan is not None:
+        requirements = requirements.filter(production_subplan_item__production_subplan=subplan)
     receipt_lot_id = getattr(receipt_lot, "pk", None) if receipt_lot is not None else None
     receipt_requirement_deltas = defaultdict(int)
     totals = {
@@ -1697,8 +1796,69 @@ def _creation_result(plan):
     return {"plan": data, "pending_replacement_demands": pending_for_plan(plan)}
 
 
-@transaction.atomic
+def _legacy_creation_content_matches(plan, items, accessories, remark):
+    """Compare the submitted fields still recoverable for pre-fingerprint orders."""
+    if not isinstance(items, list) or not isinstance(accessories, list):
+        return False
+    if any(not isinstance(row, dict) for row in items + accessories):
+        return False
+    original_items = list(plan.items.order_by("pk").values_list(
+        "category_id", "product_model_id", "quantity", "sales_bom_selection__source_bom_id",
+    ))
+    original_accessories = list(plan.accessory_items.order_by("pk").values_list(
+        "category_id", "product_model_id", "material_spec_id", "quantity_milli",
+    ))
+    try:
+        requested_items = [
+            tuple(_positive_integer(row.get(field), field) for field in (
+                "category_id", "product_model_id", "quantity", "source_bom_id",
+            ))
+            for row in items
+        ]
+        requested_accessories = [
+            (
+                _positive_integer(row.get("category_id"), "配件品类"),
+                _positive_integer(row.get("product_model_id"), "适配型号"),
+                _positive_integer(row.get("material_spec_id"), "配件规格"),
+                _positive_quantity_milli(row.get("quantity"), "配件数量"),
+            )
+            for row in accessories
+        ]
+    except OrderPlanMaterialFlowError:
+        return False
+    # Older rows can predate the sales selection snapshot. Only compare the
+    # source BOM where the original selection is actually known.
+    if len(requested_items) != len(original_items):
+        return False
+    return (
+        all(
+            incoming[:3] == original[:3] and (original[3] is None or incoming[3] == original[3])
+            for incoming, original in zip(requested_items, original_items)
+        )
+        and requested_accessories == original_accessories
+        and remark == plan.remark
+    )
+
+
 def create_material_flow_order_plan(
+    *, user, merchant_id, client_request_id, items, accessories=None, remark=""
+):
+    # A second SQLite writer can conflict at the initial order insert, before
+    # any lot is selected. Translate only that retryable conflict after the
+    # atomic operation has rolled back; other database failures stay visible.
+    try:
+        return _create_material_flow_order_plan(
+            user=user, merchant_id=merchant_id, client_request_id=client_request_id,
+            items=items, accessories=accessories, remark=remark,
+        )
+    except OperationalError as exc:
+        if connection.vendor != "sqlite" or "locked" not in str(exc).lower():
+            raise
+        raise OrderPlanMaterialFlowError("物料库存正在更新，请使用同一表单刷新后重试。") from exc
+
+
+@transaction.atomic
+def _create_material_flow_order_plan(
     *, user, merchant_id, client_request_id, items, accessories=None, remark=""
 ):
     """Sales creates a V2 plan and immediately reserves finished goods/lots."""
@@ -1711,6 +1871,15 @@ def create_material_flow_order_plan(
     client_request_id = str(client_request_id or "").strip()
     if not client_request_id or len(client_request_id) > 64:
         raise OrderPlanMaterialFlowError("客户端请求标识无效，请刷新页面后重试。")
+    remark = str(remark or "").strip()[:2000]
+    accessories = [] if accessories in (None, "") else accessories
+    request_content = json.dumps(
+        {"items": items, "accessories": accessories, "remark": remark},
+        cls=DjangoJSONEncoder,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    request_fingerprint = hashlib.sha256(request_content.encode("utf-8")).hexdigest()
     existing = _plan_queryset().filter(
         created_by=user,
         client_request_id=client_request_id,
@@ -1718,6 +1887,22 @@ def create_material_flow_order_plan(
     if existing:
         if existing.flow_version != OrderPlan.FlowVersion.MATERIAL_STOCK_V2:
             raise OrderPlanMaterialFlowError("该提交标识已用于旧订单，请刷新页面后重新创建。")
+        if existing.merchant_organization_id != relation.target_organization_id:
+            raise OrderPlanMaterialFlowError("该提交标识已用于其他商家的订单，请重新创建订单计划。")
+        snapshot = (
+            OrderPlanSalesBOMSelection.objects.filter(order_plan_item__plan=existing)
+            .order_by("order_plan_item_id")
+            .values_list("selection_snapshot", flat=True)
+            .first()
+        ) or {}
+        original_fingerprint = snapshot.get("creation_request_fingerprint")
+        matches = (
+            original_fingerprint == request_fingerprint
+            if original_fingerprint
+            else _legacy_creation_content_matches(existing, items, accessories, remark)
+        )
+        if not matches:
+            raise OrderPlanMaterialFlowError("上一次提交已生成订单，当前内容与原订单不同，请先核对原订单。")
         initialize_order_finance(existing, user=user)
         return _creation_result(existing), False
 
@@ -1746,7 +1931,7 @@ def create_material_flow_order_plan(
         created_by=user,
         creator_role_code=identity.role.code,
         total_quantity=sum(entry["quantity"] for entry in entries),
-        remark=str(remark or "").strip()[:2000],
+        remark=remark,
         status=OrderPlan.Status.MATCHING_PENDING,
         flow_version=OrderPlan.FlowVersion.MATERIAL_STOCK_V2,
     )
@@ -1806,17 +1991,23 @@ def create_material_flow_order_plan(
         # because a historical BOM has no supplier/spec mapping that would
         # only be required for new production.
         bom_lines = (
-            _validate_bom_supply_lines(frozen_bom, order_item.product_model.name)
+            _validate_bom_supply_lines(
+                frozen_bom, order_item.product_model.name,
+                factory_id=plan.factory_organization_id,
+            )
             if order_item.production_quantity
             else []
         )
+        selection_snapshot = _bom_snapshot(frozen_bom)
+        if entry["index"] == 1:
+            selection_snapshot["creation_request_fingerprint"] = request_fingerprint
         selection = OrderPlanSalesBOMSelection.objects.create(
             order_plan_item=order_item,
             source_bom=entry["source_bom"],
             frozen_bom=frozen_bom,
             selected_by=user,
             has_changes=has_changes,
-            selection_snapshot=_bom_snapshot(frozen_bom),
+            selection_snapshot=selection_snapshot,
         )
         # Compatibility fact only: old code/data statistics can continue to
         # resolve an item's final BOM, but the V2 actor remains the sales
@@ -1852,8 +2043,7 @@ def create_material_flow_order_plan(
         ),
     )
     if production_rows:
-        _create_subplans_and_requirements(material_plan, production_rows, user)
-        reservation_result = _reserve_open_requirements(material_plan=material_plan, actor=user)
+        _subplans, reservation_result = _create_subplans_and_requirements(material_plan, production_rows, user)
         requirements = list(
             OrderPlanMaterialRequirement.objects.filter(
                 production_subplan_item__production_subplan__material_plan=material_plan
@@ -1887,7 +2077,7 @@ def create_material_flow_order_plan(
             },
             created_by=user,
         )
-        keeper_openids = _role_openids(plan.factory_organization, {"factory_material_stock"})
+        keeper_openids = _action_role_openids(plan.factory_organization, {"factory_material_stock"})
         if not keeper_openids:
             raise OrderPlanMaterialFlowError("厂家尚未配置有效物料库管，不能提交需要新生产的订单。")
         _new_workitem(
@@ -2132,7 +2322,7 @@ def _publish_shipment_authorization_task(*, plan, shipment, actor_openid):
 
 
 def _publish_shipment_qrcode_task(*, plan, shipment, actor_openid):
-    recipients = _role_openids(plan.factory_organization, {"factory_stock"})
+    recipients = _action_role_openids(plan.factory_organization, {"factory_stock"})
     if not recipients:
         raise OrderPlanMaterialFlowError("厂家尚未配置有效成品库管，不能下达打码任务。")
     payload = _shipment_payload(shipment)
@@ -2161,7 +2351,7 @@ def _publish_shipment_logistics_task(*, plan, shipment, actor_openid):
     complete order plan.
     """
 
-    recipients = _role_openids(plan.factory_organization, {"factory_logistics"})
+    recipients = _action_role_openids(plan.factory_organization, {"factory_logistics"})
     if not recipients:
         raise OrderPlanMaterialFlowError("厂家尚未配置有效物流经理，不能填写本批物流信息。")
     payload = _shipment_payload(shipment)
@@ -2193,7 +2383,7 @@ def _publish_shipment_outbound_task(*, plan, shipment, actor_openid):
         uniq_key=f"sales:order-plan:{plan.pk}:shipment:{shipment.pk}:stock-outbound",
         status="CANCELLED",
     ).update(status="OPEN", done_at=None, done_by_openid="", updated_at=timezone.now())
-    recipients = _role_openids(plan.factory_organization, {"factory_stock"})
+    recipients = _action_role_openids(plan.factory_organization, {"factory_stock"})
     if not recipients:
         raise OrderPlanMaterialFlowError("厂家尚未配置有效成品库管，不能下达发货任务。")
     payload = _shipment_payload(shipment)
@@ -2215,7 +2405,7 @@ def _publish_shipment_outbound_task(*, plan, shipment, actor_openid):
 
 
 def _publish_shipment_merchant_receipt_task(*, plan, shipment, actor_openid):
-    recipients = _role_openids(
+    recipients = _action_role_openids(
         plan.merchant_organization,
         shared_operation_recipient_role_codes(
             plan.merchant_organization_id, "goods_transfer_receipt"
@@ -2541,6 +2731,10 @@ def warehouse_review_material_plan(*, user, plan_id):
     review_workitem = WorkItem.objects.select_for_update().filter(
         uniq_key=f"sales:order-plan:{plan.pk}:material-review"
     ).first()
+    if identity.role.code in SENIOR_MANAGER_ROLE_CODES and (
+        not review_workitem or review_workitem.status != "OPEN"
+    ):
+        raise OrderPlanMaterialFlowError("未找到本订单的物料核对待办任务。")
     if review_workitem and review_workitem.status == "OPEN":
         _complete_workitem_anyone(
             review_workitem,
@@ -2561,7 +2755,7 @@ def warehouse_review_material_plan(*, user, plan_id):
         if dispatch_result["errors"]:
             dispatch_summary = (
                 f"已即时推送{dispatch_result['dispatched']}个供应商；"
-                f"{len(dispatch_result['errors'])}个供应商因账号配置未完成而保留待推送。"
+                f"{len(dispatch_result['errors'])}个供应商暂未满足推送条件，保留待推送。"
             )
         else:
             dispatch_summary = f"已即时推送至{dispatch_result['dispatched']}个供应商。"
@@ -2714,6 +2908,14 @@ def dispatch_due_supply_deliveries(*, now=None, force=False, delivery_ids=None):
                 delivery.save(update_fields=("status", "cancelled_at", "updated_at"))
                 result["skipped"] += 1
                 continue
+            if not supplier_can_supply(plan.factory_organization_id, delivery.supplier_id):
+                result["skipped"] += 1
+                result["errors"].append({
+                    "delivery_id": delivery.pk,
+                    "supplier_id": delivery.supplier_id,
+                    "reason": "该供应商在订单所属厂家链路内没有有效供货关系，配送任务未推送。",
+                })
+                continue
             payload = _delivery_payload(delivery)
             recipients = get_supplier_task_recipients(
                 supplier=delivery.supplier,
@@ -2802,6 +3004,8 @@ def confirm_supplier_material_delivery(
         supplier_id = identity.organization_id
     if supplier_id != identity.organization_id:
         raise OrderPlanMaterialFlowError("只能确认本供应商的配送任务。")
+    if not supplier_can_supply(plan.factory_organization_id, supplier_id):
+        raise OrderPlanMaterialFlowError("该配送任务不属于本供应商有权参与的厂家链路。")
     deliveries = OrderPlanSupplyDelivery.objects.select_for_update().select_related(
         "material_plan", "supplier"
     ).filter(
@@ -2953,6 +3157,7 @@ def get_order_delivery_receipt_form(*, user, plan_id):
     return {
         "plan_id": plan.pk,
         "plan_code": plan.plan_code,
+        "root_organization": {"id": plan.factory_organization_id, "name": plan.factory_organization.name},
         "merchant_name": plan.merchant_organization.name,
         "items": [
             {
@@ -2995,6 +3200,10 @@ def receive_all_order_delivery_materials(*, user, plan_id):
     if not rows:
         raise OrderPlanMaterialFlowError("当前订单没有供应商已配送、待入库的物料。")
 
+    supplier_ids = set(active_supplier_ids(plan.factory_organization_id))
+    if any(delivery.supplier_id not in supplier_ids for delivery, _, _ in rows):
+        raise OrderPlanMaterialFlowError("有配送供应商在订单所属厂家链路内没有有效供货关系。")
+
     received = []
     now = timezone.now()
     for delivery, line, quantity in rows:
@@ -3035,16 +3244,13 @@ def receive_all_order_delivery_materials(*, user, plan_id):
             lot=lot,
             created_by=user,
         )
-        # The receipt document is physical proof for this exact delivery line.
-        # Reservation refresh is allowed to allocate stock across orders, but it
-        # must not be the only mechanism that advances this line's receipt
-        # progress; otherwise a successful receipt can still display "已入 0".
+        # This receipt belongs to the selected delivery line. Shared stock
+        # can still be reserved across orders without giving another delivery
+        # receipt credit for the same lot.
         if line.received_milli != line.confirmed_milli:
             line.received_milli = line.confirmed_milli
             line.save(update_fields=("received_milli", "updated_at"))
-        refreshed = refresh_material_reservations_for_stock(
-            stock=stock, actor=user, receipt_lot=lot
-        )
+        refreshed = refresh_material_reservations_for_stock(stock=stock, actor=user)
         line.refresh_from_db(fields=("received_milli",))
         received.append({
             "delivery_id": delivery.pk,
@@ -3134,11 +3340,10 @@ def refresh_material_reservations_for_stock(*, stock, actor, receipt_lot=None):
     as ready.  The material warehouse keeper sees the new live balance in the
     normal order detail and explicitly decides when all materials are ready.
 
-    ``receipt_lot`` is optional for compatibility with a maintenance caller,
-    but the normal material-inventory receipt always supplies the newly
-    created lot.  Only allocations from that lot are added to
-    ``received_milli`` on a delivery line; an older allocation must not be
-    retroactively treated as a new supplier receipt.
+    The independent material-inventory receipt supplies ``receipt_lot`` to
+    attribute only allocations from the newly created lot to delivery lines.
+    Dedicated order receipts already credit their selected line before this
+    hook and call it without ``receipt_lot`` for reservation only.
     """
 
     if receipt_lot is not None:
@@ -3269,7 +3474,7 @@ def _consume_subplan_materials(subplan, user):
 
 
 def _publish_production_task(plan, subplan, *, actor_openid):
-    recipients = _role_openids(plan.factory_organization, {"factory_production"})
+    recipients = _action_role_openids(plan.factory_organization, {"factory_production"})
     if not recipients:
         raise OrderPlanMaterialFlowError("厂家尚未配置有效生产经理，不能下达生产任务。")
     return _new_workitem(
@@ -3956,10 +4161,14 @@ def _mark_selected_return_allocations_reissued(*, shipment_device_rows, now):
         )
 
 
+def _shipment_task_key(plan_id, shipment_id, stage_key):
+    return f"sales:order-plan:{plan_id}:shipment:{shipment_id}:{stage_key}"
+
+
 def _shipment_workitem(*, plan, shipment, work_type, stage_key):
     workitem = WorkItem.objects.select_for_update().filter(
         type=work_type,
-        uniq_key=f"sales:order-plan:{plan.pk}:shipment:{shipment.pk}:{stage_key}",
+        uniq_key=_shipment_task_key(plan.pk, shipment.pk, stage_key),
         status="OPEN",
     ).first()
     if not workitem:
@@ -4144,6 +4353,14 @@ def prepare_material_flow_shipment_qrcodes(*, user, plan_id, shipment_id):
         raise OrderPlanMaterialFlowError("本批二维码已确认打印贴包，不能再次生成打印清单。")
     if shipment.status != OrderPlanShipment.Status.AUTHORIZED:
         raise OrderPlanMaterialFlowError("厂家销售经理尚未授权本批发货，不能生成二维码清单。")
+    if identity.role.code in SENIOR_MANAGER_ROLE_CODES and not _has_open_shipment_task(
+        plan=plan,
+        shipment=shipment,
+        identity=identity,
+        work_type="ORDER_PLAN_V2_QRCODE_PRINT",
+        stage_key="qrcode-print",
+    ):
+        raise OrderPlanMaterialFlowError("当前账号不是本批打码任务的处理人。")
     rows = _map_shipment_devices(plan=plan, shipment=shipment, actor=user)
     return {
         "shipment_id": shipment.pk,
@@ -4262,7 +4479,7 @@ def get_material_flow_logistics_document_file(*, user, plan_id, document_id):
         raise OrderPlanMaterialFlowError("物流凭证不存在或不属于本订单。")
     if not document.shipment_batches.filter(order_plan=plan).exists() and not (
         identity.organization_id == plan.factory_organization_id
-        and identity.role.code == "factory_logistics"
+        and identity_has_role(identity, "factory_logistics")
         and document.uploaded_by_id == user.pk
     ):
         raise OrderPlanMaterialFlowError("该物流凭证尚未关联发货批次。")
@@ -4331,7 +4548,7 @@ def confirm_material_flow_shipments_logistics(
         ):
             raise OrderPlanMaterialFlowError("当前账号不是选中批次物流任务的处理人。")
         pending.append((shipment, workitem))
-    if pending and not _role_openids(plan.factory_organization, {"factory_stock"}):
+    if pending and not _action_role_openids(plan.factory_organization, {"factory_stock"}):
         raise OrderPlanMaterialFlowError("厂家尚未配置有效成品库管，不能下达发货任务。")
     # Outbound is now a physical handover in its own right. Apply the existing
     # recall/quality gate before recording it, then check again on final ship
@@ -4691,7 +4908,7 @@ def confirm_material_flow_shipment_outbound(*, user, plan_id, shipment_id):
 
 
 def _publish_accounting_task(*, plan, actor_openid):
-    recipients = _role_openids(plan.factory_organization, {"factory_sales_assistant"})
+    recipients = _action_role_openids(plan.factory_organization, {"factory_sales_assistant"})
     if not recipients:
         raise OrderPlanMaterialFlowError("厂家尚未配置有效销售助理，不能下达入账任务。")
     return _new_workitem(
@@ -5433,6 +5650,8 @@ def _can_view_plan(identity, plan, *, supplier_sales_scope=None):
             return plan.created_by_id in sales_user_ids
         return True
     if identity.organization.organization_type.code == "SUPPLIER" and roles & {"supplier_owner", "supplier_sales"}:
+        if not supplier_can_supply(plan.factory_organization_id, org_id):
+            return False
         deliveries = OrderPlanSupplyDelivery.objects.filter(
             material_plan__order_plan=plan,
             supplier_id=org_id,
@@ -5863,7 +6082,7 @@ def _has_open_shipment_task(*, plan, shipment, identity, work_type, stage_key):
     return UserTask.objects.filter(
         workitem__type=work_type,
         workitem__status="OPEN",
-        workitem__uniq_key=f"sales:order-plan:{plan.pk}:shipment:{shipment.pk}:{stage_key}",
+        workitem__uniq_key=_shipment_task_key(plan.pk, shipment.pk, stage_key),
         to_openid=openid,
         need_action=True,
     ).exclude(state="DONE").exists()
@@ -6302,7 +6521,10 @@ def _available_actions(plan, material_plan, identity):
     )
     actions = []
     if "factory_material_stock" in roles and identity.organization_id == plan.factory_organization_id:
-        if material_plan.status == OrderPlanMaterialPlan.Status.WAITING_WAREHOUSE_REVIEW:
+        if (
+            material_plan.status == OrderPlanMaterialPlan.Status.WAITING_WAREHOUSE_REVIEW
+            and has_open_action_task_copy(identity, [f"sales:order-plan:{plan.pk}:material-review"])
+        ):
             actions.append({
                 "code": "warehouse-review", "label": "核对物料与配送计划",
                 "confirm_title": "确认核对物料", "confirm_text": "将按当前库存预占并排入供应配送推送队列。",
@@ -6469,11 +6691,13 @@ def get_material_flow_detail(*, user, plan_id):
         identity=identity,
         available_actions=timeline_actions,
     )
-    from lifecycle.services.replacement_flow_service import pending_for_plan
-    # Kept outside sales shipment quantity, pricing, finance and receivable calculations.
-    replacement_demands = pending_for_plan(plan) if identity.organization_id in {plan.factory_organization_id,plan.merchant_organization_id} else []
+    from sales.services.replacement_supply_service import order_supply_items
+
+    replacement_supply_items = order_supply_items(plan, identity, shipments)
     return {
-        "pending_replacement_demands": replacement_demands,
+        # Retain the old field for clients updating after the backend rollout.
+        "pending_replacement_demands": [row for row in replacement_supply_items if row['status'] == 'PENDING'],
+        "replacement_supply_items": replacement_supply_items,
         "plan": _serialize_plan_detail(plan, material_plan),
         "viewer": {
             "role": identity.role.code,

@@ -21,6 +21,7 @@ from quality_trace.models import (
     QualityTraceEvent,
 )
 from sales.models import OrderPlanItemMaterialBatch
+from sales.services.supplier_batch_trace_service import consumed_material_lots, with_supplier_batch_id
 from supply_chain.models import Material, MaterialSpec, SupplierMaterialBatch
 from account.models import Organization
 
@@ -43,6 +44,31 @@ def _usage_queryset(factory_id):
         "supplier_material_batch__material",
         "supplier_material_batch__material_spec",
     )
+
+
+MATERIAL_SCOPE_FIELDS = {
+    "SUPPLIER_BATCH": ("supplier_material_batch_id", "supplier_batch_id"),
+    "SUPPLIER": ("supplier_material_batch__supplier_id", "requirement__supplier_id"),
+    "MATERIAL": ("supplier_material_batch__material_id", "requirement__material_id"),
+    "MATERIAL_SPEC": ("supplier_material_batch__material_spec_id", "requirement__material_spec_id"),
+}
+V2_BATCH = "requirement__production_subplan_item__production_batch"
+
+
+def _used_target_ids(factory_id, usages, target_type):
+    legacy_field, v2_field = MATERIAL_SCOPE_FIELDS[target_type]
+    lots = consumed_material_lots(factory_id)
+    if target_type == "SUPPLIER_BATCH":
+        lots = with_supplier_batch_id(lots)
+    return models.Q(pk__in=usages.values(legacy_field)) | models.Q(pk__in=lots.values(v2_field))
+
+
+def _devices_from_material_use(factory_id, usages, lots):
+    legacy_codes = usages.order_by().values("order_plan_item__order_batch_code")
+    production_batches = lots.values(V2_BATCH + "_id")
+    return Device.objects.filter(batch__manufacturer_id=factory_id).filter(
+        models.Q(batch__batch_no__in=legacy_codes) | models.Q(batch_id__in=production_batches)
+    ).select_related("batch", "product_model")
 
 
 def _target_rows(version):
@@ -78,8 +104,7 @@ def _target_rows(version):
         }]
 
     if target_type == "SUPPLIER_BATCH":
-        ids = usages.values_list("supplier_material_batch_id", flat=True).distinct()
-        queryset = SupplierMaterialBatch.objects.filter(pk__in=ids)
+        queryset = SupplierMaterialBatch.objects.filter(_used_target_ids(factory_id, usages, target_type))
         if target_ids:
             queryset = queryset.filter(pk__in=target_ids)
         return [{
@@ -114,17 +139,14 @@ def _target_rows(version):
     definitions = {
         "SUPPLIER": (
             Organization,
-            usages.values_list("supplier_material_batch__supplier_id", flat=True).distinct(),
             lambda row: {"supplier_id": row.pk, "name": row.name, "code": row.code},
         ),
         "MATERIAL": (
             Material,
-            usages.values_list("supplier_material_batch__material_id", flat=True).distinct(),
             lambda row: {"material_id": row.pk, "name": row.name, "code": row.code},
         ),
         "MATERIAL_SPEC": (
             MaterialSpec,
-            usages.values_list("supplier_material_batch__material_spec_id", flat=True).distinct(),
             lambda row: {
                 "material_spec_id": row.pk,
                 "material_id": row.material_id,
@@ -135,8 +157,8 @@ def _target_rows(version):
     }
     if target_type not in definitions:
         raise QualityMetricError("规则目标类型不受支持。")
-    model, ids, serializer = definitions[target_type]
-    queryset = model.objects.filter(pk__in=ids)
+    model, serializer = definitions[target_type]
+    queryset = model.objects.filter(_used_target_ids(factory_id, usages, target_type))
     if target_ids:
         queryset = queryset.filter(pk__in=target_ids)
     if target_type == "MATERIAL_SPEC":
@@ -153,21 +175,22 @@ def _material_context_devices(factory_id, snapshot):
     usages = _usage_queryset(factory_id).filter(
         supplier_material_batch__material_id=snapshot["material_id"],
     )
-    filters = {
-        "order_plan_item__product_model__category_id": snapshot.get("product_category_id"),
-        "order_plan_item__product_model_id": snapshot.get("product_model_id"),
-        "supplier_material_batch__material_spec_id": snapshot.get("material_spec_id"),
-        "supplier_material_batch__supplier_id": snapshot.get("supplier_id"),
-        "supplier_material_batch_id": snapshot.get("supplier_batch_id"),
-    }
-    for field, value in filters.items():
+    lots = consumed_material_lots(factory_id).filter(requirement__material_id=snapshot["material_id"])
+    filters = (
+        ("product_category_id", "order_plan_item__product_model__category_id", V2_BATCH + "__product_model__category_id"),
+        ("product_model_id", "order_plan_item__product_model_id", V2_BATCH + "__product_model_id"),
+        ("material_spec_id", "supplier_material_batch__material_spec_id", "requirement__material_spec_id"),
+        ("supplier_id", "supplier_material_batch__supplier_id", "requirement__supplier_id"),
+        ("supplier_batch_id", "supplier_material_batch_id", "supplier_batch_id"),
+    )
+    if snapshot.get("supplier_batch_id"):
+        lots = with_supplier_batch_id(lots)
+    for key, legacy_field, v2_field in filters:
+        value = snapshot.get(key)
         if value:
-            usages = usages.filter(**{field: value})
-    batch_codes = usages.values_list("order_plan_item__order_batch_code", flat=True).distinct()
-    return Device.objects.filter(
-        batch__manufacturer_id=factory_id,
-        batch__batch_no__in=batch_codes,
-    ).select_related("batch", "product_model")
+            usages = usages.filter(**{legacy_field: value})
+            lots = lots.filter(**{v2_field: value})
+    return _devices_from_material_use(factory_id, usages, lots)
 
 
 def _candidate_devices(factory_id, target, *, excluded_contexts=None):
@@ -185,21 +208,12 @@ def _candidate_devices(factory_id, target, *, excluded_contexts=None):
             product_model_id=target_id,
         ).select_related("batch", "product_model")
 
-    usages = _usage_queryset(factory_id)
-    filters = {
-        "SUPPLIER_BATCH": "supplier_material_batch_id",
-        "SUPPLIER": "supplier_material_batch__supplier_id",
-        "MATERIAL": "supplier_material_batch__material_id",
-        "MATERIAL_SPEC": "supplier_material_batch__material_spec_id",
-    }
-    usages = usages.filter(**{filters[target_type]: target_id})
-    batch_codes = usages.values_list(
-        "order_plan_item__order_batch_code", flat=True,
-    ).distinct()
-    return Device.objects.filter(
-        batch__manufacturer_id=factory_id,
-        batch__batch_no__in=batch_codes,
-    ).select_related("batch", "product_model")
+    legacy_field, v2_field = MATERIAL_SCOPE_FIELDS[target_type]
+    usages = _usage_queryset(factory_id).filter(**{legacy_field: target_id})
+    lots = consumed_material_lots(factory_id)
+    if target_type == "SUPPLIER_BATCH":
+        lots = with_supplier_batch_id(lots)
+    return _devices_from_material_use(factory_id, usages, lots.filter(**{v2_field: target_id}))
 
 
 def _material_matches(target, rows):

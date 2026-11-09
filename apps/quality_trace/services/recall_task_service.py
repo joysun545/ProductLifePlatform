@@ -802,6 +802,8 @@ def get_recall_task_scope(*, user, campaign_id):
         "task_type": "QUALITY_RECALL_OBSERVER_NOTICE" if viewer.observer(campaign) else "QUALITY_RECALL_SCOPE",
         "title": title, "summary": context["scope_summary"] + "。" + context["stage_summary"],
         "campaign": {"id": campaign.pk, "recall_no": campaign.recall_no,
+                     "root_organization": {"id": campaign.factory_organization_id,
+                                           "name": campaign.factory_organization.name},
                      **campaign_text(campaign, viewer), "deadline": campaign.deadline.isoformat(),
                      "status": campaign.status},
         "scope": scope,

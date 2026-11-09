@@ -245,6 +245,22 @@ select{
 }
 
 
+.material-category-options {
+    display: flex;
+    flex: 1;
+    flex-wrap: wrap;
+    gap: 8px 16px;
+    max-height: 9em;
+    overflow-y: auto;
+}
+
+.material-category-options label {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+
+
 
 textarea{
 
@@ -717,11 +733,19 @@ button:hover{
 </style>
 
 
-</head>
+<style>
+html{height:100%;scroll-padding-top:0}body.pldp-web-page{margin:0!important;padding:0!important;height:100dvh!important;overflow:hidden!important;background:#f5f7f2!important;color:#152e2a;font-family:'Segoe UI','Microsoft YaHei',sans-serif}
+.pldp-site-header,.pldp-site-header *{box-sizing:border-box}.pldp-site-header{position:relative!important;z-index:100!important;height:72px!important;min-height:72px;display:flex!important;align-items:center;justify-content:space-between;padding:0 5%!important;margin:0!important;width:100%;max-width:none!important;background:#f5f7f2!important;color:#152e2a!important;border-bottom:1px solid #dfe7e2;box-shadow:none!important;border-radius:0!important}
+.pldp-brand{display:flex;align-items:center;gap:13px;text-decoration:none!important;color:#152e2a!important}.pldp-brand>b{background:#006d57;color:white;border-radius:12px;padding:7px 13px;font-size:23px;line-height:1.7}.pldp-brand span{font-size:21px;font-weight:700;line-height:1.3}.pldp-brand small{display:block;font-size:10px;font-weight:400;letter-spacing:2px;margin-top:4px}.pldp-site-header nav{display:flex;align-items:center;gap:30px;font:13px/1.7 'Segoe UI','Microsoft YaHei',sans-serif}.pldp-site-header nav a{color:#152e2a;text-decoration:none}.pldp-site-header .pldp-entry,.pldp-site-header button{width:auto!important;margin:0!important;background:#e7eddf!important;color:#006d57!important;border:1px solid #c4d9c9!important;border-radius:20px!important;padding:6px 13px!important;font:12px/1.7 inherit;cursor:pointer}
+.pldp-page-frame{box-sizing:border-box;height:calc(100dvh - 72px);display:flex;flex-direction:column;min-height:0;padding:20px clamp(18px,3vw,56px) 24px;gap:16px}.pldp-page-heading{flex:none;margin:0!important;padding:0!important;font-size:24px!important;line-height:1.4!important;letter-spacing:0!important;color:#152e2a!important}.pldp-page-content{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding:24px;background:white;border:1px solid #dfe7e2;border-radius:14px}
+.pldp-page-content>main,.pldp-page-content>.container,.pldp-page-content>.wrap{width:100%!important;max-width:none!important;margin:0!important;padding:0!important}.pldp-page-content>main.card{box-shadow:none;border:0;background:transparent}.pldp-page-content .pldp-old-heading{display:none!important}.pldp-page-content>header{height:auto;position:static;background:transparent;color:inherit;margin:0 0 18px;padding:0;border:0}.pldp-page-content .header{box-shadow:none;border-radius:0;padding:0 0 16px}.pldp-page-content table{max-width:100%}.pldp-page-content .grid{margin-top:16px}
+@media(max-width:700px){.pldp-site-header{padding-inline:16px!important}.pldp-site-header nav{gap:10px}.pldp-site-header nav>a:not(.pldp-entry){display:none}.pldp-brand small{font-size:8px;letter-spacing:0}.pldp-page-frame{padding:16px 12px;gap:12px}.pldp-page-content{padding:16px}.pldp-page-heading{font-size:20px!important}}
+@media print{body.pldp-web-page{height:auto!important;overflow:visible!important;background:#fff!important}.pldp-site-header,.pldp-page-heading{display:none!important}.pldp-page-frame,.pldp-page-content{display:block!important;height:auto!important;overflow:visible!important;margin:0!important;padding:0!important;border:0!important;box-shadow:none!important}.pldp-page-content>.container>:not(#result-panel){display:none!important}}
+</style></head>
 
 
 
-<body>
+<body class="pldp-web-page"><header class="pldp-site-header"><a class="pldp-brand" href="/"><b>PL</b><span>PLDP<small>产品生命周期数字平台</small></span></a><nav><a href="/#explore">工作域演示</a><a href="/#principles">协同逻辑</a><a class="pldp-entry" href="/pldp/web/portal/">进入工作台</a><button type="button" id="pldp-shell-logout">退出登录</button></nav></header><div class="pldp-page-frame"><h1 class="pldp-page-heading">物料基础资料管理中心</h1><div class="pldp-page-content">
 
 
 {% csrf_token %}
@@ -731,7 +755,7 @@ button:hover{
 
 
 
-<div class="title">
+<div class="title pldp-old-heading">
 
 物料基础资料管理中心
 
@@ -854,7 +878,7 @@ class="panel active">
                     id="material_code_preview"
                     class="material-code-preview"
                 >
-                    请先选择所属产品分类
+                    请先选择编码归属品类
                 </div>
 
             </div>
@@ -883,7 +907,7 @@ class="panel active">
 
             <div class="label">
 
-            所属产品分类
+            编码归属品类
 
             </div>
 
@@ -895,7 +919,7 @@ class="panel active">
 
             <option value="">
 
-                请选择产品分类
+                请选择编码归属品类
 
             </option>
 
@@ -908,6 +932,14 @@ class="panel active">
 
 
 
+
+        <div class="form-item">
+            <div class="label">其他适用品类</div>
+            <div id="material_applicable_categories"
+                 class="material-category-options"
+                 role="group"
+                 aria-label="其他适用品类，可多选"></div>
+        </div>
 
         <div class="form-item">
 
@@ -2389,7 +2421,7 @@ function updateMaterialCodePreview(){
     if(!categoryCode){
 
         previewNode.textContent =
-        "请先选择所属产品分类";
+        "请先选择编码归属品类";
 
         return;
 
@@ -2446,6 +2478,11 @@ function addMaterial(){
         document.getElementById(
             "material_category"
         ).value,
+
+        product_category_ids: Array.from(
+            document.querySelectorAll("#material_applicable_categories input:checked"),
+            input => input.value
+        ),
 
 
         is_key_part:
@@ -2560,6 +2597,10 @@ function resetMaterial(){
         "material_key"
     ).checked=false;
 
+
+    document.querySelectorAll("#material_applicable_categories input:checked").forEach(input => {
+        input.checked = false;
+    });
 
     updateMaterialCodePreview();
 
@@ -3882,36 +3923,8 @@ function deleteSupplierRelation(id){
 
 
 function resetMaterialForm(){
-
-
-    document.getElementById(
-        "material_code"
-    ).value="";
-
-
-    document.getElementById(
-        "material_name"
-    ).value="";
-
-
-    document.getElementById(
-        "material_category"
-    ).value="";
-
-
-    document.getElementById(
-        "material_description"
-    ).value="";
-
-
-    document.getElementById(
-        "material_key"
-    ).checked=false;
-
-
-    updateMaterialCodePreview();
-
-
+    document.getElementById("material_category").value = "";
+    resetMaterial();
 }
 
 
@@ -4280,6 +4293,9 @@ function loadProductCategories(){
             );
 
 
+            const applicableCategories = document.getElementById("material_applicable_categories");
+            applicableCategories.replaceChildren();
+
             let filterSelect =
             document.getElementById(
                 "material_filter_category"
@@ -4304,7 +4320,7 @@ function loadProductCategories(){
                 addSelect.innerHTML =
                 `
                 <option value="">
-                    请选择产品分类
+                    请选择编码归属品类
                 </option>
                 `;
 
@@ -4353,7 +4369,13 @@ function loadProductCategories(){
 
             data.forEach(
                 item => {
-
+                    const label = document.createElement("label");
+                    const checkbox = document.createElement("input");
+                    checkbox.type = "checkbox";
+                    checkbox.className = "checkbox";
+                    checkbox.value = item.id;
+                    label.append(checkbox, document.createTextNode(item.name));
+                    applicableCategories.appendChild(label);
 
                     if(addSelect){
 
@@ -4670,7 +4692,7 @@ function searchMaterialList(){
 </script>
 
 
-</body>
+</div></div><script>(function(){var b=document.getElementById('pldp-shell-logout');if(b)b.onclick=async function(){var c=document.cookie.split('; ').find(function(x){return x.startsWith('csrftoken=')});var t=c?decodeURIComponent(c.slice(10)):'';if(!t){var i=document.querySelector('[name=csrfmiddlewaretoken]');t=i?i.value:''}try{var r=await fetch('/pldp/web/portal/api/logout/',{method:'POST',credentials:'same-origin',headers:{'X-CSRFToken':t}});if(!r.ok)throw Error();location.assign('/')}catch(e){alert('退出失败，请刷新页面后重试。')}}})();</script></body>
 
 
 </html>

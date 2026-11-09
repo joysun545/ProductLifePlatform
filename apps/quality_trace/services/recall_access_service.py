@@ -131,8 +131,9 @@ class RecallViewer:
         if "factory_sales" in self.roles:
             groups = (row.responsibility_snapshot or {}).get("groups", [])
             merchant_ids = {str(value) for value in self.sales_merchant_ids}
-            return any(group.get("organization_type") == "MERCHANT"
-                       and str(group.get("organization_id")) in merchant_ids for group in groups)
+            if any(group.get("organization_type") == "MERCHANT"
+                   and str(group.get("organization_id")) in merchant_ids for group in groups):
+                return True
         disposition = getattr(row, "post_disposition", None)
         if not disposition:
             return False

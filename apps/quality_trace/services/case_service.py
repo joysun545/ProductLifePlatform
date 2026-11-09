@@ -556,6 +556,11 @@ def start_recall(*, user, case_id, reason):
 @transaction.atomic
 def complete_recall(*, user, action_id, reason):
     identity = _identity(user, RECALL_MANAGER_ROLES)
+    return _complete_recall_for_actor(identity=identity, user=user, action_id=action_id, reason=reason)
+
+
+def _complete_recall_for_actor(*, identity, user, action_id, reason):
+    """Complete the control record inside an authorized recall closeout transaction."""
     action = (
         QualityControlAction.objects.select_for_update()
         .select_related("quality_case__source_alert")
@@ -663,6 +668,10 @@ def serialize_control_action(row):
 def serialize_case(row, *, include_devices=False):
     data = {
         "id": row.pk,
+        "root_organization": {
+            "id": row.factory_organization_id,
+            "name": row.factory_organization.name,
+        },
         "case_no": row.case_no,
         "source_alert_id": row.source_alert_id,
         "scope_type": row.scope_type,

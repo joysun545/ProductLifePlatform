@@ -606,6 +606,14 @@ class ScanOwnershipAndInstallationTests(TestCase):
         self.assertEqual(transfer.initiated_by_id, manager.pk)
 
     def test_stock_senior_manager_can_confirm_receipt_without_task_and_replaces_owner(self):
+        self._exercise_stock_senior_manager_receipt(staffed=True)
+
+    def test_vacant_stock_role_creates_actionable_receipt_for_senior_manager(self):
+        self._exercise_stock_senior_manager_receipt(staffed=False)
+
+    def _exercise_stock_senior_manager_receipt(self, *, staffed):
+        if staffed:
+            self._user_identity("independent_receipt_stock", self.direct_merchant, self.merchant_stock_role)
         manager = self._user_identity(
             "merchant_receipt_senior_manager",
             self.direct_merchant,
@@ -645,11 +653,12 @@ class ScanOwnershipAndInstallationTests(TestCase):
             type="GOODS_TRANSFER_RECEIPT_CONFIRM",
             uniq_key=f"lifecycle:goods-transfer:{transfer.pk}:receipt",
         )
-        self.assertFalse(
+        self.assertEqual(
             receipt_workitem.user_tasks.filter(
                 to_openid=manager.wx_openid,
                 need_action=True,
-            ).exists()
+            ).exists(),
+            not staffed,
         )
 
         with self.assertRaises(GoodsTransferError):
@@ -1576,6 +1585,12 @@ class ScanOwnershipAndInstallationTests(TestCase):
         self.assertEqual(supported.json()["data"]["status"], "NOT_CONFIGURED")
 
     def test_after_sales_application_submit_snapshots_and_publishes_tasks(self):
+        self._exercise_after_sales_factory_workorder(staffed=True)
+
+    def test_vacant_aftersales_role_routes_submission_to_granted_manager(self):
+        self._exercise_after_sales_factory_workorder(staffed=False)
+
+    def _exercise_after_sales_factory_workorder(self, *, staffed):
         token = self._install_and_token()
         accepted = self.client.post(
             f"/pldp/api/lifecycle/scan/customer-invitations/{token}/accept/",
@@ -1583,6 +1598,13 @@ class ScanOwnershipAndInstallationTests(TestCase):
             **self.auth(self.customer_user),
         )
         self.assertEqual(accepted.status_code, 201)
+        self._mark_required_documents_read(self.customer_user)
+        activated = self.client.post(
+            f"/pldp/api/lifecycle/customer/devices/{self.device.id}/activate/",
+            {"activation_method": "VEHICLE_PLATE", "vehicle_no": "渝A12345"},
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(activated.status_code, 200, activated.json())
 
         factory_sales_role, _ = OrganizationRole.objects.update_or_create(
             organization_type=self.factory.organization_type,
@@ -1630,7 +1652,10 @@ class ScanOwnershipAndInstallationTests(TestCase):
             organization=self.factory,
             role=factory_aftersales_role,
             inviter=factory_senior_manager,
+            is_active=staffed,
         )
+
+        factory_actor = factory_aftersales if staffed else factory_senior_manager
 
         context = self.client.get(
             f"/pldp/api/lifecycle/customer/devices/{self.device.id}/after-sales/context/",
@@ -1683,6 +1708,18 @@ class ScanOwnershipAndInstallationTests(TestCase):
                 **self.auth(self.customer_user),
             )
             self.assertEqual(video_upload.status_code, 201, video_upload.json())
+            plate_upload = self.client.post(
+                f"/pldp/api/lifecycle/after-sales/applications/{application_id}/media/",
+                {
+                    "media_type": "IMAGE",
+                    "purpose": "PLATE_PRESENCE_EVIDENCE",
+                    "file": SimpleUploadedFile(
+                        "plate.jpg", b"\xff\xd8\xff\xe0test-plate", content_type="image/jpeg"
+                    ),
+                },
+                **self.auth(self.customer_user),
+            )
+            self.assertEqual(plate_upload.status_code, 201, plate_upload.json())
             submitted = self.client.post(
                 f"/pldp/api/lifecycle/after-sales/applications/{application_id}/submit/",
                 {},
@@ -1692,11 +1729,11 @@ class ScanOwnershipAndInstallationTests(TestCase):
             self.assertEqual(submitted.status_code, 200)
             detail = self.client.get(
                 f"/pldp/api/lifecycle/after-sales/applications/{application_id}/",
-                **self.auth(factory_aftersales),
+                **self.auth(factory_actor),
             )
             self.assertEqual(detail.status_code, 200)
             factory_detail = detail.json()["data"]
-            self.assertEqual(len(factory_detail["media"]), 2)
+            self.assertEqual(len(factory_detail["media"]), 3)
             self.assertEqual(factory_detail["viewer_stage"]["mode"], "ACTION_REQUIRED")
             self.assertEqual(
                 factory_detail["viewer_stage"]["badge"],
@@ -1760,12 +1797,13 @@ class ScanOwnershipAndInstallationTests(TestCase):
         self.assertTrue(
             WorkItem.objects.filter(type="AFTERSALES_FACTORY_WORKORDER", biz_id=str(application_id)).exists()
         )
-        self.assertTrue(
+        self.assertEqual(
             UserTask.objects.filter(
                 workitem__type="AFTERSALES_FACTORY_WORKORDER",
                 to_openid=factory_aftersales.wx_openid,
                 need_action=True,
-            ).exists()
+            ).exists(),
+            staffed,
         )
         self.assertFalse(
             UserTask.objects.filter(
@@ -1894,12 +1932,12 @@ class ScanOwnershipAndInstallationTests(TestCase):
                 "final_solution_note": "已远程指导完成复紧和启动测试，设备恢复正常。",
             },
             content_type="application/json",
-            **self.auth(factory_aftersales),
+            **self.auth(factory_actor),
         )
         self.assertEqual(remote.status_code, 200, remote.json())
         senior_task.refresh_from_db()
         self.assertEqual(senior_task.state, "DONE")
-        self.assertEqual(senior_task.done_reason, "OTHER_ACTION")
+        self.assertEqual(senior_task.done_reason, "OTHER_ACTION" if staffed else "SELF_ACTION")
         legacy_sales_task.refresh_from_db()
         self.assertEqual(legacy_sales_task.state, "DONE")
         self.assertEqual(legacy_sales_task.done_reason, "OTHER_ACTION")
@@ -2382,3 +2420,128 @@ class ScanOwnershipAndInstallationTests(TestCase):
             )
             self.assertEqual(advanced.status_code, 409)
             self.assertIn("厂家尚未配置", advanced.json()["msg"])
+
+    def test_unactivated_customer_device_cannot_create_aftersales_draft(self):
+        token = self._install_and_token()
+        auth = self.auth(self.customer_user)
+        accepted = self.client.post(
+            f"/pldp/api/lifecycle/scan/customer-invitations/{token}/accept/",
+            self._accept_payload(),
+            **auth,
+        )
+        self.assertEqual(accepted.status_code, 201, accepted.json())
+
+        device_url = f"/pldp/api/lifecycle/customer/devices/{self.device.id}/"
+        device = self.client.get(device_url, **auth)
+        self.assertEqual(device.status_code, 200, device.json())
+        self.assertFalse(device.json()["data"]["actions"]["can_apply_aftersale"])
+        draft = self.client.post(
+            f"{device_url}after-sales/applications/",
+            {"fault_description": "设备无法启动"},
+            content_type="application/json",
+            **auth,
+        )
+        self.assertEqual(draft.status_code, 409, draft.json())
+        self.assertIn("尚未激活", draft.json()["msg"])
+        self.assertFalse(AfterSalesApplication.objects.filter(device=self.device).exists())
+
+    def test_revoked_driver_cannot_upload_or_submit_aftersales_draft(self):
+        token = self._install_and_token()
+        accepted = self.client.post(
+            f"/pldp/api/lifecycle/scan/customer-invitations/{token}/accept/",
+            self._accept_payload(),
+            **self.auth(self.customer_user),
+        )
+        self.assertEqual(accepted.status_code, 201, accepted.json())
+        binding = CustomerDeviceBinding.objects.get(
+            device=self.device, status=CustomerDeviceBinding.Status.ACTIVE,
+        )
+        driver = self._user_identity(
+            "aftersales_draft_driver", binding.customer_organization, self.driver_role,
+        )
+        driver_binding = DriverVehicleBinding.objects.create(
+            vehicle=binding.vehicle, driver=driver,
+        )
+        factory_role, _ = OrganizationRole.objects.update_or_create(
+            organization_type=self.factory.organization_type,
+            code="factory_aftersales",
+            defaults={"name": "厂家售后经理", "is_active": True},
+        )
+        factory_aftersales = self._user_identity(
+            "aftersales_draft_factory", self.factory, factory_role,
+        )
+        self._mark_required_documents_read(driver)
+        auth = self.auth(driver)
+        device_url = f"/pldp/api/lifecycle/customer/devices/{self.device.id}/"
+        activated = self.client.post(
+            f"{device_url}activate/",
+            {"activation_method": "VEHICLE_PLATE", "vehicle_no": "渝A12345"},
+            **auth,
+        )
+        self.assertEqual(activated.status_code, 200, activated.json())
+        draft = self.client.post(
+            f"{device_url}after-sales/applications/",
+            {
+                "fault_description": "设备无法启动",
+                "location_name": "测试现场",
+                "location_address": "重庆市渝北区",
+                "location_latitude": "29.6000000",
+                "location_longitude": "106.5000000",
+                "location_confirmed": True,
+            },
+            content_type="application/json",
+            **auth,
+        )
+        self.assertEqual(draft.status_code, 201, draft.json())
+        application = AfterSalesApplication.objects.get(pk=draft.json()["data"]["id"])
+        url = f"/pldp/api/lifecycle/after-sales/applications/{application.pk}/"
+
+        def upload(purpose):
+            return self.client.post(
+                f"{url}media/",
+                {
+                    "media_type": "IMAGE",
+                    "purpose": purpose,
+                    "file": SimpleUploadedFile(
+                        "evidence.jpg", b"\xff\xd8\xff\xe0test-image", content_type="image/jpeg"
+                    ),
+                },
+                **auth,
+            )
+
+        with tempfile.TemporaryDirectory() as media_root, override_settings(
+            AFTERSALES_PRIVATE_ROOT=media_root,
+        ):
+            purposes = ("APPLICATION_EVIDENCE", "PLATE_PRESENCE_EVIDENCE")
+            for purpose in purposes:
+                uploaded = upload(purpose)
+                self.assertEqual(uploaded.status_code, 201, uploaded.json())
+            event_count = application.events.count()
+            driver_binding.is_active = False
+            driver_binding.save(update_fields=("is_active",))
+
+            for purpose in purposes:
+                blocked = upload(purpose)
+                self.assertEqual(blocked.status_code, 409, blocked.json())
+                self.assertIn("获授权车辆", blocked.json()["msg"])
+            blocked = self.client.post(
+                f"{url}submit/", {}, content_type="application/json", **auth,
+            )
+            self.assertEqual(blocked.status_code, 409, blocked.json())
+            self.assertIn("获授权车辆", blocked.json()["msg"])
+            application.refresh_from_db()
+            self.assertEqual(application.status, AfterSalesApplication.Status.DRAFT)
+            self.assertEqual(application.media.count(), 2)
+            self.assertEqual(application.events.count(), event_count)
+            self.assertFalse(WorkItem.objects.filter(
+                domain="AFTERSALE", biz_id=str(application.pk),
+            ).exists())
+
+            driver_binding.is_active = True
+            driver_binding.save(update_fields=("is_active",))
+            submitted = self.client.post(
+                f"{url}submit/", {}, content_type="application/json", **auth,
+            )
+            self.assertEqual(submitted.status_code, 200, submitted.json())
+            factory_detail = self.client.get(url, **self.auth(factory_aftersales))
+            self.assertEqual(factory_detail.status_code, 200, factory_detail.json())

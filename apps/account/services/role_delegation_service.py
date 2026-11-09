@@ -1,6 +1,8 @@
 """Scope-checked permissions for factory and merchant senior managers."""
 
-from account.models import SeniorManagerProfile
+from django.db.models.functions import Trim
+
+from account.models import SeniorManagerProfile, UserOrganization
 
 
 SENIOR_MANAGER_ROLE_CODES = frozenset({
@@ -64,7 +66,6 @@ def delegated_role_user_ids(identity, role_code):
 
     if not identity or role_code not in delegated_role_codes(identity):
         return frozenset()
-    from account.models import UserOrganization
 
     return frozenset(
         UserOrganization.objects.filter(
@@ -111,6 +112,45 @@ def identity_has_role(identity, role_codes):
     return bool(delegated_role_codes(identity) & role_codes)
 
 
+def vacant_role_manager_openids(organization, role_codes):
+    """Find authorized managers for unstaffed action roles in this organization."""
+
+    requested = {role_codes} if isinstance(role_codes, str) else set(role_codes or ())
+    if not organization or not requested:
+        return []
+
+    reachable_identities = UserOrganization.objects.filter(
+        organization_id=organization.pk,
+        organization__is_active=True,
+        organization__organization_type__is_active=True,
+        organization__factory_root__is_active=True,
+        role__organization_type_id=organization.organization_type_id,
+        role__is_active=True,
+        is_active=True,
+        user__is_active=True,
+        user__wx_openid__isnull=False,
+    ).exclude(user__wx_openid="").order_by()
+    staffed = {
+        role_code
+        for role_code, openid in reachable_identities.filter(
+            role__code__in=requested,
+        ).values_list("role__code", "user__wx_openid")
+        if openid.strip()
+    }
+    vacant = requested - staffed - SENIOR_MANAGER_ROLE_CODES
+    if not vacant:
+        return []
+
+    openids = reachable_identities.filter(
+        role__code__in=SENIOR_MANAGER_ROLE_CODES,
+        senior_manager_profile__managed_roles__code__in=vacant,
+        senior_manager_profile__managed_roles__is_active=True,
+        senior_manager_profile__managed_roles__is_owner_role=False,
+        senior_manager_profile__managed_roles__organization_type_id=organization.organization_type_id,
+    ).values_list("user__wx_openid", flat=True)
+    return sorted({openid.strip() for openid in openids if openid.strip()})
+
+
 def senior_manager_can_proactively_perform(identity, operation):
     """Whether this manager has an explicit proactive shared-operation grant.
 
@@ -146,13 +186,14 @@ def organization_has_operation_manager(organization_id, operation):
         identity__organization__organization_type__code="MERCHANT",
         identity__is_active=True,
         identity__user__is_active=True,
+        identity__user__wx_openid__isnull=False,
         identity__organization__is_active=True,
         identity__role__is_active=True,
         identity__role__code__in=SENIOR_MANAGER_ROLE_CODES,
         managed_roles__is_active=True,
         managed_roles__organization_type__code="MERCHANT",
         managed_roles__code__in=required_roles,
-    )
+    ).annotate(manager_openid=Trim("identity__user__wx_openid")).exclude(manager_openid="")
     if mode == "all":
         from django.db.models import Count, Q
 
@@ -172,9 +213,9 @@ def organization_has_operation_manager(organization_id, operation):
 def shared_operation_recipient_role_codes(organization_id, operation):
     """Return merchant roles that receive actionable operation copies.
 
-    A senior manager with the operation's delegated role acts proactively, so
-    the manager does not receive a duplicate ANYONE_DO task. The owner remains
-    in the task cohort until an active manager takes over that operation.
+    The owner remains in the role cohort until a reachable, authorized
+    manager takes over that operation. Publishers resolve managers for any
+    vacant roles in the resulting cohort.
     """
 
     rule = MERCHANT_OPERATION_ROLE_RULES.get(str(operation or ""))

@@ -8,6 +8,7 @@ from django.utils import timezone
 
 from account.services.auth_service import get_active_identity
 from account.services.role_delegation_service import (
+    SENIOR_MANAGER_ROLE_CODES,
     has_open_action_task_copy,
     identity_has_role,
 )
@@ -20,13 +21,14 @@ from workflow.services.workflow_service import publish_workitem
 
 from .recall_collaboration_service import (
     FACTORY_RECALL_COLLABORATION_ROLES, close_factory_recall_progress,
-    close_merchant_return_task, organization_recipients,
+    close_merchant_return_task, organization_action_recipients, organization_recipients,
 )
 from .recall_progress_service import calculate_recall_progress
+from .recall_evidence_service import confirmed_recall_evidence
 from .recall_service import QualityRecallError
 from .recall_task_service import complete_recall_scope_tasks_if_ready
 from .recall_transport_service import (
-    MERCHANT_ROLES, _current_custodian, _evidence, _snapshot, _upstream_target,
+    MERCHANT_ROLES, _current_custodian, _snapshot, _upstream_target,
     create_next_recall_transport_leg, dispatch_recall_transport_leg,
     isolate_recalled_device, publish_batch_posting_confirmation,
     receive_recall_transport_leg,
@@ -121,25 +123,48 @@ def _candidate(row, identity):
     }
 
 
-def _manager_has_candidate_task(identity, row, candidate):
-    if candidate["action"] == "RECEIVE":
-        keys = (f"quality-recall-transport:{candidate['leg_id']}:receive",)
-        return has_open_action_task_copy(identity, keys)
-    if candidate["action"] == "ISOLATE":
-        keys = (f"quality-recall-transport:{candidate['leg_id']}:inventory-posting",)
-        return has_open_action_task_copy(identity, keys)
-
+def _candidate_task_scope(identity, row, candidate):
+    action = candidate["action"]
+    leg_id = candidate["leg_id"]
     organization_id = identity.organization_id
+    workitem_ids = []
+    if identity.role.code in SENIOR_MANAGER_ROLE_CODES:
+        tasks = WorkItem.objects.filter(
+            type=TASK_TYPES[action],
+            biz_id=str(row.campaign_id),
+            status="OPEN",
+            payload__recipient_organization_id=organization_id,
+            user_tasks__to_openid=identity.user.wx_openid,
+            user_tasks__need_action=True,
+            user_tasks__state__in=("NEW", "READ"),
+        ).values_list("pk", "payload")
+        for workitem_id, payload in tasks:
+            # Receipt and posting bind to the exact transport leg. Return
+            # tasks bind to the device, as they initiate the next leg.
+            if not isinstance(payload, dict):
+                continue
+            device_ids = payload.get("recall_device_ids")
+            leg_ids = payload.get("leg_ids")
+            if not isinstance(device_ids, list) or row.pk not in device_ids:
+                continue
+            if action == "DISPATCH" or (isinstance(leg_ids, list) and leg_id in leg_ids):
+                workitem_ids.append(workitem_id)
+
+    if action == "RECEIVE":
+        return (f"quality-recall-transport:{leg_id}:receive",), workitem_ids
+    if action == "ISOLATE":
+        return (f"quality-recall-transport:{leg_id}:inventory-posting",), workitem_ids
+
     handover = getattr(row, "customer_handover", None)
     keys = [f"quality-recall:{row.campaign_id}:org:{organization_id}"]
     if handover and handover.merchant_organization_id == organization_id:
         keys.append(
             f"quality-recall-merchant-return:{row.pk}:org:{organization_id}"
         )
-    workitem_ids = (row.responsibility_snapshot or {}).get("workitem_ids", [])
-    return has_open_action_task_copy(
-        identity, keys, workitem_ids=workitem_ids,
-    )
+    snapshot = row.responsibility_snapshot
+    if isinstance(snapshot, dict) and isinstance(snapshot.get("workitem_ids"), list):
+        workitem_ids.extend(snapshot["workitem_ids"])
+    return keys, workitem_ids
 
 
 def get_recall_batch_groups(*, user, campaign, rows=None):
@@ -161,7 +186,8 @@ def get_recall_batch_groups(*, user, campaign, rows=None):
             continue
         if not candidate:
             continue
-        if not _manager_has_candidate_task(identity, row, candidate):
+        keys, workitem_ids = _candidate_task_scope(identity, row, candidate)
+        if not has_open_action_task_copy(identity, keys, workitem_ids=workitem_ids):
             continue
         group = groups.setdefault(candidate["key"], {
             **{key: value for key, value in candidate.items() if key != "leg_id"},
@@ -200,7 +226,7 @@ def _request_data(action, device_ids, evidence, provider, tracking, location, no
         raise QualityRecallError("凭证信息过长，请重新上传。")
     return {
         "action": action, "recall_device_ids": sorted(device_ids),
-        "evidence": _evidence(evidence, "本次批量操作"),
+        "evidence": dict(evidence),
         "logistics_provider": _text(provider, "物流承运方", 128, action == "DISPATCH"),
         "tracking_no": _text(tracking, "物流单号", 128, action == "DISPATCH"),
         "isolation_location": _text(location, "隔离库位", 255, action == "ISOLATE"),
@@ -250,7 +276,7 @@ def _close_processed_batch_tasks(operation, user):
 
 
 def _publish_action(operation, *, organization, roles, action, legs, user):
-    recipients = organization_recipients(organization, roles)
+    recipients = organization_action_recipients(organization, roles)
     if not recipients:
         raise QualityRecallError(f"{organization.name}没有可接收本阶段任务的有效岗位账号。")
     count = len(legs)
@@ -352,15 +378,20 @@ def execute_recall_batch(
     candidates = []
     for row in rows:
         candidate = _candidate(row, identity)
-        if (
-            not candidate
-            or candidate["action"] != action
-            or not _manager_has_candidate_task(identity, row, candidate)
-        ):
+        if not candidate or candidate["action"] != action:
             raise QualityRecallError(f"设备{row.sn_snapshot}当前不属于您的本阶段待办，请刷新清单。")
-        candidates.append(candidate)
+        keys, workitem_ids = _candidate_task_scope(identity, row, candidate)
+        if not has_open_action_task_copy(identity, keys, workitem_ids=workitem_ids):
+            raise QualityRecallError(f"设备{row.sn_snapshot}当前不属于您的本阶段待办，请刷新清单。")
+        candidates.append({**candidate, "action_workitem_ids": workitem_ids})
     if len({candidate["key"] for candidate in candidates}) != 1:
         raise QualityRecallError("请选择同一流转范围内的设备；不同到货批次请分别确认。")
+    # Keep the full upload response for the single-operation validation boundary.
+    # Only the canonical signed snapshot is persisted in the operation audit row.
+    submitted_evidence = request["evidence"]
+    request["evidence"] = confirmed_recall_evidence(
+        submitted=submitted_evidence, identity=identity, campaign=campaign,
+    )
     operation = QualityRecallBatchOperation.objects.create(
         campaign=campaign, organization=identity.organization, action=action,
         client_request_id=request_id, request_fingerprint=fingerprint,
@@ -370,17 +401,20 @@ def execute_recall_batch(
     )
     legs, receipt_ids = [], []
     for row, candidate in zip(rows, candidates):
+        workitem_ids = candidate["action_workitem_ids"]
         if action == "DISPATCH":
             if candidate["leg_id"]:
                 leg_id = candidate["leg_id"]
             else:
                 leg_id = create_next_recall_transport_leg(
                     user=user, recall_device_id=row.pk, notify=False,
+                    action_workitem_ids=workitem_ids,
                 ).pk
             leg = dispatch_recall_transport_leg(
-                user=user, leg_id=leg_id, evidence=request["evidence"],
+                user=user, leg_id=leg_id, evidence=submitted_evidence,
                 logistics_provider=request["logistics_provider"],
                 tracking_no=request["tracking_no"], notify=False,
+                action_workitem_ids=workitem_ids,
             )
             leg.relation_snapshot = {**leg.relation_snapshot, "dispatch_batch_operation_id": operation.pk}
             leg.save(update_fields=("relation_snapshot", "updated_at"))
@@ -389,15 +423,16 @@ def execute_recall_batch(
                 close_merchant_return_task(handover, identity.organization, user=user)
         elif action == "RECEIVE":
             leg = receive_recall_transport_leg(
-                user=user, leg_id=candidate["leg_id"], evidence=request["evidence"],
+                user=user, leg_id=candidate["leg_id"], evidence=submitted_evidence,
                 receipt_note=request["receipt_note"], notify=False,
+                action_workitem_ids=workitem_ids,
             )
         else:
             receipt = isolate_recalled_device(
-                user=user, leg_id=candidate["leg_id"], evidence=request["evidence"],
+                user=user, leg_id=candidate["leg_id"], evidence=submitted_evidence,
                 isolation_location=request["isolation_location"],
                 disposition=QualityRecallIsolationReceipt.Disposition.PENDING_INSPECTION,
-                notify=False,
+                notify=False, action_workitem_ids=workitem_ids,
             )
             receipt_ids.append(receipt.pk)
             leg = receipt.transport_leg

@@ -4,7 +4,8 @@ from uuid import uuid4
 
 from django.test import TestCase
 from django.utils import timezone
-from account.models import Organization, OrganizationRelation, OrganizationRole, OrganizationType, User, UserOrganization
+from account.models import (Organization, OrganizationRelation, OrganizationRole, OrganizationType,
+                            SeniorManagerProfile, User, UserOrganization)
 from account.services.auth_service import issue_access_token
 from lifecycle.models import (ActivationRecord, CustomerDeviceBinding, CustomerVehicle, Device,
                               DeviceState, DriverVehicleBinding, GoodsTransfer, OrganizationDevice)
@@ -18,6 +19,7 @@ from quality_trace.services.recall_handover_service import (select_customer_deli
     accept_factory_pickup_request, submit_customer_pickup_shipment)
 from quality_trace.services.recall_batch_service import execute_recall_batch
 from quality_trace.services.recall_transport_service import confirm_recall_inventory_batch
+from quality_trace.services.recall_progress_service import complete_recall_campaign
 from quality_trace.services.recall_disposition_service import (start_recall_post_disposition,
     confirm_recall_disposition_supplier, confirm_recall_disposition_matching,
     complete_recall_disposition_production, complete_recall_device_disposition)
@@ -25,8 +27,10 @@ from quality_trace.services.recall_task_service import get_recall_task_scope
 from workflow.models import UserTask, WorkItem
 from workflow.services.task_query import get_task_list, get_task_summary
 
+from .test_recall_batch import RecallEvidenceUploadMixin
 
-class RecallRoleInteractionTests(TestCase):
+
+class RecallRoleInteractionTests(RecallEvidenceUploadMixin, TestCase):
     @classmethod
     def make_user(cls, org, role, suffix=''):
         name = f'rr-{org.pk}-{role}-{suffix}'
@@ -37,16 +41,17 @@ class RecallRoleInteractionTests(TestCase):
 
     @classmethod
     def setUpTestData(cls):
-        def org(kind, name):
+        def org(kind, name, *, factory_root=None):
             return Organization.objects.create(name=name, code=f'RR-{name}',
-                organization_type=OrganizationType.objects.get(code=kind))
+                organization_type=OrganizationType.objects.get(code=kind),
+                factory_root=factory_root)
         cls.factory = org('OWNER', '厂家')
         cls.direct = org('MERCHANT', '直属商家')
         cls.lower = org('MERCHANT', '下级商家')
         cls.second = org('MERCHANT', '第二下级商家')
         cls.customer = org('CUSTOMER', '用户组织')
-        cls.supplier = org('SUPPLIER', '供应商')
-        cls.other_supplier = org('SUPPLIER', '其他供应商')
+        cls.supplier = org('SUPPLIER', '供应商', factory_root=cls.factory)
+        cls.other_supplier = org('SUPPLIER', '其他供应商', factory_root=cls.factory)
         for parent, child in ((cls.factory, cls.direct), (cls.direct, cls.lower),
                               (cls.direct, cls.second), (cls.lower, cls.customer),
                               (cls.direct, cls.customer)):
@@ -136,9 +141,10 @@ class RecallRoleInteractionTests(TestCase):
         return data
 
     def run_batch(self, user, action, rows):
+        evidence = self.upload_evidence(user)
         return execute_recall_batch(user=user, campaign_id=self.campaign.pk, action=action,
             recall_device_ids=[row.pk for row in rows], client_request_id=uuid4().hex,
-            evidence={'storage_key': 'private/recall/rr.jpg'}, logistics_provider='测试物流',
+            evidence=evidence, logistics_provider='测试物流',
             tracking_no='RR-TRACK', isolation_location='召回隔离库')
 
     def select(self, method, user=None):
@@ -146,7 +152,7 @@ class RecallRoleInteractionTests(TestCase):
             delivery_method=method, payload={'contact_name': '测试用户', 'contact_phone': '13800000000',
                 'pickup_address': '测试地址', 'pickup_time_window': '明天下午'})
 
-    def return_all(self):
+    def return_all(self, *, logistics=None, assistant=None):
         self.select('MERCHANT_HANDOVER')
         self.handover.refresh_from_db()
         accept_merchant_handover_by_token(user=self.merchant_users[self.lower.pk]['merchant_sales'],
@@ -158,9 +164,12 @@ class RecallRoleInteractionTests(TestCase):
         self.run_batch(self.merchant_users[self.direct.pk]['merchant_owner'], 'RECEIVE', self.rows[:3])
         self.run_batch(self.merchant_users[self.direct.pk]['merchant_stock'], 'RECEIVE', self.rows[3:6])
         self.run_batch(self.merchant_users[self.direct.pk]['merchant_sales'], 'DISPATCH', self.rows)
-        self.run_batch(self.factory_users['factory_logistics'], 'RECEIVE', self.rows)
-        self.run_batch(self.factory_users['factory_sales_assistant'], 'ISOLATE', self.rows)
-        confirm_recall_inventory_batch(user=self.factory_users['factory_sales_assistant'], campaign_id=self.campaign.pk)
+        logistics = logistics or self.factory_users['factory_logistics']
+        assistant = assistant or self.factory_users['factory_sales_assistant']
+        self.run_batch(logistics, 'RECEIVE', self.rows)
+        self.run_batch(assistant, 'ISOLATE', self.rows)
+        self.assertTrue(self.detail(assistant)['inventory_posting']['can_confirm_batch'])
+        confirm_recall_inventory_batch(user=assistant, campaign_id=self.campaign.pk)
 
     def test_all_roles_share_consistent_list_detail_and_single_device_scope(self):
         for role in ('factory_chief_engineer', 'factory_sales_assistant', 'factory_logistics', 'factory_sales'):
@@ -186,6 +195,20 @@ class RecallRoleInteractionTests(TestCase):
         for user in (self.unrelated_driver, self.supplier_owner, self.supplier_sales):
             self.get(user, f'recalls/{self.campaign.pk}/', allowed=False)
             self.assertEqual(self.get(user, 'recalls/')['items'], [])
+
+    def test_missing_handover_returns_a_refreshable_error(self):
+        missing_id = self.handover.pk + 1
+        auth = {"HTTP_AUTHORIZATION": f"Bearer {issue_access_token(self.owner)}"}
+        prefix = f"/pldp/api/quality-trace/recall-handovers/{missing_id}/"
+        for action, data in (
+            ("acknowledge/", {}),
+            ("delivery-method/", {"delivery_method": "CUSTOMER_DIRECT_SHIP"}),
+        ):
+            with self.subTest(action=action):
+                response = self.client.post(prefix + action, data, **auth)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["code"], 1)
+                self.assertIn("召回交接单不存在", response.json()["msg"])
 
     def test_wechat_swaps_do_not_transfer_scope_even_with_old_factory_recipients(self):
         snapshots = list(self.campaign.devices.values_list('responsibility_snapshot', flat=True))
@@ -279,6 +302,63 @@ class RecallRoleInteractionTests(TestCase):
         submit_customer_pickup_shipment(user=self.owner, handover_id=self.handover.pk,
             logistics_provider='取件物流', tracking_no='PICKUP', evidence={'storage_key': 'private/rr.jpg'})
         self.assertEqual(self.detail(self.factory_users['factory_logistics'])['batch_flow']['groups'][0]['action'], 'RECEIVE')
+
+    def test_vacant_factory_roles_can_complete_exact_recall_batch_and_device_tasks(self):
+        operations = self.make_user(self.factory, 'factory_senior_manager', 'vacant-operations')
+        disposition = self.make_user(self.factory, 'factory_senior_manager', 'vacant-disposition')
+        operations_roles = {'factory_logistics', 'factory_sales_assistant'}
+        disposition_roles = {'factory_chief_engineer', 'factory_production', 'factory_matching'}
+        for user, roles in ((operations, operations_roles), (disposition, disposition_roles)):
+            SeniorManagerProfile.objects.create(identity=user.organization_identity).managed_roles.add(
+                *OrganizationRole.objects.filter(code__in=roles),
+            )
+        UserOrganization.objects.filter(
+            organization=self.factory, role__code__in=operations_roles | disposition_roles,
+        ).update(is_active=False)
+
+        self.return_all(logistics=operations, assistant=operations)
+        self.assertTrue(self.detail(disposition)['post_disposition']['can_start'])
+        self.assertFalse(self.detail(operations)['post_disposition']['can_start'])
+        items = start_recall_post_disposition(
+            user=disposition, campaign_id=self.campaign.pk, method='REPAIR_WITH_PARTS',
+            recall_device_ids=[self.rows[0].pk], note='缺岗接手验证',
+        )
+        item = items[0]
+        confirm_recall_disposition_supplier(
+            user=self.supplier_owner, confirmation_id=item.supplier_confirmations.get().pk,
+        )
+        path = f'recall-devices/{self.rows[0].pk}/'
+        actions = self.get(disposition, path)['post_disposition']['available_actions']
+        self.assertTrue(actions['matching_confirm'])
+        self.assertFalse(self.get(operations, path)['post_disposition']['available_actions']['matching_confirm'])
+        confirm_recall_disposition_matching(
+            user=disposition, disposition_id=item.pk,
+            replacement_parts=[{'part_no': 'RR-VACANCY-PART', 'quantity': 1}],
+        )
+        self.assertTrue(self.get(disposition, path)['post_disposition']['available_actions']['production_complete'])
+        complete_recall_disposition_production(
+            user=disposition, disposition_id=item.pk, completion_note='完成维修',
+        )
+        self.assertTrue(self.get(disposition, path)['post_disposition']['available_actions']['chief_confirm'])
+        completed = complete_recall_device_disposition(
+            user=disposition, disposition_id=item.pk, completion_note='复核通过',
+        )
+        self.assertEqual(completed.completed_by_id, disposition.pk)
+
+        remaining = start_recall_post_disposition(
+            user=disposition, campaign_id=self.campaign.pk, method='DISASSEMBLE',
+            recall_device_ids=[row.pk for row in self.rows[1:]], note='剩余设备拆机',
+        )
+        for item in remaining:
+            complete_recall_disposition_production(
+                user=disposition, disposition_id=item.pk, completion_note='拆机完成',
+            )
+        self.assertTrue(self.detail(disposition)['post_disposition']['can_complete_campaign'])
+        closeout = complete_recall_campaign(
+            user=disposition, campaign_id=self.campaign.pk, reason='全部召回处置已完成',
+        )
+        self.assertEqual(closeout.completed_by_id, disposition.pk)
+        self.assertEqual(closeout.completed_role_snapshot, 'factory_senior_manager')
 
     def test_nine_devices_return_and_all_three_dispositions_preserve_other_roles(self):
         self.return_all()

@@ -9,6 +9,11 @@ from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from account.services.auth_service import (
+    ApiAuthenticationError,
+    authenticate_request,
+    get_active_identity,
+)
 from product.models import (
     BOM,
     BOMItem,
@@ -18,6 +23,7 @@ from product.models import (
     ProductModel,
 )
 from supply_chain.models import Material, MaterialSpec, MaterialSpecSupplier
+from supply_chain.services.supply_scope import active_supplier_ids
 
 
 V1_VERSION = "v1"
@@ -62,6 +68,21 @@ def request_user_or_none(request):
     user = getattr(request, "user", None)
     if user and user.is_authenticated:
         return user
+    return None
+
+
+def _bom_factory_id(request):
+    principal = getattr(request, "web_portal_principal", {})
+    if principal.get("kind") == "factory":
+        return principal["organization_id"]
+    if (request.headers.get("Authorization") or "").lower().startswith("bearer "):
+        try:
+            identity = get_active_identity(authenticate_request(request))
+        except ApiAuthenticationError:
+            return None
+        root = identity.organization.get_factory_root() if identity else None
+        if root:
+            return root.pk
     return None
 
 
@@ -189,7 +210,7 @@ def normalize_required_documents(raw_documents, uploaded_files=None, existing=No
     return documents, None
 
 
-def validate_bom_items(category, raw_items):
+def validate_bom_items(category, raw_items, *, factory_id):
     """
     校验一条完整链路：
     产品品类 -> 物料 -> 物料规格 -> 可供应该规格的组织。
@@ -248,7 +269,8 @@ def validate_bom_items(category, raw_items):
         MaterialSpecSupplier.objects.filter(
             material_spec_id__in=spec_ids,
             supplier_id__in=supplier_ids,
-            supplier__is_active=True,
+        ).filter(
+            supplier_id__in=active_supplier_ids(factory_id),
         ).values_list("material_spec_id", "supplier_id")
     )
 
@@ -264,7 +286,7 @@ def validate_bom_items(category, raw_items):
             return None, f"BOM第{index}行的物料规格与物料不匹配"
 
         if (spec.id, row["supplier_id"]) not in valid_supplier_links:
-            return None, f"BOM第{index}行的供应商不能供应所选物料规格"
+            return None, f"BOM第{index}行的供应商在当前厂家链路内没有所选物料规格的有效供应关系"
 
     return normalized_rows, None
 
@@ -426,6 +448,7 @@ class ProductModelCreateAPI(APIView):
         rows, validation_error = validate_bom_items(
             category,
             request.data.get("bom_items"),
+            factory_id=_bom_factory_id(request),
         )
         if validation_error:
             return error_response(validation_error)
@@ -481,7 +504,9 @@ class CategoryBOMOptionsAPI(APIView):
         except ProductCategory.DoesNotExist:
             return error_response("产品品类不存在", status.HTTP_404_NOT_FOUND)
 
-        supplier_links = MaterialSpecSupplier.objects.select_related("supplier").order_by(
+        supplier_links = MaterialSpecSupplier.objects.filter(
+            supplier_id__in=active_supplier_ids(_bom_factory_id(request)),
+        ).select_related("supplier").order_by(
             "supplier__name", "supplier_id"
         )
         specs = MaterialSpec.objects.order_by("code").prefetch_related(
@@ -507,7 +532,6 @@ class CategoryBOMOptionsAPI(APIView):
                                 "name": link.supplier.name,
                             }
                             for link in spec.suppliers.all()
-                            if link.supplier.is_active
                         ],
                     }
                 )
@@ -596,6 +620,7 @@ class ProductModelV1BOMAPI(APIView):
         rows, validation_error = validate_bom_items(
             product.category,
             request.data.get("bom_items"),
+            factory_id=_bom_factory_id(request),
         )
         if validation_error:
             return error_response(validation_error)
@@ -603,7 +628,7 @@ class ProductModelV1BOMAPI(APIView):
         try:
             with transaction.atomic():
                 locked_product = ProductModel.objects.select_for_update().get(id=product.id)
-                bom, created = BOM.objects.get_or_create(
+                bom, created = BOM.objects.select_for_update().get_or_create(
                     product_model=locked_product,
                     version=V1_VERSION,
                     defaults={
@@ -612,11 +637,24 @@ class ProductModelV1BOMAPI(APIView):
                         "created_by": request_user_or_none(request),
                     },
                 )
-                if not created:
-                    bom.version_no = 1
-                    bom.is_active = True
-                    bom.save(update_fields=["version_no", "is_active"])
-                replace_bom_items(bom, rows)
+                in_use = not created and (
+                    bom.production_batches.exists()
+                    or bom.sales_order_frozen_selections.exists()
+                    or bom.order_plan_confirmations.exists()
+                )
+                if in_use:
+                    fields = ("material_id", "material_spec_id", "supplier_id", "remark")
+                    current_rows = list(bom.items.values(*fields).order_by("material_id"))
+                    if current_rows != sorted(rows, key=lambda row: row["material_id"]):
+                        return error_response("该v1版BOM已被订单或生产批次使用，不能修改原版本")
+                else:
+                    if not created:
+                        bom.version_no = 1
+                        bom.is_active = True
+                        bom.save(update_fields=["version_no", "is_active"])
+                    replace_bom_items(bom, rows)
+        except ProtectedError:
+            return error_response("该v1版BOM明细已被业务数据使用，不能修改")
         except IntegrityError:
             return error_response("保存失败：BOM中存在重复物料")
 
@@ -731,8 +769,11 @@ class ProductModelDocumentsAPI(APIView):
 class CategoryDeleteAPI(APIView):
     def post(self, request):
         try:
-            category = ProductCategory.objects.get(id=request.data.get("id"))
-            category.delete()
+            with transaction.atomic():
+                category = ProductCategory.objects.select_for_update().get(id=request.data.get("id"))
+                if category.materials.exists():
+                    return error_response("该品类已被物料使用，不能删除")
+                category.delete()
         except (TypeError, ValueError, ProductCategory.DoesNotExist):
             return error_response("品类不存在", status.HTTP_404_NOT_FOUND)
         except ProtectedError:

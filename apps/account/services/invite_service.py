@@ -2,6 +2,7 @@ import uuid
 from datetime import timedelta
 
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.utils import timezone
 
@@ -33,7 +34,35 @@ class InvitationError(Exception):
     """普通组织邀请流程错误。"""
 
 
+def _parse_invitation_token(token):
+    if isinstance(token, uuid.UUID):
+        return token
+    if token is None or (isinstance(token, str) and not token.strip()):
+        raise InvitationError("邀请token缺失")
+    if not isinstance(token, str):
+        raise InvitationError("邀请链接格式无效，请使用完整链接")
+    try:
+        return uuid.UUID(token.strip())
+    except ValueError as exc:
+        raise InvitationError("邀请链接格式无效，请使用完整链接") from exc
+
+
+def _invitation_root(source_organization):
+    root = source_organization.get_factory_root()
+    return {"id": root.pk, "name": root.name} if root else None
+
+
+def _pending_factory_root(invitation):
+    return {
+        "id": None,
+        "name": invitation.organization_name,
+        "state": "pending_creation",
+    }
+
+
 def _get_inviter_identity(user):
+    if not user.is_active:
+        raise InvitationError("邀请人的账号已经停用")
     identity = get_active_identity(user)
     if not identity:
         raise InvitationError("游客没有组织邀请资格")
@@ -58,10 +87,7 @@ def _get_invitation_queryset(for_update=False):
 
 
 def _get_invitation(token, *, for_update=False):
-    try:
-        return _get_invitation_queryset(for_update=for_update).get(token=token)
-    except (InvitationRecord.DoesNotExist, ValueError, TypeError) as exc:
-        raise InvitationError("邀请链接不存在或已失效") from exc
+    return _get_invitation_queryset(for_update=for_update).get(token=token)
 
 
 def _get_platform_factory_invitation(token, *, for_update=False):
@@ -72,27 +98,28 @@ def _get_platform_factory_invitation(token, *, for_update=False):
         queryset = queryset.select_for_update()
     try:
         return queryset.get(token=token)
-    except (PlatformFactoryInvitation.DoesNotExist, ValueError, TypeError) as exc:
+    except PlatformFactoryInvitation.DoesNotExist as exc:
         raise InvitationError("邀请链接不存在或已失效") from exc
 
 
 def _ensure_pending(invitation):
     now = timezone.now()
+    status = invitation.Status
 
     if (
-        invitation.status == InvitationRecord.Status.PENDING
+        invitation.status == status.PENDING
         and invitation.expires_at <= now
     ):
-        invitation.status = InvitationRecord.Status.EXPIRED
+        invitation.status = status.EXPIRED
         invitation.save(update_fields=("status", "updated_at"))
 
-    if invitation.status == InvitationRecord.Status.ACCEPTED:
+    if invitation.status == status.ACCEPTED:
         raise InvitationError("该邀请已被接受")
-    if invitation.status == InvitationRecord.Status.CANCELLED:
+    if invitation.status == status.CANCELLED:
         raise InvitationError("该邀请已被取消")
-    if invitation.status == InvitationRecord.Status.EXPIRED:
+    if invitation.status == status.EXPIRED:
         raise InvitationError("该邀请已过期")
-    if invitation.status != InvitationRecord.Status.PENDING:
+    if invitation.status != status.PENDING:
         raise InvitationError("邀请状态无效")
 
 
@@ -270,22 +297,28 @@ def create_staff_invitation(
         "target_role_name": invitation.target_role.name,
         "scope": invitation.scope,
         "expires_at": invitation.expires_at.isoformat(),
+        "root_organization": _invitation_root(invitation.source_organization),
     }
 
 
 def get_invitation_detail(*, token, viewer=None):
+    token = _parse_invitation_token(token)
     try:
         invitation = _get_invitation(token)
-    except InvitationError:
+    except InvitationRecord.DoesNotExist:
         platform_invitation = _get_platform_factory_invitation(token)
         return _platform_factory_invitation_detail(platform_invitation, viewer)
     _ensure_pending(invitation)
+    _validate_invitation_still_authorized(invitation)
 
-    viewer_has_identity = bool(viewer and get_active_identity(viewer))
+    if viewer and invitation.inviter_id == viewer.pk:
+        raise InvitationError("不能接受自己发出的邀请")
+    viewer_has_identity = bool(viewer and UserOrganization.objects.filter(user=viewer).exists())
     target_type = invitation.target_role.organization_type
 
     detail = {
         "token": str(invitation.token),
+        "root_organization": _invitation_root(invitation.source_organization),
         "status": invitation.status,
         "scope": invitation.scope,
         "relation_type": invitation.relation_type,
@@ -342,13 +375,26 @@ def get_invitation_detail(*, token, viewer=None):
     return detail
 
 
+def _validate_platform_factory_invitation_authority(invitation):
+    if not invitation.inviter.is_active or not invitation.inviter.is_superuser:
+        raise InvitationError("项目管理员权限已失效，该邀请不能再使用")
+    role = invitation.target_role
+    owner_type = role.organization_type
+    if (
+        role.code != "factory_admin"
+        or not role.is_owner_role
+        or not role.is_active
+        or owner_type.code != "OWNER"
+        or not owner_type.is_active
+    ):
+        raise InvitationError("厂家负责人岗位或厂家组织类型已失效，请重新发出邀请")
+
+
 def _platform_factory_invitation_detail(invitation, viewer):
-    now = timezone.now()
-    if invitation.status == PlatformFactoryInvitation.Status.PENDING and invitation.expires_at <= now:
-        invitation.status = PlatformFactoryInvitation.Status.EXPIRED
-        invitation.save(update_fields=("status", "updated_at"))
-    if invitation.status != PlatformFactoryInvitation.Status.PENDING:
-        raise InvitationError("该邀请已失效或已被接受")
+    _ensure_pending(invitation)
+    _validate_platform_factory_invitation_authority(invitation)
+    if viewer and invitation.inviter_id == viewer.pk:
+        raise InvitationError("邀请人不能接受自己发出的邀请")
 
     target_type = invitation.target_role.organization_type
     viewer_already_has_identity = bool(
@@ -357,6 +403,7 @@ def _platform_factory_invitation_detail(invitation, viewer):
     return {
         "token": str(invitation.token),
         "invitation_kind": "platform_factory_owner",
+        "root_organization": _pending_factory_root(invitation),
         "status": invitation.status,
         "scope": "platform_factory_root",
         "relation_type": "",
@@ -440,6 +487,7 @@ def create_platform_factory_invitation(
         "target_role_name": target_role.name,
         "organization_name": organization_name,
         "expires_at": invitation.expires_at.isoformat(),
+        "root_organization": _pending_factory_root(invitation),
     }
 
 
@@ -448,21 +496,24 @@ def _accept_platform_factory_invitation(*, invitee, token, nickname="", avatar="
     invitation = _get_platform_factory_invitation(token, for_update=True)
     if invitation.status == PlatformFactoryInvitation.Status.ACCEPTED:
         if invitation.invitee_id == invitee.pk:
-            return build_user_payload(invitee)
+            payload = build_user_payload(invitee)
+            payload["root_organization"] = (
+                {
+                    "id": payload["factory_root_id"],
+                    "name": payload["factory_root_name"],
+                }
+                if payload["factory_root_id"] else None
+            )
+            return payload
         raise InvitationError("该邀请已被其他账号接受")
-    if invitation.status == PlatformFactoryInvitation.Status.PENDING and invitation.expires_at <= timezone.now():
-        invitation.status = PlatformFactoryInvitation.Status.EXPIRED
-        invitation.save(update_fields=("status", "updated_at"))
-    if invitation.status != PlatformFactoryInvitation.Status.PENDING:
-        raise InvitationError("该邀请已失效")
-    if not invitation.inviter.is_active or not invitation.inviter.is_superuser:
-        raise InvitationError("项目管理员权限已失效，该邀请不能再使用")
+    _ensure_pending(invitation)
+    _validate_platform_factory_invitation_authority(invitation)
     if invitation.inviter_id == invitee.pk:
         raise InvitationError("邀请人不能接受自己发出的邀请")
     if UserOrganization.objects.filter(user=invitee).exists():
         raise InvitationError("当前微信账号已经拥有或保留过组织身份，不能再次加入")
 
-    owner_type = OrganizationType.objects.get(code="OWNER", is_active=True)
+    owner_type = invitation.target_role.organization_type
     organization = Organization.objects.create(
         name=invitation.organization_name,
         code=_generate_organization_code(owner_type.code),
@@ -494,6 +545,7 @@ def _accept_platform_factory_invitation(*, invitee, token, nickname="", avatar="
     invitation.accepted_at = timezone.now()
     invitation.save(update_fields=("invitee", "status", "accepted_at", "updated_at"))
     payload = build_user_payload(invitee)
+    payload["root_organization"] = _invitation_root(organization)
     payload["invitation"] = {
         "token": str(invitation.token),
         "scope": "platform_factory_root",
@@ -512,19 +564,16 @@ def _generate_organization_code(organization_type_code):
 
 
 def _validate_invitation_still_authorized(invitation):
-    inviter_identity = (
-        UserOrganization.objects.select_related("organization", "role")
-        .filter(
-            user=invitation.inviter,
-            organization=invitation.source_organization,
-            role=invitation.inviter_role,
-            is_active=True,
-            organization__is_active=True,
-            role__is_active=True,
-        )
-        .first()
-    )
-    if not inviter_identity:
+    if not invitation.inviter.is_active:
+        raise InvitationError("邀请人的账号已经停用")
+    if not invitation.target_role.is_active or not invitation.target_role.organization_type.is_active:
+        raise InvitationError("目标岗位或组织类型已经停用")
+    inviter_identity = get_active_identity(invitation.inviter)
+    if (
+        not inviter_identity
+        or inviter_identity.organization_id != invitation.source_organization_id
+        or inviter_identity.role_id != invitation.inviter_role_id
+    ):
         raise InvitationError("邀请人的组织身份已经失效")
 
     rule = invitation.rule
@@ -573,9 +622,10 @@ def accept_staff_invitation(
     address="",
 ):
     """接受邀请并一次性建立账号、组织和组织关系链路。"""
+    token = _parse_invitation_token(token)
     try:
         invitation = _get_invitation(token, for_update=True)
-    except InvitationError:
+    except InvitationRecord.DoesNotExist:
         return _accept_platform_factory_invitation(
             invitee=invitee,
             token=token,
@@ -586,7 +636,9 @@ def accept_staff_invitation(
 
     if invitation.status == InvitationRecord.Status.ACCEPTED:
         if invitation.invitee_id == invitee.pk:
-            return build_user_payload(invitee)
+            payload = build_user_payload(invitee)
+            payload["root_organization"] = _invitation_root(invitation.source_organization)
+            return payload
         raise InvitationError("该邀请已被其他账号接受")
 
     _ensure_pending(invitation)
@@ -614,7 +666,7 @@ def accept_staff_invitation(
             if not region:
                 raise InvitationError("请填写所在或负责区域")
 
-            organization = Organization.objects.create(
+            organization = Organization(
                 name=organization_name,
                 code=_generate_organization_code(
                     target_role.organization_type.code
@@ -625,6 +677,11 @@ def accept_staff_invitation(
                 address=(address or "").strip(),
                 provides_after_sales=False,
             )
+            try:
+                organization.full_clean()
+            except ValidationError as exc:
+                raise InvitationError("；".join(exc.messages)) from exc
+            organization.save()
 
         if organization.organization_type_id != target_role.organization_type_id:
             raise InvitationError("目标组织类型与指定岗位不一致")
@@ -699,6 +756,7 @@ def accept_staff_invitation(
         relation.save()
 
     payload = build_user_payload(invitee)
+    payload["root_organization"] = _invitation_root(invitation.source_organization)
     payload["invitation"] = {
         "token": str(invitation.token),
         "scope": invitation.scope,

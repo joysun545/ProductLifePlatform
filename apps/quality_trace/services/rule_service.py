@@ -178,21 +178,23 @@ def _fault_policy(value, scope):
     return result
 
 
-def _factory_rule_manager(user):
+def _factory_rule_manager(user, *, web_authorized=False):
     try:
         identity = get_quality_trace_identity(user)
     except QualityTraceAccessError as exc:
         raise QualityRuleError(str(exc)) from exc
     if identity.organization.organization_type.code != "OWNER":
         raise QualityRuleError("只有厂家可以配置质量预警规则。")
-    if identity.role.code not in RULE_MANAGER_ROLES:
+    from web_portal.access import identity_can_access_module
+    allowed = identity_can_access_module(identity, "quality") if web_authorized else identity.role.code in RULE_MANAGER_ROLES
+    if not allowed:
         raise QualityRuleError("当前岗位无权发布质量预警规则。")
     return identity
 
 
 @transaction.atomic
-def publish_rule_version(*, user, data):
-    identity = _factory_rule_manager(user)
+def publish_rule_version(*, user, data, web_authorized=False):
+    identity = _factory_rule_manager(user, web_authorized=web_authorized)
     payload = data if isinstance(data, dict) else {}
     metric_type = str(payload.get("metric_type") or "").strip().upper()
     if metric_type not in SUPPORTED_METRICS:
@@ -278,6 +280,10 @@ def serialize_rule(rule, version=None):
     version = version or rule.versions.filter(version=rule.current_version).first()
     return {
         "id": rule.pk,
+        "root_organization": {
+            "id": rule.factory_organization_id,
+            "name": rule.factory_organization.name,
+        },
         "code": rule.code,
         "name": rule.name,
         "status": rule.status,
@@ -299,9 +305,9 @@ def serialize_rule(rule, version=None):
     }
 
 
-def simulate_rule(*, user, data, at=None):
+def simulate_rule(*, user, data, at=None, web_authorized=False):
     """Calculate a draft without creating a rule version, alert or case."""
-    identity = _factory_rule_manager(user)
+    identity = _factory_rule_manager(user, web_authorized=web_authorized)
     payload = data if isinstance(data, dict) else {}
     metric_type = str(payload.get("metric_type") or "").strip().upper()
     if metric_type not in SUPPORTED_METRICS:
@@ -353,5 +359,5 @@ def list_rules(*, user):
         serialize_rule(rule)
         for rule in QualityAlertRule.objects.filter(
             factory_organization=identity.organization,
-        ).prefetch_related("versions")
+        ).select_related("factory_organization").prefetch_related("versions")
     ]

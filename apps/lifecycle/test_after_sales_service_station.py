@@ -477,6 +477,33 @@ class AfterSalesServiceStationApplicationTests(TestCase):
         self.assertIn(manager_identity.user.wx_openid, recipients)
         self.assertNotIn(parent_owner.wx_openid, recipients)
 
+    def test_vacant_factory_sales_role_routes_station_review_to_granted_manager(self):
+        manager = User.objects.create_user(
+            username="vacant_station_review_manager", wx_openid="vacant-station-review-manager",
+        )
+        identity = UserOrganization.objects.create(
+            user=manager, organization=self.factory_root,
+            role=OrganizationRole.objects.get(code="factory_senior_manager"),
+        )
+        SeniorManagerProfile.objects.create(identity=identity).managed_roles.add(self.factory_sales_role)
+        self.factory_sales_identity.is_active = False
+        self.factory_sales_identity.save(update_fields=("is_active",))
+
+        submit_service_station_application(user=self.owner, data=self._payload())
+        application = AfterSalesServiceStationApplication.objects.get(organization=self.organization)
+        task = WorkItem.objects.get(uniq_key=f"after-sales-station:{application.pk}:review")
+        self.assertEqual(list(task.user_tasks.values_list("to_openid", flat=True)), [manager.wx_openid])
+        self.assertTrue(get_service_station_review_context(
+            user=manager, application_id=application.pk,
+        )["can_review"])
+        review_service_station_application(
+            user=manager, application_id=application.pk,
+            action="reject", review_note="请补齐收件信息",
+        )
+        application.refresh_from_db()
+        self.assertEqual(application.status, "REJECTED")
+        self.assertEqual(task.user_tasks.get(to_openid=manager.wx_openid).done_reason, "SELF_ACTION")
+
     def test_application_cannot_be_submitted_without_factory_sales_reviewer(self):
         self.factory_sales_identity.is_active = False
         self.factory_sales_identity.save(update_fields=("is_active",))

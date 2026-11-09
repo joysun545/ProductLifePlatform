@@ -2,7 +2,7 @@ import uuid
 from datetime import timedelta
 
 from django.core.exceptions import ObjectDoesNotExist
-from django.db import transaction
+from django.db import IntegrityError, OperationalError, transaction
 from django.utils import timezone
 
 from account.models import (
@@ -11,6 +11,7 @@ from account.models import (
     OrganizationRelationType,
     OrganizationType,
     OrganizationRole,
+    User,
     UserOrganization,
 )
 from account.services.auth_service import get_active_identity
@@ -164,8 +165,10 @@ class CustomerDeviceService:
         except ObjectDoesNotExist:
             invitation_lifecycle_code = ""
 
+        root = invitation.device.batch.manufacturer.get_factory_root()
         return {
             "token": str(invitation.token),
+            "root_organization": {"id": root.pk, "name": root.name} if root else None,
             "status": invitation.status,
             "accepted_by_me": accepted_by_me,
             "acceptance_allowed": not blocked_reason,
@@ -755,29 +758,98 @@ class CustomerDeviceService:
             )
         return cls._driver_invitation_payload(invitation, user=user)
 
-    @staticmethod
-    def _driver_invitation_payload(invitation, *, user):
+    @classmethod
+    def _driver_invitation_eligibility(cls, invitation, *, user, lock_identity=False):
+        """Read the historical slot separately from its current permission.
+
+        An inactive slot still owns the account's one-to-one identity. Driver
+        sharing never restores or moves that slot. Preview and POST deliberately
+        use this same decision, including accepted-invitation replays.
+        """
+        identities = UserOrganization.objects.select_related(
+            "user", "organization__organization_type",
+            "organization__factory_root", "role",
+        )
+        if lock_identity:
+            identities = identities.select_for_update(of=("self",))
+        identity = identities.filter(user_id=user.pk).first()
+        accepted_by_me = bool(
+            invitation.status == DriverVehicleInvitation.Status.ACCEPTED
+            and invitation.invitee_id == user.pk
+        )
+        decision = {
+            "identity": identity, "driver_role": None,
+            "accepted_by_me": accepted_by_me,
+            "acceptance_allowed": False, "current_access_allowed": False,
+            "blocked_reason": "", "error_class": CustomerFlowStateError,
+        }
+
+        def blocked(reason, error_class=CustomerFlowPermissionError):
+            decision.update(blocked_reason=reason, error_class=error_class)
+            return decision
+
+        if invitation.inviter_id == user.pk:
+            return blocked("分享人不能接受自己的司机邀请")
+        if invitation.status == DriverVehicleInvitation.Status.ACCEPTED:
+            if not accepted_by_me:
+                return blocked("该邀请已由其他账号接受", CustomerFlowStateError)
+        elif invitation.status != DriverVehicleInvitation.Status.PENDING:
+            return blocked("司机邀请已失效", CustomerFlowStateError)
+        elif invitation.expires_at <= timezone.now():
+            return blocked("司机邀请已过期", CustomerFlowStateError)
+
+        organization = invitation.vehicle.customer_organization
+        root = organization.get_factory_root()
+        if not (organization.is_active and organization.organization_type.is_active
+                and root and root.is_active):
+            return blocked("分享车辆所属组织当前不可用，请联系用户负责人")
+        if invitation.vehicle.status != CustomerVehicle.Status.ACTIVE:
+            return blocked("分享车辆已失效，请联系用户负责人")
+        if not user.is_active or (identity and not identity.user.is_active):
+            return blocked("当前账号已停用，请联系管理员")
+
+        if identity:
+            # None from the effective-identity getter means unusable, never that
+            # this account has no historical slot and may create another one.
+            active_identity = get_active_identity(user)
+            if not active_identity or active_identity.pk != identity.pk:
+                return blocked("当前账号的组织身份已停用或不可用，请联系管理员")
+            if not (identity.organization_id == organization.pk
+                    and identity.role.code == "driver"
+                    and identity.role.organization_type_id == organization.organization_type_id):
+                return blocked("当前微信已有其他业务岗位，请使用独立微信账号接受")
+        elif accepted_by_me:
+            return blocked("当前司机身份不可用，请联系管理员")
+        else:
+            decision["driver_role"] = OrganizationRole.objects.filter(
+                organization_type_id=organization.organization_type_id,
+                code="driver", is_active=True,
+            ).first()
+            if not decision["driver_role"]:
+                return blocked("司机岗位当前不可用，请联系管理员")
+
+        if accepted_by_me:
+            if not DriverVehicleBinding.objects.filter(
+                vehicle_id=invitation.vehicle_id, driver_id=user.pk,
+                is_active=True,
+            ).exists():
+                return blocked("当前车辆共享授权已停用，请联系用户负责人重新分享")
+            decision["current_access_allowed"] = True
+        else:
+            decision["acceptance_allowed"] = True
+        return decision
+
+    @classmethod
+    def _driver_invitation_payload(cls, invitation, *, user, eligibility=None):
         devices = list(CustomerDeviceBinding.objects.filter(
             vehicle=invitation.vehicle,
             status=CustomerDeviceBinding.Status.ACTIVE,
         ).select_related("device__product_model", "device__state"))
-        accepted_by_me = invitation.invitee_id == user.id
-        acceptance_allowed = (
-            invitation.status == DriverVehicleInvitation.Status.PENDING
-            and invitation.expires_at > timezone.now()
-            and invitation.inviter_id != user.id
-        )
-        blocked_reason = ""
-        if invitation.inviter_id == user.id:
-            blocked_reason = "分享人不能接受自己的司机邀请"
-        elif invitation.status == DriverVehicleInvitation.Status.ACCEPTED and not accepted_by_me:
-            blocked_reason = "该邀请已由其他账号接受"
-        elif invitation.status != DriverVehicleInvitation.Status.PENDING and not accepted_by_me:
-            blocked_reason = "司机邀请已失效"
-        elif invitation.expires_at <= timezone.now():
-            blocked_reason = "司机邀请已过期"
+        eligibility = eligibility or cls._driver_invitation_eligibility(invitation, user=user)
+        root = invitation.vehicle.customer_organization.get_factory_root()
         return {
             "token": str(invitation.token), "status": invitation.status,
+            "root_organization": {"id": root.pk, "name": root.name} if root else None,
             "expires_at": invitation.expires_at.isoformat(),
             "vehicle": {"id": invitation.vehicle_id,
                         "vehicle_no": invitation.vehicle.vehicle_no,
@@ -790,21 +862,27 @@ class CustomerDeviceService:
                 "organization_name": invitation.vehicle.customer_organization.name,
                 "nickname": invitation.inviter.wx_nickname or invitation.inviter.username,
             },
-            "accepted_by_me": accepted_by_me,
-            "acceptance_allowed": acceptance_allowed,
-            "blocked_reason": blocked_reason,
+            "accepted_by_me": eligibility["accepted_by_me"],
+            "acceptance_allowed": eligibility["acceptance_allowed"],
+            "current_access_allowed": eligibility["current_access_allowed"],
+            "blocked_reason": eligibility["blocked_reason"],
         }
 
     @classmethod
     def driver_invitation_detail(cls, *, token, user):
         invitation = DriverVehicleInvitation.objects.select_related(
-            "vehicle__customer_organization", "inviter", "invitee"
+            "vehicle__customer_organization__organization_type",
+            "vehicle__customer_organization__factory_root", "inviter", "invitee"
         ).filter(token=token).first()
         if not invitation:
             raise CustomerFlowStateError("司机邀请不存在")
         if invitation.status == DriverVehicleInvitation.Status.PENDING and invitation.expires_at <= timezone.now():
-            invitation.status = DriverVehicleInvitation.Status.EXPIRED
-            invitation.save(update_fields=("status", "updated_at"))
+            # A preview must not overwrite a concurrently accepted invitation.
+            DriverVehicleInvitation.objects.filter(
+                pk=invitation.pk, status=DriverVehicleInvitation.Status.PENDING,
+                expires_at__lte=timezone.now(),
+            ).update(status=DriverVehicleInvitation.Status.EXPIRED, updated_at=timezone.now())
+            invitation.refresh_from_db()
         if invitation.status == DriverVehicleInvitation.Status.ACCEPTED and invitation.invitee_id != user.id:
             raise CustomerFlowStateError("该邀请已由其他账号接受")
         if invitation.status not in {DriverVehicleInvitation.Status.PENDING,
@@ -813,35 +891,58 @@ class CustomerDeviceService:
         return cls._driver_invitation_payload(invitation, user=user)
 
     @classmethod
-    @transaction.atomic
     def accept_driver_invitation(cls, *, token, user):
-        invitation = DriverVehicleInvitation.objects.select_for_update().select_related(
-            "vehicle__customer_organization", "inviter"
+        try:
+            with transaction.atomic():
+                return cls._accept_driver_invitation_locked(token=token, user=user)
+        except IntegrityError as exc:
+            # The one-to-one identity and unique vehicle/driver pair are the
+            # final concurrency fence. Querying in the failed atomic block
+            # would itself fail; the complete claim has already rolled back.
+            raise CustomerFlowStateError("账号身份或车辆授权已变化，请刷新后重试") from exc
+        except OperationalError as exc:
+            # SQLite has no row locks: concurrent writers may instead receive
+            # a database/table lock error. Return a retryable conflict only for
+            # that condition, after the transaction has rolled back.
+            if "locked" not in str(exc).lower():
+                raise
+            raise CustomerFlowStateError("车辆分享正在被处理，请刷新后重试") from exc
+
+    @classmethod
+    def _accept_driver_invitation_locked(cls, *, token, user):
+        # Serialize one account accepting different organizations' invitations
+        # on databases with row locks, even when no identity row exists yet.
+        user = User.objects.select_for_update().get(pk=user.pk)
+        invitation = DriverVehicleInvitation.objects.select_for_update(of=("self",)).select_related(
+            "vehicle__customer_organization__organization_type",
+            "vehicle__customer_organization__factory_root", "inviter"
         ).filter(token=token).first()
         if not invitation:
             raise CustomerFlowStateError("司机邀请不存在")
-        if invitation.inviter_id == user.id:
-            raise CustomerFlowPermissionError("分享人不能接受自己的司机邀请")
-        if invitation.status == DriverVehicleInvitation.Status.ACCEPTED:
-            if invitation.invitee_id == user.id:
-                return cls._driver_invitation_payload(invitation, user=user)
-            raise CustomerFlowStateError("该邀请已由其他账号接受")
-        if invitation.status != DriverVehicleInvitation.Status.PENDING or invitation.expires_at <= timezone.now():
-            raise CustomerFlowStateError("司机邀请已失效")
-        identity = get_active_identity(user)
-        if identity and not (
-            identity.organization_id == invitation.vehicle.customer_organization_id
-            and identity.role.code == "driver"
-        ):
-            raise CustomerFlowPermissionError("当前微信已有其他业务岗位")
+        eligibility = cls._driver_invitation_eligibility(
+            invitation, user=user, lock_identity=True,
+        )
+        if eligibility["blocked_reason"]:
+            raise eligibility["error_class"](eligibility["blocked_reason"])
+        if eligibility["accepted_by_me"]:
+            # This is a read-only replay. Never re-enable a vehicle, identity or
+            # revoked binding merely because this user accepted in the past.
+            return cls._driver_invitation_payload(invitation, user=user, eligibility=eligibility)
+
+        now = timezone.now()
+        claimed = DriverVehicleInvitation.objects.filter(
+            pk=invitation.pk, status=DriverVehicleInvitation.Status.PENDING,
+            invitee__isnull=True, expires_at__gt=now,
+            vehicle__status=CustomerVehicle.Status.ACTIVE,
+        ).update(invitee_id=user.pk, status=DriverVehicleInvitation.Status.ACCEPTED,
+                 accepted_at=now, updated_at=now)
+        if claimed != 1:
+            raise CustomerFlowStateError("司机邀请状态已变化，请刷新后重试")
+        identity = eligibility["identity"]
         if not identity:
-            role = OrganizationRole.objects.get(
-                organization_type=invitation.vehicle.customer_organization.organization_type,
-                code="driver", is_active=True,
-            )
             identity = UserOrganization.objects.create(
                 user=user, organization=invitation.vehicle.customer_organization,
-                role=role, inviter=invitation.inviter,
+                role=eligibility["driver_role"], inviter=invitation.inviter,
             )
         DriverVehicleBinding.objects.update_or_create(
             vehicle=invitation.vehicle, driver=user,
@@ -849,8 +950,7 @@ class CustomerDeviceService:
         )
         invitation.invitee = user
         invitation.status = DriverVehicleInvitation.Status.ACCEPTED
-        invitation.accepted_at = timezone.now()
-        invitation.save()
+        invitation.accepted_at = now
         return cls._driver_invitation_payload(invitation, user=user)
 
     @staticmethod
@@ -975,6 +1075,7 @@ class CustomerDeviceService:
         )
         return {
             **(item or {}),
+            "root_organization": {"id": device.batch.manufacturer_id, "name": device.batch.manufacturer.name},
             "content": document.content,
             "mime_type": document.mime_type,
             "file_endpoint": (
@@ -1033,6 +1134,11 @@ class CustomerDeviceService:
         _, device, _ = cls._owned_device_context(device_id=device_id, user=user)
         return DeviceTelemetryService.snapshot(device=device, user=user)
 
+    @staticmethod
+    def is_activated(device):
+        state = getattr(device, "state", None)
+        return state is not None and state.activation_status == "ACTIVATED"
+
     @classmethod
     def device_result(cls, *, device_id, user):
         identity, device, invitation = cls._owned_device_context(
@@ -1047,7 +1153,7 @@ class CustomerDeviceService:
         profile = cls._customer_profile(identity=identity, user=user)
         if binding:
             profile["vehicle_no"] = binding.vehicle_no
-        is_activated = device.state.activation_status == "ACTIVATED"
+        is_activated = cls.is_activated(device)
         activation_record = getattr(device, "activation", None)
         from lifecycle.models import ReplacementFlow
         replacement = ReplacementFlow.objects.filter(application__replacement_device=device,swapped_at__isnull=False).first()

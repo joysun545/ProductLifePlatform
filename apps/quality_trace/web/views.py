@@ -17,16 +17,9 @@ from supply_chain.models import Material, MaterialFaultCause, MaterialSpec, Supp
 
 
 def _development_rule_user(request):
-    if request.user.is_authenticated:
-        return request.user
-    identity = UserOrganization.objects.filter(
-        is_active=True,
-        organization__organization_type__code="OWNER",
-        role__code__in=("factory_chief_engineer", "factory_admin"),
-    ).select_related("user").order_by("role__code", "pk").first()
-    if not identity:
-        raise QualityTraceAccessError("开发环境尚未配置厂家负责人或厂家总工程师账号。")
-    return identity.user
+    from web_portal.access import require_web_identity
+    require_web_identity(request, "quality")
+    return request.user
 
 
 def _payload(request):
@@ -50,17 +43,8 @@ def _console_context(request):
 
 @ensure_csrf_cookie
 def dashboard(request):
-    # Development phase: the QR-entry session gate is intentionally not yet
-    # installed.  The production implementation will restore role-bound
-    # temporary-session validation before this view is exposed.
-    if not request.user.is_authenticated:
-        return render(request, "quality_trace/dashboard.html", {
-            "identity": None,
-            "alerts": QualityAlert.objects.all()[:20],
-            "cases": BatchQualityCase.objects.all()[:20],
-            "development_mode": True,
-            **_console_context(request),
-        })
+    from web_portal.access import require_web_identity
+    require_web_identity(request, "quality")
     try:
         identity = get_quality_trace_identity(request.user)
     except QualityTraceAccessError as exc:
@@ -96,7 +80,7 @@ def root_causes(request):
 @require_POST
 def rule_simulation(request):
     try:
-        data = simulate_rule(user=_development_rule_user(request), data=_payload(request))
+        data = simulate_rule(user=_development_rule_user(request), data=_payload(request), web_authorized=True)
     except (QualityTraceAccessError, QualityRuleError) as exc:
         return JsonResponse({"code": 1, "msg": str(exc), "data": {}}, status=200)
     return JsonResponse({"code": 0, "msg": "模拟计算完成；未保存规则、未生成预警。", "data": data})
@@ -105,7 +89,7 @@ def rule_simulation(request):
 @require_POST
 def rule_publish(request):
     try:
-        data = publish_rule_version(user=_development_rule_user(request), data=_payload(request))
+        data = publish_rule_version(user=_development_rule_user(request), data=_payload(request), web_authorized=True)
     except (QualityTraceAccessError, QualityRuleError) as exc:
         return JsonResponse({"code": 1, "msg": str(exc), "data": {}}, status=200)
     return JsonResponse({"code": 0, "msg": "质量预警规则版本已发布。", "data": data})

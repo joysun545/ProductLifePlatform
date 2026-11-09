@@ -85,9 +85,11 @@ def identity_can_issue_device_codes(identity):
 
 
 @transaction.atomic
-def generate_device_code_batch(*, user, quantity):
+def generate_device_code_batch(*, user, quantity, web_authorized=False):
     identity = get_active_identity(user)
-    if not identity_can_issue_device_codes(identity):
+    from web_portal.access import identity_can_access_module
+    allowed = identity_can_access_module(identity, "device_codes") if web_authorized else identity_can_issue_device_codes(identity)
+    if not allowed:
         raise PhysicalDeviceCodePermissionError(
             "设备编码由厂家生产经理、厂家负责人，或分管生产经理的厂家高级经理生成"
         )

@@ -1,13 +1,22 @@
 import hashlib
+import json
 import re
+from datetime import datetime, timezone as datetime_timezone
 from urllib.parse import parse_qs, urlsplit
 
+from django.core import signing
+from django.utils import timezone
+
 from workflow.models import UserTask
+from workflow.services.task_root import task_root_organizations
 
 
 FACTORY_RETURN_TYPE_PREFIX = "FACTORY_RETURN_"
 QUALITY_RECALL_TYPE_PREFIX = "QUALITY_RECALL_"
 GOODS_TRANSFER_TYPE_PREFIX = "GOODS_TRANSFER_"
+DISCONTINUED_MERCHANT_PAYMENT_TYPES = frozenset({
+    "GOODS_TRANSFER_PAYMENT_UPLOAD", "GOODS_TRANSFER_PAYMENT_CONFIRM",
+})
 # A grouped inbox card normally opens the newest unread update.  Some business
 # flows also place a real operation and read-only progress notices in the same
 # group.  In those flows the operation must win the card entry so the user is
@@ -35,6 +44,18 @@ SUPPLIER_ACTION_TYPES = frozenset(
         "ORDER_PLAN_SUPPLIER_DELIVERY",
     }
 )
+
+TASK_LIST_CURSOR_SALT = "workflow.task-list.cursor.v1"
+TASK_LIST_CURSOR_VERSION = 1
+TASK_LIST_CURSOR_MAX_AGE = 30 * 60
+
+
+class TaskCursorError(ValueError):
+    """A paging context cannot safely continue; start a fresh task list."""
+
+    def __init__(self, message, *, http_status=400):
+        super().__init__(message)
+        self.http_status = http_status
 
 
 def _append_query(link, values):
@@ -195,7 +216,7 @@ def _task_summary(task):
     )
 
 
-def _serialize_task(task):
+def _serialize_task(task, roots):
     """Serialize one real inbox row.
 
     A grouped inbox card is only a query projection. Child rows remain the
@@ -204,7 +225,7 @@ def _serialize_task(task):
     """
 
     workitem = task.workitem
-    return {
+    data = {
         "id": task.id,
         "state": task.state,
         "need_action": bool(task.need_action),
@@ -221,7 +242,23 @@ def _serialize_task(task):
         "action_mode": workitem.action_mode,
         "workitem_status": workitem.status,
         "collaboration": _collaboration_data(task),
+        "root_organization": roots.get(workitem.pk),
     }
+    context = getattr(task, "_replacement_scope_context", None)
+    if context:
+        leg = context["leg"]
+        data["recorded_need_action"] = getattr(task, "_replacement_recorded_need_action", task.need_action)
+        data["replacement_context"] = {
+            "application_id": context["application"].pk,
+            "leg_id": leg.pk if leg else None,
+            "leg_status": leg.status if leg else "",
+            "action": context["action"],
+            "responsible": context["responsible"],
+            "can_act_now": context["can_act_now"],
+            "is_current_stage": context["is_current_stage"],
+            "unfinished": context["unfinished"],
+        }
+    return data
 
 
 def _factory_return_scope(workitem):
@@ -378,6 +415,82 @@ def _prime_goods_transfer_scopes(tasks):
         references = resolved.get(workitem.pk, set())
         workitem._inbox_goods_transfer_conflict = len(references) > 1
         workitem._inbox_goods_transfer_id = next(iter(references)) if len(references) == 1 else None
+
+
+def _without_discontinued_merchant_finance(tasks):
+    """Hide retired merchant money actions without rewriting inbox history.
+
+    Shipment payment types belonged exclusively to the merchant down-shipment
+    settlement flow. Account tasks also include still-valid factory returns,
+    so those are filtered only after resolving their actual persisted case.
+    Ambiguous or missing references are preserved rather than guessed from a
+    title, organization name, or a caller-supplied counterparty id.
+    """
+    tasks = [task for task in tasks
+             if task.workitem.type not in DISCONTINUED_MERCHANT_PAYMENT_TYPES]
+    account_tasks = [task for task in tasks
+                     if task.workitem.type.startswith("GOODS_TRANSFER_ACCOUNT_")]
+    if not account_tasks:
+        return tasks
+    from django.db.models import Q
+    from lifecycle.models import GoodsTransferAccountCase, GoodsTransferAccountPayment
+
+    references, payment_ids, direct_case_ids, transfer_ids = {}, set(), set(), set()
+    for task in account_tasks:
+        workitem = task.workitem
+        payload = workitem.payload if isinstance(workitem.payload, dict) else {}
+        cases, payments = set(), set()
+        case_id = _positive_id(payload.get("account_case_id"))
+        if case_id:
+            cases.add(case_id)
+        for key in ("payment_id", "account_payment_id"):
+            payment_id = _positive_id(payload.get(key))
+            if payment_id:
+                payments.add(payment_id)
+        match = re.fullmatch(
+            r"(?:apps\.)?(?:lifecycle\.)?GoodsTransferAccount(Case|Payment):([0-9]+)",
+            workitem.biz_ref or "",
+        )
+        if match:
+            value = _positive_id(match.group(2))
+            if value:
+                (cases if match.group(1) == "Case" else payments).add(value)
+        transfer_id = _goods_transfer_id(workitem)
+        references[task.pk] = (cases, payments, transfer_id)
+        direct_case_ids.update(cases)
+        payment_ids.update(payments)
+        if transfer_id:
+            transfer_ids.add(transfer_id)
+    payment_cases = dict(GoodsTransferAccountPayment.objects.filter(
+        pk__in=payment_ids).values_list("pk", "account_case_id")) if payment_ids else {}
+    case_ids = direct_case_ids | set(payment_cases.values())
+    query = Q(pk__in=case_ids) | Q(transfer_id__in=transfer_ids)
+    cases = list(GoodsTransferAccountCase.objects.filter(query).values(
+        "pk", "transfer_id", "upper_organization__organization_type__code"))
+    by_id = {case["pk"]: case for case in cases}
+    by_transfer = {}
+    for case in cases:
+        by_transfer.setdefault(case["transfer_id"], []).append(case)
+    disabled = set()
+    for task in account_tasks:
+        if getattr(task.workitem, "_inbox_goods_transfer_conflict", False):
+            continue
+        case_ids, payments, transfer_id = references[task.pk]
+        if any(payment not in payment_cases for payment in payments):
+            continue
+        concrete = case_ids | {payment_cases[payment] for payment in payments}
+        if concrete:
+            if len(concrete) != 1 or not concrete.issubset(by_id):
+                continue
+            selected = [by_id[next(iter(concrete))]]
+            if transfer_id and selected[0]["transfer_id"] != transfer_id:
+                continue
+        else:
+            selected = by_transfer.get(transfer_id, [])
+        if selected and all(case["upper_organization__organization_type__code"] == "MERCHANT"
+                            for case in selected):
+            disabled.add(task.pk)
+    return [task for task in tasks if task.pk not in disabled]
 
 
 def _task_group_scope(task):
@@ -540,18 +653,24 @@ def _entry_task(tasks, *, prefer_action=False):
     return tasks[0]
 
 
-def _serialize_group(scope, tasks, *, include_children=False):
+def _serialize_group(scope, tasks, roots, *, include_children=False):
     # Query order is newest first and is retained within every child list.
     representative = tasks[0]
     metadata = _group_metadata(scope, tasks)
+    replacement_contexts = _replacement_group_context(scope, tasks) if metadata["is_workorder"] else []
     entry_task = _entry_task(
         tasks,
         prefer_action=(
             metadata["group_kind"] in ACTION_PREFERRED_GROUP_KINDS
+            or bool(replacement_contexts)
         ),
     )
-    child_items = [_serialize_task(task) for task in tasks]
-    entry_item = _serialize_task(entry_task)
+    child_items = [_serialize_task(task, roots) for task in tasks]
+    entry_item = _serialize_task(entry_task, roots)
+    entry_root = entry_item["root_organization"]
+    group_root = entry_root if all(
+        item["root_organization"] == entry_root for item in child_items
+    ) else None
     entry_link = _resolved_link(entry_task)
     child_unread_count = sum(task.state == "NEW" for task in tasks)
     child_action_pending_count = sum(
@@ -578,6 +697,7 @@ def _serialize_group(scope, tasks, *, include_children=False):
         # Compatibility fields allow existing single-task clients/tests to keep
         # using id/link/collaboration unchanged.
         **entry_item,
+        "root_organization": group_root,
         "group_id": _group_id(scope),
         "card_id": _group_id(scope),
         "entry_task_id": entry_task.pk,
@@ -645,6 +765,12 @@ def _serialize_group(scope, tasks, *, include_children=False):
             })
     if metadata["group_kind"] == "QUALITY_RECALL":
         _recall_display(group, entry_task)
+    if replacement_contexts:
+        if child_action_pending_count:
+            # A newer completed status snapshot must not hide the actual
+            # operation still owned by this viewer.
+            group["title"] = _compose_group_title(tasks, prefer_action=True)
+        _aftersales_replacement_display(group, tasks, replacement_contexts)
     context = getattr(entry_task, "_recall_scope_context", None)
     if context:
         campaign, viewer, rows = context
@@ -673,6 +799,70 @@ def _serialize_group(scope, tasks, *, include_children=False):
     if include_children:
         group["items"] = child_items
     return group
+
+
+def _replacement_group_context(scope, tasks):
+    """Enable this projection only for one trusted canonical replacement case."""
+    contexts = [getattr(task, "_replacement_scope_context", None) for task in tasks]
+    contexts = [context for context in contexts if context]
+    if not contexts:
+        return []
+    application = contexts[0]["application"]
+    if (scope != f"explicit:aftersales:{application.case_no}"
+            or any(context["application"].pk != application.pk for context in contexts)):
+        return []
+    return contexts
+
+
+def _aftersales_replacement_display(group, tasks, contexts):
+    """Separate the actual case status from its independent handoff notices."""
+    application = contexts[0]["application"]
+    unfinished = {}
+    for context in contexts:
+        if context["unfinished"]:
+            leg = context["leg"]
+            key = ("leg", leg.pk) if leg else (context["action"], context["flow"].pk)
+            unfinished[key] = context
+    group["aftersales_context"] = {
+        "application_id": application.pk,
+        "case_no": application.case_no,
+        "status": application.status,
+        "status_name": application.get_status_display(),
+        "execution_stage": application.execution_stage,
+        "unfinished_replacement_leg_count": len(unfinished),
+    }
+    closed = application.status == "CLOSED"
+    case_text = "售后已结案" if closed else application.get_status_display()
+    stage_text = []
+    for context in unfinished.values():
+        leg = context["leg"]
+        if context["action"] == "scan":
+            text = "现场换新待服务人员交付"
+        elif leg is None:
+            text = "旧机待厂家取回"
+        elif leg.direction == "OLD":
+            text = "旧机退回待签收" if leg.status == "SENT" else "旧机待退回"
+        else:
+            text = "补发设备待签收" if leg.status == "SENT" else "换新待补发"
+        if text not in stage_text:
+            stage_text.append(text)
+    group["summary"] = "｜".join(filter(None, [
+        _task_summary(tasks[0]), case_text, "；".join(stage_text),
+    ]))
+    group["latest_summary"] = group["summary"]
+    if group["action_pending_count"]:
+        group["display_state"] = "待处理"
+    elif unfinished:
+        group["title"] = f"{case_text}，换新链路待跟进"
+        group["display_state"] = (
+            "待知晓" if group["unread_count"] else (
+                "待他岗处理" if not any(context["responsible"] for context in unfinished.values())
+                else "待跟进"
+            )
+        )
+    else:
+        group["title"] = case_text
+        group["display_state"] = "待知晓" if group["unread_count"] else case_text
 
 
 def _recall_display(group, task):
@@ -722,6 +912,7 @@ def _task_groups(openid):
         .order_by("-cursor_time", "-id")
     )
     _prime_goods_transfer_scopes(tasks)
+    tasks = _without_discontinued_merchant_finance(tasks)
     grouped = {}
     for task in tasks:
         scope = _task_group_scope(task)
@@ -730,6 +921,20 @@ def _task_groups(openid):
     from quality_trace.services.recall_access_service import RecallViewer, recall_campaign_queryset, visible_rows
     user = User.objects.filter(wx_openid=openid, is_active=True).first()
     if user:
+        from lifecycle.services.replacement_task_scope import resolve_scopes
+        replacement_contexts = resolve_scopes(
+            list({task.workitem_id: task.workitem for task in tasks}.values()), user,
+        )
+        for task in tasks:
+            context = replacement_contexts.get(task.workitem_id)
+            # Only a currently authorized reader gets current case/leg facts.
+            # Unknown, contradictory and out-of-scope rows stay conservative.
+            if not context or not context["observer"]:
+                continue
+            task._replacement_scope_context = context
+            task._replacement_recorded_need_action = task.need_action
+            if not context["responsible"]:
+                task.need_action = False  # Read-only viewer projection.
         viewer = RecallViewer(user)
         for scope, group_tasks in grouped.items():
             if not scope.startswith("quality-recall:campaign:"):
@@ -763,10 +968,15 @@ def get_task_summary(openid):
     }
     """
 
+    groups = _task_groups(openid)
+    return {**_summary_from_groups(groups), "revision": _task_revision(groups)}
+
+
+def _summary_from_groups(groups):
     unread_count = 0
     action_pending_count = 0
     attention_count = 0
-    for scope, tasks in _task_groups(openid).items():
+    for scope, tasks in groups.items():
         group_unread = sum(task.state == "NEW" for task in tasks)
         group_action = sum(
             task.need_action and task.state != "DONE" for task in tasks
@@ -792,47 +1002,195 @@ def get_task_summary(openid):
 
 
 
-def get_task_list(openid, limit=50):
-    """
-    获取用户任务列表
-
-    用于：
-    小程序任务页面
-    """
-
+def _task_list_limit(limit):
     try:
         limit = int(limit)
-    except Exception:
+    except (TypeError, ValueError, OverflowError):
         limit = 50
-
-
     if limit <= 0 or limit > 200:
         limit = 50
+    return limit
 
+
+def _task_time_micros(value):
+    if timezone.is_naive(value):
+        value = timezone.make_aware(value)
+    delta = value.astimezone(datetime_timezone.utc) - datetime(1970, 1, 1, tzinfo=datetime_timezone.utc)
+    return (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
+
+
+def _loaded_stage_revision(record):
+    if record is None:
+        return None
+    # Avoid deferred field/relation descriptors: use only already loaded data.
+    fields = ("status", "updated_at", "status_updated_at", "execution_stage", "confirmed_at")
+    return [record.pk, *[
+        value.isoformat() if hasattr(value, "isoformat") else value
+        for value in (record.__dict__.get(field) for field in fields)
+    ]]
+
+
+def _task_revision(groups):
+    """Opaque full-inbox change marker; never an authorization capability."""
+    facts, stages, replacement_stages = [], [], []
+    replacement_seen = set()
+    for scope, tasks in sorted(groups.items()):
+        for task in sorted(tasks, key=lambda task: task.pk):
+            facts.append([
+                scope, task.pk, task.workitem_id, task.state, bool(task.need_action),
+                _task_time_micros(task.cursor_time), _task_time_micros(task.updated_at),
+                _task_time_micros(task.workitem.updated_at),
+                _task_time_micros(task.workitem.last_activity_at), task.workitem.status,
+            ])
+            replacement = getattr(task, "_replacement_scope_context", None)
+            if replacement and task.workitem_id not in replacement_seen:
+                replacement_seen.add(task.workitem_id)
+                application, flow, leg = (replacement["application"], replacement["flow"], replacement["leg"])
+                recovery = flow.__dict__.get("recovery") or {}
+                replacement_stage = [
+                    scope, task.workitem_id, _loaded_stage_revision(application),
+                    [flow.pk, flow.__dict__.get("protocol_version"), flow.__dict__.get("mode"),
+                     flow.__dict__.get("service_mode"), recovery.get("state"),
+                     str(flow.__dict__.get("swapped_at") or ""), recovery.get("picked_up_at")],
+                    None if leg is None else [
+                        leg.pk, leg.__dict__.get("direction"), leg.__dict__.get("sequence"),
+                        leg.__dict__.get("status"), leg.__dict__.get("from_organization_id"),
+                        leg.__dict__.get("to_organization_id"), leg.__dict__.get("device_id"),
+                        str(leg.__dict__.get("sent_at") or ""), str(leg.__dict__.get("received_at") or ""),
+                    ],
+                    *[replacement[key] for key in (
+                        "action", "role", "root_id", "responsible", "observer", "can_act_now",
+                        "is_current_stage", "unfinished", "notification_only", "version_matches",
+                    )],
+                ]
+                if "scope_revision" in replacement:
+                    replacement_stage.append(replacement["scope_revision"])
+                replacement_stages.append(replacement_stage)
+        context = getattr(tasks[0], "_recall_scope_context", None)
+        if not context:
+            continue
+        campaign, _viewer, rows = context
+        row_facts = []
+        for row in sorted(rows, key=lambda row: row.pk):
+            cached = row._state.fields_cache
+            disposition = cached.get("post_disposition")
+            confirmations = (disposition._prefetched_objects_cache.get("supplier_confirmations", ())
+                             if disposition is not None else ())
+            row_facts.append([
+                _loaded_stage_revision(row),
+                [_loaded_stage_revision(leg) for leg in sorted(
+                    row._prefetched_objects_cache.get("transport_legs", ()), key=lambda leg: leg.pk)],
+                _loaded_stage_revision(cached.get("customer_handover")),
+                _loaded_stage_revision(cached.get("isolation_receipt")),
+                _loaded_stage_revision(disposition),
+                [_loaded_stage_revision(item) for item in sorted(confirmations, key=lambda item: item.pk)],
+            ])
+        stages.append([scope, _loaded_stage_revision(campaign), row_facts])
+    return hashlib.sha256(json.dumps([facts, stages, replacement_stages], separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _task_priority(item):
+    if item["action_pending_count"]:
+        return 0
+    return 1 if item["unread_count"] else 2
+
+
+def _read_task_cursor(cursor, *, openid, limit):
+    if not isinstance(cursor, str) or len(cursor) > 4096:
+        raise TaskCursorError("任务分页标识无效，请刷新任务列表。")
+    try:
+        context = signing.loads(cursor, salt=TASK_LIST_CURSOR_SALT, max_age=TASK_LIST_CURSOR_MAX_AGE)
+    except signing.SignatureExpired as exc:
+        raise TaskCursorError("任务分页已过期，请刷新任务列表。", http_status=409) from exc
+    except (signing.BadSignature, ValueError, TypeError, UnicodeError) as exc:
+        raise TaskCursorError("任务分页标识无效，请刷新任务列表。") from exc
+    if not isinstance(context, dict):
+        raise TaskCursorError("任务分页标识无效，请刷新任务列表。")
+    if (
+        type(context.get("version")) is not int
+        or context.get("version") != TASK_LIST_CURSOR_VERSION
+        or context.get("openid") != openid
+        or context.get("scope") != "MY:all"
+        or type(context.get("limit")) is not int or context.get("limit") != limit
+    ):
+        raise TaskCursorError("任务分页身份或参数已变化，请刷新任务列表。")
+    watermark, started_at, after = context.get("watermark"), context.get("started_at"), context.get("after")
+    if (
+        type(watermark) is not int or watermark < 0
+        or type(started_at) is not int
+        or not isinstance(context.get("fingerprint"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", context["fingerprint"])
+        or not isinstance(after, list) or len(after) != 3
+        or type(after[0]) is not int or after[0] not in (0, 1, 2)
+        or type(after[1]) is not int
+        or not isinstance(after[2], str) or not re.fullmatch(r"[0-9a-f]{24}", after[2])
+    ):
+        raise TaskCursorError("任务分页标识无效，请刷新任务列表。")
+    age = int(timezone.now().timestamp()) - started_at
+    if age < 0 or age > TASK_LIST_CURSOR_MAX_AGE:
+        raise TaskCursorError("任务分页已过期，请刷新任务列表。", http_status=409)
+    return context
+
+
+def get_task_list(openid, limit=50, *, cursor=None, task_filter="all"):
+    """Page whole inbox groups with a signed, recipient-bound keyset.
+
+    The high-watermark freezes candidates and their sort anchors, not live
+    business text or group children. New rows may extend a returned group;
+    new groups appear on refresh. Changed old ordering/permission facts require
+    an explicit refresh rather than silently skipping or repeating cards.
+    """
+    limit = _task_list_limit(limit)
+    if task_filter not in (None, "", "all"):
+        raise TaskCursorError("当前任务列表不支持此筛选，请刷新任务列表。")
+    context = _read_task_cursor(cursor, openid=openid, limit=limit) if cursor not in (None, "") else None
+    started_at = context["started_at"] if context else int(timezone.now().timestamp())
 
     groups = _task_groups(openid)
-    items = [
-        _serialize_group(scope, tasks)
-        for scope, tasks in list(groups.items())[:limit]
-    ]
-
-
-    unread_count = sum(
-        int(any(task.state == "NEW" for task in tasks))
-        if _uses_card_level_badge(scope, tasks)
-        else sum(task.state == "NEW" for task in tasks)
-        for scope, tasks in groups.items()
+    roots = task_root_organizations(
+        task.workitem for tasks in groups.values() for task in tasks
     )
-
-
+    current_items = {scope: _serialize_group(scope, tasks, roots) for scope, tasks in groups.items()}
+    high_id = max((task.pk for tasks in groups.values() for task in tasks), default=0)
+    watermark = context["watermark"] if context else high_id
+    candidates, facts = [], []
+    for scope, tasks in sorted(groups.items()):
+        old_tasks = [task for task in tasks if task.pk <= watermark]
+        if not old_tasks:
+            continue
+        anchor = current_items[scope] if len(old_tasks) == len(tasks) else _serialize_group(scope, old_tasks, roots)
+        priority = _task_priority(anchor)
+        key = (priority, -max(_task_time_micros(task.cursor_time) for task in old_tasks), anchor["group_id"])
+        candidates.append((key, scope))
+        facts.append([
+            scope, priority, anchor["unread_count"], anchor["action_pending_count"],
+            [[task.pk, task.workitem_id, task.state, bool(task.need_action), _task_time_micros(task.cursor_time)]
+             for task in sorted(old_tasks, key=lambda task: task.pk)],
+        ])
+    fingerprint = hashlib.sha256(json.dumps(facts, separators=(",", ":")).encode("utf-8")).hexdigest()
+    if context and context["fingerprint"] != fingerprint:
+        raise TaskCursorError("任务状态或可见范围已变化，请刷新任务列表。", http_status=409)
+    candidates.sort(key=lambda row: row[0])
+    if context:
+        after = tuple(context["after"])
+        candidates = [row for row in candidates if row[0] > after]
+    page = candidates[:limit]
+    has_more = len(candidates) > limit
+    next_cursor = None
+    if has_more:
+        next_cursor = signing.dumps({
+            "version": TASK_LIST_CURSOR_VERSION, "openid": openid, "scope": "MY:all", "limit": limit,
+            "watermark": watermark, "fingerprint": fingerprint, "after": list(page[-1][0]),
+            "started_at": started_at,
+        }, salt=TASK_LIST_CURSOR_SALT, compress=True)
     return {
-
-        "unread_count": unread_count,
-
-        "items": items,
-
+        "unread_count": _summary_from_groups(groups)["unread_count"],
+        "items": [current_items[scope] for _, scope in page],
         "group_count": len(groups),
-
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+        "updates_available": high_id > watermark,
+        "revision": _task_revision(groups),
     }
 
 
@@ -844,5 +1202,6 @@ def get_task_group(openid, group_id):
         return None
     for scope, tasks in _task_groups(openid).items():
         if _group_id(scope) == group_id:
-            return _serialize_group(scope, tasks, include_children=True)
+            roots = task_root_organizations(task.workitem for task in tasks)
+            return _serialize_group(scope, tasks, roots, include_children=True)
     return None

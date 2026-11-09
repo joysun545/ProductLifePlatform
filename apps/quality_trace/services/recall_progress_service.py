@@ -26,7 +26,7 @@ from quality_trace.models import (
 from workflow.models import UserTask, WorkItem
 from workflow.services.workflow_service import publish_workitem
 
-from .case_service import RECALL_MANAGER_ROLES, _identity, complete_recall
+from .case_service import RECALL_MANAGER_ROLES, _complete_recall_for_actor, _identity
 from .recall_service import QualityRecallError
 
 
@@ -347,8 +347,8 @@ def complete_recall_campaign(*, user, campaign_id, reason):
         status=QualityRecallPostDisposition.Status.COMPLETED,
     ).exists():
         raise QualityRecallError("本批仍有设备未完成召回后处置。")
-    recall_action = complete_recall(
-        user=user, action_id=campaign.control_action_id, reason=reason,
+    recall_action = _complete_recall_for_actor(
+        identity=identity, user=user, action_id=campaign.control_action_id, reason=reason,
     )
     terminal_control = QualityControlAction.objects.filter(
         quality_case=campaign.quality_case,

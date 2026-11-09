@@ -18,6 +18,7 @@ from account.services.role_delegation_service import (
     identity_can_perform_shared_operation,
     identity_has_role,
     shared_operation_recipient_role_codes,
+    vacant_role_manager_openids,
 )
 from lifecycle.models import (
     DeviceState,
@@ -616,10 +617,10 @@ def _publish_notice(transfer, organization, direction, title, summary):
 
 
 def _publish_receipt_task(transfer):
-    recipients = _role_openids(
-        transfer.to_organization,
-        _receipt_roles(transfer.to_organization),
-    )
+    organization = transfer.to_organization
+    roles = _receipt_roles(organization)
+    recipients = (*_role_openids(organization, roles),
+                  *vacant_role_manager_openids(organization, roles))
     if not recipients:
         raise GoodsTransferError("收货组织没有可接收入库任务的有效账号。")
     action_name = (
@@ -802,7 +803,7 @@ def submit_goods_transfer(
             update_fields=("status", "submitted_at", "updated_at")
         )
         if transfer.flow_type == GoodsTransfer.FlowType.SHIPMENT:
-            # 商业单据和收款是独立协作链，不改变实物收货前置条件。
+            # 清单和物流是独立资料协作，不改变实物收货前置条件。
             from lifecycle.services.goods_transfer_settlement_service import (
                 initialize_goods_transfer_settlement,
             )
@@ -1100,6 +1101,18 @@ def _serialize_item(item):
     }
 
 
+def goods_transfer_root_payload(transfer):
+    instruction = transfer.instruction_organization
+    root_id = instruction.factory_root_id
+    if not root_id or not (
+        root_id
+        == transfer.from_organization.factory_root_id
+        == transfer.to_organization.factory_root_id
+    ):
+        return None
+    return {"id": root_id, "name": instruction.factory_root.name}
+
+
 def serialize_goods_transfer(transfer, identity=None):
     if identity is None:
         identity = get_active_identity(transfer.initiated_by)
@@ -1185,13 +1198,16 @@ def serialize_goods_transfer(transfer, identity=None):
                 process,
                 FactoryReturnDocument.DocumentKind.GOODS_LIST,
             )
-    from lifecycle.services.replacement_v6_service import pending_for_route
+    from sales.services.replacement_supply_service import transfer_supply_candidates, transfer_supply_items
+
     return {
-        "pending_replacement_demands":pending_for_route(transfer.from_organization_id,transfer.to_organization_id) if transfer.flow_type=='SHIPMENT' else [],
+        "pending_replacement_demands": transfer_supply_candidates(transfer, identity),
+        "replacement_supply_items": transfer_supply_items(transfer, identity),
         "id": transfer.pk,
         "flow_no": transfer.flow_no,
         "flow_type": transfer.flow_type,
         "flow_type_name": transfer.get_flow_type_display(),
+        "root_organization": goods_transfer_root_payload(transfer),
         "status": transfer.status,
         "status_name": transfer.get_status_display(),
         "instruction_organization": {
@@ -1263,6 +1279,12 @@ def serialize_goods_transfer(transfer, identity=None):
             "can_view_accounts": bool(
                 identity
                 and (
+                    (transfer.flow_type == GoodsTransfer.FlowType.RETURN
+                     and transfer.to_organization.organization_type.code == "OWNER")
+                    or (transfer.flow_type == GoodsTransfer.FlowType.TRANSFER
+                        and transfer.instruction_organization.organization_type.code == "OWNER")
+                )
+                and (
                     transfer.status == GoodsTransfer.Status.COMPLETED
                     or (
                         transfer.flow_type == GoodsTransfer.FlowType.RETURN
@@ -1304,6 +1326,7 @@ def get_goods_transfer_detail(*, user, transfer_id):
     transfer = (
         GoodsTransfer.objects.select_related(
             "instruction_organization__organization_type",
+            "instruction_organization__factory_root",
             "from_organization__organization_type",
             "to_organization__organization_type",
             "source_account",
@@ -1334,6 +1357,7 @@ def get_goods_transfer_list(*, user, limit=50):
     transfers = (
         GoodsTransfer.objects.select_related(
             "instruction_organization__organization_type",
+            "instruction_organization__factory_root",
             "from_organization__organization_type",
             "to_organization__organization_type",
             "source_account",

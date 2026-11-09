@@ -56,7 +56,7 @@ def material_fault_causes(request):
             if cause:
                 cause.is_active = not cause.is_active
                 cause.save(update_fields=("is_active", "updated_at"))
-        return redirect("product:material_fault_causes")
+        return redirect("pldp:web:product:material_fault_causes")
     return render(request, "product/material_fault_causes.html", {
         "materials": Material.objects.filter(is_key_part=True).order_by("code"),
         "causes": MaterialFaultCause.objects.select_related("material").order_by("material__code", "grade", "code"),

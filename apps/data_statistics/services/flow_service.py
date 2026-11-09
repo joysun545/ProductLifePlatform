@@ -3,7 +3,7 @@ from collections import defaultdict
 from django.db.models import Count, Sum
 
 from account.models import OrganizationRelation, OrganizationRelationType
-from lifecycle.models import ActivationRecord, CustomerDeviceBinding, Device, InstallationRecord, OrganizationDevice
+from lifecycle.models import ActivationRecord, CustomerDeviceBinding, Device, GoodsTransfer, GoodsTransferItem, InstallationRecord, OrganizationDevice
 from sales.models import (
     OrderPlan,
     OrderPlanItem,
@@ -432,6 +432,25 @@ def _factory_sales_order_plan_metrics(identity):
     }
 
 
+def _merchant_shipment_metrics(identity):
+    """Count physical shipments, never their optional documents or money."""
+    root = identity.organization.get_factory_root()
+    if not root:
+        return {"merchant_shipment_count": 0, "merchant_shipped_device_count": 0}
+    transfers = GoodsTransfer.objects.filter(
+        from_organization=identity.organization,
+        flow_type=GoodsTransfer.FlowType.SHIPMENT,
+        submitted_at__isnull=False,
+        instruction_organization__factory_root_id=root.pk,
+        from_organization__factory_root_id=root.pk,
+        to_organization__factory_root_id=root.pk,
+    ).exclude(status__in=(GoodsTransfer.Status.SCANNING, GoodsTransfer.Status.CANCELLED))
+    return {
+        "merchant_shipment_count": transfers.count(),
+        "merchant_shipped_device_count": GoodsTransferItem.objects.filter(transfer__in=transfers).count(),
+    }
+
+
 def build_flow_statistics(identity):
     organization_type = identity.organization_type
     role_code = identity.role.code
@@ -485,8 +504,11 @@ def build_flow_statistics(identity):
             "channel_inventory_device_count": totals["market_inventory_device_count"],
             "organization_inventory_device_count": own["market_inventory_device_count"],
         }
+        metrics.update(_merchant_shipment_metrics(identity))
         rate_base = totals["market_device_count"]
-        metric_note = "入库设备为进入当前商家链路的设备；链路库存含本组织及全部下级；组织库存仅统计本组织。"
+        metric_note = ("入库设备为进入当前商家链路的设备；链路库存含本组织及全部下级；组织库存仅统计本组织。"
+                       "累计下发单数和发货台次仅统计本组织已提交且未取消的向下发货，包含在途；"
+                       "同一设备多次发货分别计台次，不依赖清单或应收金额。")
     elif organization_type == "OWNER" and role_code == "factory_sales":
         metrics = _factory_sales_order_plan_metrics(identity)
         metrics["channel_inventory_device_count"] = totals["market_inventory_device_count"]

@@ -1,9 +1,11 @@
 """Factory service custody. Frozen routes; no sales, channel stock or credit facts."""
 from copy import deepcopy
+import uuid
 from django.db import transaction
 from django.utils import timezone
 from account.models import UserOrganization,User
 from account.services.auth_service import get_active_identity
+from account.services.role_delegation_service import vacant_role_manager_openids
 from lifecycle.models import AfterSalesApplication,ReplacementFlow,ReplacementLeg,OrganizationDevice,DeviceState,LifecycleEvent,Device
 from lifecycle.services import replacement_flow_service as B
 from lifecycle.services.aftersales_service import AfterSalesService as S
@@ -40,10 +42,23 @@ def _event(app,name,user,**payload):
     device=app.replacement_device if payload.get('direction')=='outbound' and app.replacement_device_id else app.device
     LifecycleEvent.objects.create(device=device,event_type='AFTERSALE_TRANSFER',operator=user,organization=i.organization if i else None,data={'application_id':app.pk,'factory_transport_action':name,**payload})
 
+def _factory_logistics_openids(app):
+    return [
+        *UserOrganization.objects.filter(
+            organization_id=app.factory_organization_id,
+            is_active=True,
+            user__is_active=True,
+            role__is_active=True,
+            role__code="factory_logistics",
+        ).exclude(user__wx_openid="").values_list("user__wx_openid", flat=True),
+        *vacant_role_manager_openids(app.factory_organization, {"factory_logistics"}),
+    ]
+
+
 def _notify(app,t,direction,index,user,receive=False):
     rows=t[direction];leg=rows[index];org=leg['to'] if receive else leg['from']
     if org==app.factory_organization_id:
-        ids=list(UserOrganization.objects.filter(organization_id=org,is_active=True,user__is_active=True,role__is_active=True,role__code='factory_logistics').exclude(user__wx_openid='').values_list('user__wx_openid',flat=True))
+        ids=_factory_logistics_openids(app)
     elif org==app.customer_organization_id:ids=[app.applicant.wx_openid]
     else:
         ids=list(UserOrganization.objects.filter(organization_id=org,is_active=True,user__is_active=True,role__is_active=True,role__code__in=['merchant_owner','merchant_sales','merchant_stock','merchant_electrician','service_electrician']).exclude(user__wx_openid='').values_list('user__wx_openid',flat=True))
@@ -73,7 +88,7 @@ def begin(app,user,kind='REPAIR',route='DIRECT'):
         path=[root]
     now=timezone.now().isoformat()
     def legs(nodes):return [{'from':a,'to':b,'status':'PENDING','ready_at':now} for a,b in zip(nodes,nodes[1:])]
-    t={'version':1,'kind':kind,'route':route,'state':'INBOUND','created_at':now,'participants':list(dict.fromkeys(path+outbound)),
+    t={'version':1,'transport_id':str(uuid.uuid4()),'kind':kind,'route':route,'state':'INBOUND','created_at':now,'participants':list(dict.fromkeys(path+outbound)),
         'inbound':legs(path),'outbound':legs(outbound),'attribution':None,'prepared_device_id':None,'legacy_custody':legacy_custody,'repair_completed':bool(kind=='REPAIR' and app.repair_completed_at)}
     # Existing unreceived direct handover may be adopted without changing its facts.
     flow=ReplacementFlow.objects.filter(application=app,mode='FACTORY').first()
@@ -91,7 +106,7 @@ def begin(app,user,kind='REPAIR',route='DIRECT'):
     if t['inbound']:_notify(app,t,'inbound',0,user,receive=t['inbound'][0]['status']=='SENT')
     else:
         # Physical receipt still requires an explicit logistics acknowledgement.
-        S._publish_task(app,step='factory-transport-pickup',task_type='AFTERSALES_FACTORY_TRANSPORT',title='请厂家物流核验已在厂设备',summary=S._summary(app),recipients_openids=list(UserOrganization.objects.filter(organization_id=root,is_active=True,role__code='factory_logistics',user__is_active=True).values_list('user__wx_openid',flat=True)),actor_openid=user.wx_openid or '')
+        S._publish_task(app,step='factory-transport-pickup',task_type='AFTERSALES_FACTORY_TRANSPORT',title='请厂家物流核验已在厂设备',summary=S._summary(app),recipients_openids=_factory_logistics_openids(app),actor_openid=user.wx_openid or '')
 
 def _factory_received(app,t,user):
     now=timezone.now().isoformat();t.update(state='FACTORY_RECEIVED',factory_received_at=now,factory_received_by=user.pk)
@@ -120,6 +135,14 @@ def record_repair(app,user):
 def media_allowed(app,user,purpose):
     t=get(app)
     if not t:return False
+    if t['state'] == 'DELIVERED' and S._is_factory_aftersales(app, user):
+        from lifecycle.services.replacement_v6_service import transport_recovery_ready
+        flow = ReplacementFlow.objects.filter(application=app).first()
+        if transport_recovery_ready(app, flow):
+            if purpose == 'REPAIR_EVIDENCE':
+                return flow.recovery.get('state') in {'REPAIRING', 'DISASSEMBLING'}
+            if purpose == 'REPAIR_RETURN_SHIPMENT_DOCUMENT':
+                return flow.material_returns.filter(status='NOTIFIED').exists()
     if purpose=='REPAIR_EVIDENCE':return t['state']=='FACTORY_RECEIVED' and S._is_assignee(app,user) and S._is_factory_aftersales(app,user)
     if purpose!='REPAIR_RETURN_SHIPMENT_DOCUMENT':return False
     for direction in ['inbound','outbound']:
@@ -129,11 +152,13 @@ def media_allowed(app,user,purpose):
     return False
 
 def _proof(app,user,data,after):
-    ids=data.get('document_ids')
-    if not isinstance(ids,list) or not ids or any(type(x) is not int for x in ids):B.error('请上传本段物流凭证')
-    records=list(app.media.filter(pk__in=ids,uploaded_by=user,purpose='REPAIR_RETURN_SHIPMENT_DOCUMENT',created_at__gte=after))
-    if {x.pk for x in records}!=set(ids):B.error('本段物流凭证无效、已过期或不属于当前账号')
-    return sorted(set(ids))
+    from lifecycle.services import aftersales_evidence_service as E
+    t=get(app)
+    scope=E.resolve(app,user,{'evidence_action':E.FT_ACTION,
+        'transport_id':E.transport_id(app,t),'direction':data.get('direction'),
+        'index':data.get('index'),'evidence_kind':'LOGISTICS'})
+    records=E.require_ids(app,user,data.get('document_ids'),key=scope['key'],kind='LOGISTICS',after=after)
+    return sorted(row.pk for row in records)
 
 def _delivered(app,t,user):
     t['state']='DELIVERED';t['delivered_at']=timezone.now().isoformat();_save(app,t)
@@ -149,6 +174,11 @@ def _delivered(app,t,user):
     values=t['attribution']['data']
     S._close_application(app,user=user,identity=get_active_identity(user),data=values,event_type='FACTORY_TRANSPORT_DELIVERED_AND_CLOSED')
     app.closed_by=original;app.save(update_fields=['closed_by','updated_at'])
+    if t['kind'] == 'REPLACEMENT':
+        from lifecycle.services.replacement_v6_service import _role_task, transport_recovery_ready
+        flow.refresh_from_db()
+        if transport_recovery_ready(app, flow) and flow.recovery.get('state') == 'WAIT_DECISION':
+            _role_task(app, {'factory_aftersales'}, '直接返厂换新旧机待研判', 'recovery', user)
 
 def _leg(t,data):
     direction=data.get('direction')
@@ -240,17 +270,18 @@ def execute(application_id,user,data):
 def describe(app,user):
     t=get(app)
     if not t:return None
+    from lifecycle.services import aftersales_evidence_service as E
     from account.models import Organization
     names=dict(Organization.objects.filter(pk__in=t['participants']).values_list('pk','name'))
     rows=[];active=app.status not in {'CANCELLED','CLOSED'}
     for direction in ['inbound','outbound']:
         for n,leg in enumerate(t[direction]):
             enabled=active and (direction=='inbound' or bool(t.get('attribution'))) and (n==0 or t[direction][n-1]['status']=='RECEIVED')
-            rows.append({**leg,'key':direction+'-'+str(n),'direction':direction,'index':n,'from_name':names.get(leg['from'],''),'to_name':names.get(leg['to'],''),
+            rows.append({**leg,**E.describe(app,user,E.ft_scope(app,t,direction,n)),'key':direction+'-'+str(n),'direction':direction,'index':n,'from_name':names.get(leg['from'],''),'to_name':names.get(leg['to'],''),
                 'can_send':enabled and leg['status']=='PENDING' and actor(app,user,leg['from']),
                 'can_receive':enabled and leg['status']=='SENT' and actor(app,user,leg['to'])})
     af=active and S._is_factory_aftersales(app,user) and S._is_assignee(app,user) and t['state']=='FACTORY_RECEIVED'
-    return {'kind':t['kind'],'route':t['route'],'state':t['state'],'legs':rows,'prepared_device_id':t.get('prepared_device_id'),'device_sn':app.replacement_device.sn if t.get('prepared_device_id') else app.device.sn,
+    return {'transport_id':E.transport_id(app,t),'kind':t['kind'],'route':t['route'],'state':t['state'],'legs':rows,'prepared_device_id':t.get('prepared_device_id'),'device_sn':app.replacement_device.sn if t.get('prepared_device_id') else app.device.sn,
         'can_prepare':af and t['kind']=='REPLACEMENT' and not t.get('prepared_device_id'),
         'can_finalize':af and bool(t.get('repair_completed') or t.get('prepared_device_id')),
         'can_pickup':active and not t['inbound'] and t['state']=='INBOUND' and logistics(user,app)}

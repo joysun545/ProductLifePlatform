@@ -8,6 +8,7 @@ from account.services.auth_service import (
 )
 
 from workflow.services.task_query import (
+    TaskCursorError,
     get_task_group,
     get_task_summary,
     get_task_list,
@@ -62,10 +63,18 @@ class TaskListAPI(APIView):
             return error_response
         limit = request.GET.get("limit", 50)
 
-        data = get_task_list(
-            openid,
-            limit=limit
-        )
+        try:
+            data = get_task_list(
+                openid,
+                limit=limit,
+                cursor=request.GET.get("cursor"),
+                task_filter=request.GET.get("filter", "all"),
+            )
+        except TaskCursorError as exc:
+            return Response(
+                {"code": 1, "msg": str(exc), "data": {"refresh_required": True}},
+                status=exc.http_status,
+            )
 
         return Response({
             "code": 0,

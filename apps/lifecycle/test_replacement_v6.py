@@ -1,5 +1,7 @@
 from contextlib import ExitStack
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
+from django.core.files.storage import FileSystemStorage
 from django.test import TestCase,RequestFactory
 from account.models import Organization,OrganizationType,OrganizationRelation
 from account.services.auth_service import issue_access_token
@@ -36,6 +38,9 @@ class ReplacementV6Tests(TestCase):
         cls.case.bom_snapshot=S._snapshot(cls.device)['bom'];cls.case.save()
     def setUp(self):
         self.stack=ExitStack();self.addCleanup(self.stack.close)
+        media_root=self.stack.enter_context(TemporaryDirectory())
+        self.stack.enter_context(patch.object(AfterSalesMedia._meta.get_field('file'),
+            'storage',FileSystemStorage(location=media_root)))
         for name in ['_publish_task','_publish_applicant_notice','_complete_tasks','_complete_factory_workorder','_send_factory_close_task','_publish_supplier_quality_notices']:
             mock=self.stack.enter_context(patch.object(S,name))
             if name=='_publish_task':self.notifications=mock
@@ -48,10 +53,11 @@ class ReplacementV6Tests(TestCase):
             shipment=OrderPlanShipment.objects.filter(pk=data.get('shipment_id') or 0).first()
             self.prepare_supply(leg,shipment.order_plan if shipment else None);actor=self.warehouse;self.proof(actor)
             data.update(handover_method='SHIPMENT',note='补发',logistics_company='顺丰',tracking_no='SUPPLY-SF')
-        if action=='SEND_REPLACEMENT_LEG' and ReplacementLeg.objects.filter(pk=data.get('leg_id'),direction='OLD').exists():
-            image=AfterSalesMedia.objects.create(application=self.case,purpose='REPAIR_RETURN_SHIPMENT_DOCUMENT',media_type='IMAGE',file='old.jpg',uploaded_by=actor)
-            doc=AfterSalesMedia.objects.create(application=self.case,purpose='REPAIR_RETURN_SHIPMENT_DOCUMENT',media_type='IMAGE',file='waybill.jpg',uploaded_by=actor)
-            data.update(device_image_ids=[image.pk],logistics_document_ids=[doc.pk])
+        if action=='SEND_REPLACEMENT_LEG' and leg and leg.direction=='OLD' and B.can_send(leg,actor):
+            if 'device_image_ids' not in data:
+                data['device_image_ids']=[base.upload_transport_proof(self,actor,leg=leg,kind='DEVICE').pk]
+            if 'logistics_document_ids' not in data:
+                data['logistics_document_ids']=[base.upload_transport_proof(self,actor,leg=leg,kind='LOGISTICS').pk]
         return call_api(application_id=self.case.pk,user=actor,data={'action':action,**data})
     def approve(self,mode='LOCAL'):
         self.call('DECIDE',self.af,decision='REPLACEMENT',replacement_flow_version=3,execution_mode=mode,receiving_address='厂家地址')
@@ -97,7 +103,13 @@ class ReplacementV6Tests(TestCase):
         flow,_=self.swap();leg=flow.legs.get(direction='OLD')
         self.call('SEND_REPLACEMENT_LEG',leg_id=leg.pk,confirmed=True)
         matches=[c.kwargs for c in self.notifications.call_args_list if c.kwargs.get('step')=='replacement-'+str(leg.pk)+'-receive']
-        self.assertTrue(matches);self.assertIn(self.af.wx_openid,matches[-1]['recipients_openids']);self.assertIn(self.logistics.wx_openid,matches[-1]['recipients_openids'])
+        notices=[c.kwargs for c in self.notifications.call_args_list if c.kwargs.get('step')=='replacement-'+str(leg.pk)+'-receive-notice']
+        self.assertTrue(matches);self.assertTrue(notices)
+        self.assertIn(self.logistics.wx_openid,matches[-1]['recipients_openids'])
+        self.assertNotIn(self.af.wx_openid,matches[-1]['recipients_openids'])
+        self.assertTrue(matches[-1]['need_action'])
+        self.assertIn(self.af.wx_openid,notices[-1]['recipients_openids'])
+        self.assertFalse(notices[-1]['need_action'])
         with self.assertRaises(AfterSalesError):self.call('RECEIVE_REPLACEMENT_LEG',self.af,leg_id=leg.pk,confirmed=True)
         with self.assertRaises(AfterSalesError):self.call('FACTORY_PICKUP',self.af,confirmed=True)
         self.call('FACTORY_PICKUP',self.logistics,confirmed=True)
@@ -111,11 +123,25 @@ class ReplacementV6Tests(TestCase):
         flow=self.approve();self.stock(self.other_merchant)
         self.call('CONFIRM_REPLACEMENT_SERVICE',operator,service_mode='HOME');self.call('SCAN_SWAP',operator,qr_text='NEW-LIFECYCLE')
         first=flow.legs.get(direction='OLD',sequence=1);second=flow.legs.get(direction='OLD',sequence=2)
-        self.call('SEND_REPLACEMENT_LEG',operator,leg_id=first.pk,confirmed=True)
+        images=[base.upload_transport_proof(self,operator,leg=first,kind='DEVICE').pk for _ in range(4)]
+        documents=[base.upload_transport_proof(self,operator,leg=first,kind='LOGISTICS').pk for _ in range(5)]
+        base.upload_transport_proof(self,operator,leg=first,expected_status=409)
+        self.call('SEND_REPLACEMENT_LEG',operator,leg_id=first.pk,confirmed=True,
+            device_image_ids=images,logistics_document_ids=documents)
         self.call('RECEIVE_REPLACEMENT_LEG',self.owner,leg_id=first.pk,confirmed=True)
         second.refresh_from_db();self.assertEqual(second.status,'PENDING')
         self.assertEqual(OrganizationDevice.objects.get(device=self.device).organization_id,self.merchant.pk)
-        self.call('SEND_REPLACEMENT_LEG',self.owner,leg_id=second.pk,confirmed=True)
+        with self.assertRaises(AfterSalesError):
+            call_api(application_id=self.case.pk,user=self.owner,data={'action':'SEND_REPLACEMENT_LEG',
+                'leg_id':second.pk,'device_image_ids':images,'logistics_document_ids':documents})
+        images2=[base.upload_transport_proof(self,self.owner,leg=second,kind='DEVICE').pk for _ in range(4)]
+        documents2=[base.upload_transport_proof(self,self.owner,leg=second,kind='LOGISTICS').pk for _ in range(4)]
+        base.upload_transport_proof(self,self.sales,leg=second,kind='LOGISTICS')
+        base.upload_transport_proof(self,self.owner,leg=second,expected_status=409)
+        self.assertEqual(self.case.media.filter(evidence_scope_key=f'old:{first.pk}:send').count(),9)
+        self.assertEqual(self.case.media.filter(evidence_scope_key=f'old:{second.pk}:send').count(),9)
+        self.call('SEND_REPLACEMENT_LEG',self.owner,leg_id=second.pk,confirmed=True,
+            device_image_ids=images2,logistics_document_ids=documents2)
         second.refresh_from_db();self.assertEqual(second.status,'SENT')
 
     def test_factory_must_pick_up_before_diagnosis_or_closing(self):
@@ -194,7 +220,7 @@ class ReplacementV6Tests(TestCase):
         AfterSalesMedia.objects.create(application=self.case,purpose='REPAIR_EVIDENCE',media_type='IMAGE',file='test.jpg',uploaded_by=self.sales)
         self.call('REQUEST',requested='FACTORY_REPAIR',holder='EXECUTOR',reason='不能现场维修')
         self.call('DECIDE',self.af,decision='FACTORY_REPAIR',receiving_address='厂家售后维修部')
-        proof=AfterSalesMedia.objects.create(application=self.case,purpose='REPAIR_RETURN_SHIPMENT_DOCUMENT',media_type='IMAGE',file='handover.jpg',uploaded_by=self.sales)
+        proof=base.upload_transport_proof(self,self.sales,direction='inbound',index=0)
         self.call('FACTORY_TRANSPORT_SEND',direction='inbound',index=0,document_ids=[proof.pk],logistics_company='顺丰',tracking_no='FACTORY-RETURN')
         with self.assertRaises(AfterSalesError):self.call('FACTORY_TRANSPORT_RECEIVE',self.af,direction='inbound',index=0,confirmed=True)
         self.call('FACTORY_TRANSPORT_RECEIVE',self.logistics,direction='inbound',index=0,confirmed=True)
@@ -253,8 +279,8 @@ class ReplacementV6Tests(TestCase):
         flow,_=self.swap();leg=flow.legs.get(direction='OLD')
         def submit(**data):return call_api(application_id=self.case.pk,user=self.sales,data={'action':'SEND_REPLACEMENT_LEG','leg_id':leg.pk,**data})
         with self.assertRaises(AfterSalesError):submit()
-        image=AfterSalesMedia.objects.create(application=self.case,purpose='REPAIR_RETURN_SHIPMENT_DOCUMENT',media_type='IMAGE',file='old.jpg',uploaded_by=self.sales)
-        doc=AfterSalesMedia.objects.create(application=self.case,purpose='REPAIR_RETURN_SHIPMENT_DOCUMENT',media_type='IMAGE',file='waybill.jpg',uploaded_by=self.sales)
+        image=base.upload_transport_proof(self,self.sales,leg=leg,kind='DEVICE')
+        doc=base.upload_transport_proof(self,self.sales,leg=leg,kind='LOGISTICS')
         other=AfterSalesMedia.objects.create(application=self.case,purpose='REPAIR_RETURN_SHIPMENT_DOCUMENT',media_type='IMAGE',file='other.jpg',uploaded_by=self.af)
         with self.assertRaises(AfterSalesError):submit(device_image_ids=[image.pk],logistics_document_ids=[image.pk])
         with self.assertRaises(AfterSalesError):submit(device_image_ids=[image.pk],logistics_document_ids=[other.pk])

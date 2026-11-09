@@ -4,6 +4,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from workflow.models import UserTask
+from workflow.services.task_root import task_root_organizations
 
 
 class TaskActionError(Exception):
@@ -57,7 +58,8 @@ def _open_goods_transfer_group(task, now):
     refreshed = next(
         members for key, members in _task_groups(task.to_openid).items() if key == scope
     )
-    card = _serialize_group(scope, refreshed)
+    roots = task_root_organizations(child.workitem for child in refreshed)
+    card = _serialize_group(scope, refreshed, roots)
     task.refresh_from_db(fields=("state",))
     return {
         "state": task.state,
@@ -65,6 +67,7 @@ def _open_goods_transfer_group(task, now):
         "group_kind": card["group_kind"],
         "entry_task_id": card["entry_task_id"],
         "link": card["link"],
+        "root_organization": card["root_organization"],
     }
 
 
@@ -124,7 +127,7 @@ def _open_aftersales_group(task, now):
     if not group_key or payload.get("inbox_group_kind") != "AFTERSALES":
         return False
 
-    tasks = (
+    tasks = list(
         UserTask.objects.select_for_update()
         .select_related("workitem")
         .filter(
@@ -134,10 +137,18 @@ def _open_aftersales_group(task, now):
             state__in=("NEW", "READ"),
         )
     )
+    from account.models import User
+    from lifecycle.services.replacement_task_scope import resolve_scopes
+    user = User.objects.filter(wx_openid=task.to_openid, is_active=True).first()
+    replacement_contexts = resolve_scopes([row.workitem for row in tasks], user)
     for grouped_task in tasks:
         if grouped_task.state == "NEW":
             grouped_task.read_at = now
-        if grouped_task.need_action:
+        replacement = replacement_contexts.get(grouped_task.workitem_id)
+        replacement_observer = bool(
+            replacement and replacement["observer"] and not replacement["responsible"]
+        )
+        if grouped_task.need_action and not replacement_observer:
             grouped_task.state = "READ"
         else:
             grouped_task.state = "DONE"
@@ -183,19 +194,20 @@ def open_task(openid, usertask_id):
     if goods_result is not None:
         return goods_result
 
+    root = task_root_organizations([task.workitem]).get(task.workitem_id)
+    context = {"root_organization": root} if root else {}
+
     if task.state == "DONE":
-        return {
-            "state": task.state
-        }
+        return {"state": task.state, **context}
 
 
     if _open_quality_recall_group(task, now):
         task.refresh_from_db(fields=("state",))
-        return {"state": task.state}
+        return {"state": task.state, **context}
 
     if _open_aftersales_group(task, now):
         task.refresh_from_db(fields=("state",))
-        return {"state": task.state}
+        return {"state": task.state, **context}
 
 
     # 已读
@@ -233,6 +245,4 @@ def open_task(openid, usertask_id):
     )
 
 
-    return {
-        "state": task.state
-    }
+    return {"state": task.state, **context}

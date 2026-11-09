@@ -5,7 +5,7 @@ from pathlib import Path
 import uuid
 
 from django.db import transaction
-from django.db.models import Max, OuterRef, Subquery, Sum
+from django.db.models import Max, OuterRef, Q, Subquery, Sum
 from django.utils import timezone
 
 from account.models import UserOrganization
@@ -15,6 +15,7 @@ from account.services.role_delegation_service import (
     delegated_role_codes,
     effective_role_codes,
     identity_has_role,
+    vacant_role_manager_openids,
 )
 from lifecycle.models import (
     DeviceMaterialFaultRecord,
@@ -34,7 +35,17 @@ from lifecycle.models import (
     OrganizationDevice,
     QRCode,
 )
-from sales.models import OrderPlanItem
+from lifecycle.services.goods_transfer_service import goods_transfer_root_payload
+from sales.models import (
+    OrderPlanItem,
+    OrderPlanProductionSubplanItem,
+    OrderPlanShipmentDevice,
+    OrderPlanSupplyDeliveryRequirement,
+)
+from sales.services.supplier_batch_trace_service import (
+    consumed_material_lots,
+    with_supplier_batch_id,
+)
 from supply_chain.models import MaterialSpecSupplier
 from supply_chain.services.supplier_responsibility_service import (
     SupplierResponsibilityError,
@@ -296,6 +307,11 @@ def _role_openids(organization, role_codes):
     )
 
 
+def _action_openids(organization, role_codes):
+    return (*_role_openids(organization, role_codes),
+            *vacant_role_manager_openids(organization, role_codes))
+
+
 def _process_link(transfer):
     return (
         "/pages/stock/factory_return_process/factory_return_process"
@@ -367,7 +383,7 @@ def _publish_action(
     actor,
     payload=None,
 ):
-    recipients = _role_openids(transfer.to_organization, role_codes)
+    recipients = _action_openids(transfer.to_organization, role_codes)
     if not recipients:
         role_text = "、".join(sorted(role_codes))
         raise FactoryReturnProcessError(
@@ -1225,7 +1241,7 @@ def confirm_factory_return_pickup(*, user, transfer_id):
             raise FactoryReturnProcessError(
                 f"设备{item.device.sn}状态已变化，不能确认取回。"
             )
-    if not _role_openids(
+    if not _action_openids(
         transfer.to_organization,
         {"factory_sales_assistant"},
     ):
@@ -1310,7 +1326,7 @@ def confirm_factory_return_pickup(*, user, transfer_id):
 
 
 def _publish_stock_notice(transfer, actor, counts):
-    recipients = _role_openids(transfer.to_organization, {"factory_stock"})
+    recipients = _action_openids(transfer.to_organization, {"factory_stock"})
     if not recipients:
         raise FactoryReturnProcessError("厂家缺少有效的库管账号。")
     summary = (
@@ -1461,7 +1477,7 @@ def post_factory_return_inventory(
             raise FactoryReturnProcessError("请选择有效的退货入库分类。")
 
     # 先验证所有必需岗位，避免分类后才发现任务无法分发。
-    if not _role_openids(transfer.to_organization, {"factory_stock"}):
+    if not _action_openids(transfer.to_organization, {"factory_stock"}):
         raise FactoryReturnProcessError("厂家缺少有效的库管账号。")
     needs_followup = any(
         str(row.get("stock_status") or "").upper()
@@ -1472,9 +1488,9 @@ def post_factory_return_inventory(
         for row in submitted
     )
     if needs_followup:
-        if not _role_openids(transfer.to_organization, {"factory_production"}):
+        if not _action_openids(transfer.to_organization, {"factory_production"}):
             raise FactoryReturnProcessError("厂家缺少有效的生产经理账号。")
-        if not _role_openids(transfer.to_organization, {"factory_matching"}):
+        if not _action_openids(transfer.to_organization, {"factory_matching"}):
             raise FactoryReturnProcessError("厂家缺少有效的配套经理账号。")
 
     now = timezone.now()
@@ -1819,18 +1835,117 @@ def _locked_internal_inventory_item(transfer, item_id):
     return item
 
 
-def _source_order_item(inventory_item):
-    """Resolve the exact order line that created the production batch."""
+_SOURCE_LOOKUP_REQUIRED = object()
 
+
+def _source_production_subplan_item(inventory_item):
+    """Use the recorded production batch link for the current production flow."""
+
+    batch = inventory_item.source_production_batch
+    items = list(
+        OrderPlanProductionSubplanItem.objects.select_related(
+            "order_plan_item__plan",
+            "order_plan_item__sales_bom_selection",
+            "production_subplan__material_plan",
+        ).filter(
+            Q(production_batch_id=batch.pk) | Q(production_batch_code=batch.batch_no)
+        ).order_by("id")[:2]
+    )
+    if not items:
+        return None
+    item = items[0]
+    line = item.order_plan_item
+    selection = getattr(line, "sales_bom_selection", None)
+    if (
+        len(items) != 1
+        or item.production_batch_id != batch.pk
+        or item.production_batch_code != batch.batch_no
+        or item.production_subplan.material_plan.order_plan_id != line.plan_id
+        or line.plan.factory_organization_id != batch.manufacturer_id
+        or line.product_model_id != batch.product_model_id
+        or not selection
+        or selection.frozen_bom_id != batch.bom_id
+    ):
+        raise FactoryReturnProcessError("原生产批次与订单明细或冻结BOM不一致，请先核对生产记录。")
+    return item
+
+
+def _source_order_item(inventory_item, *, production_item=_SOURCE_LOOKUP_REQUIRED):
+    """Resolve the order line that manufactured the device."""
+
+    if production_item is _SOURCE_LOOKUP_REQUIRED:
+        production_item = _source_production_subplan_item(inventory_item)
+    if production_item:
+        return production_item.order_plan_item
+
+    batch = inventory_item.source_production_batch
     return (
         OrderPlanItem.objects.select_related(
             "plan",
             "bom_confirmation__confirmed_bom",
         )
-        .filter(order_batch_code=inventory_item.source_production_batch.batch_no)
-        .order_by("id")
+        .filter(
+            order_batch_code=batch.batch_no,
+            plan__factory_organization_id=batch.manufacturer_id,
+            product_model_id=batch.product_model_id,
+        )
         .first()
     )
+
+
+def _source_order_trace(inventory_item, order_item, production_item):
+    device = inventory_item.transfer_item.device
+    batch = inventory_item.source_production_batch
+    if (
+        device.batch_id != batch.pk
+        or device.product_model_id != inventory_item.source_product_model_id
+        or batch.product_model_id != inventory_item.source_product_model_id
+        or batch.bom_id != inventory_item.source_bom_id
+    ):
+        raise FactoryReturnProcessError("退货设备与记录的原生产批次、型号或BOM不一致，请先核对。")
+    if order_item and batch.manufacturer_id != inventory_item.process.transfer.to_organization_id:
+        raise FactoryReturnProcessError("设备原生产订单不属于本次收货厂家的链路。")
+    # A production batch can be split across several physical shipments. The
+    # exact device allocation identifies its shipment, never the batch alone.
+    shipment_scope = Q(return_inventory_allocation__isnull=True)
+    if production_item:
+        shipment_scope |= Q(order_plan_id=order_item.plan_id)
+    allocations = list(
+        OrderPlanShipmentDevice.objects.select_related("shipment", "shipment_item")
+        .filter(shipment_scope, device_id=device.pk)
+        .order_by("id")[:2]
+    )
+    shipped_allocation = None
+    if allocations:
+        allocation = allocations[0]
+        shipment = allocation.shipment
+        shipment_item = allocation.shipment_item
+        if (
+            len(allocations) != 1
+            or not production_item
+            or allocation.order_plan_id != order_item.plan_id
+            or shipment.order_plan_id != order_item.plan_id
+            or shipment.production_subplan_id != production_item.production_subplan_id
+            or shipment_item.shipment_id != allocation.shipment_id
+            or shipment_item.order_plan_item_id != order_item.pk
+            or shipment_item.production_subplan_item_id != production_item.pk
+            or allocation.return_inventory_allocation_id is not None
+        ):
+            raise FactoryReturnProcessError("设备原发货分配与生产订单明细不一致，请先核对发货记录。")
+        if shipment.shipped_at:
+            shipped_allocation = allocation
+    if not order_item:
+        return None
+    return {
+        "order_plan_id": order_item.plan_id,
+        "order_plan_code": order_item.plan.plan_code,
+        "order_plan_item_id": order_item.pk,
+        "order_batch_code": order_item.order_batch_code,
+        "production_subplan_item_id": production_item.pk if production_item else None,
+        "shipment_id": shipped_allocation.shipment_id if shipped_allocation else None,
+        "shipment_item_id": shipped_allocation.shipment_item_id if shipped_allocation else None,
+        "shipment_sequence_no": shipped_allocation.shipment.sequence_no if shipped_allocation else None,
+    }
 
 
 def _original_supplier_task_recipients(*, inventory_item, supplier, material_ids):
@@ -1838,9 +1953,8 @@ def _original_supplier_task_recipients(*, inventory_item, supplier, material_ids
 
     Supplier owners are resolved from the supplier's current active identities so
     the notification always reaches the current owner slot. Responsible sales
-    managers, however, are taken from the supplier-task snapshot created when the
-    original order BOM was confirmed. A material that had no responsible sales
-    manager at that time remains owner-only during return tracing.
+    managers come from the original delivery task for the actual production
+    requirement, or from the original preparation task on older orders.
 
     Legacy devices that cannot be linked to an order line keep the previous
     current-responsibility fallback; the returned source marker makes that
@@ -1856,7 +1970,10 @@ def _original_supplier_task_recipients(*, inventory_item, supplier, material_ids
         supplier=supplier,
         material_ids=material_ids,
     )
-    order_item = _source_order_item(inventory_item)
+    subplan_item = _source_production_subplan_item(inventory_item)
+    order_item = (
+        subplan_item.order_plan_item if subplan_item else _source_order_item(inventory_item)
+    )
     if not order_item:
         assigned_material_ids = {
             int(material_id)
@@ -1875,52 +1992,54 @@ def _original_supplier_task_recipients(*, inventory_item, supplier, material_ids
         )
         return current
 
-    source_workitem = None
-    for candidate in WorkItem.objects.filter(
-        type="ORDER_PLAN_SUPPLIER_PREPARE",
-        biz_ref=f"sales.OrderPlan:{order_item.plan_id}",
-    ).order_by("id"):
-        payload = candidate.payload if isinstance(candidate.payload, dict) else {}
-        try:
-            payload_supplier_id = int(payload.get("supplier_id") or 0)
-        except (TypeError, ValueError):
-            continue
-        if payload_supplier_id == supplier.pk:
-            source_workitem = candidate
-            break
-
     owner_openids = list(current["owner_openids"])
     owner_scopes = {
         openid: scope
         for openid, scope in current["recipient_scopes"].items()
         if scope.get("role") == "supplier_owner"
     }
-    if not source_workitem:
-        return {
-            "openids": owner_openids,
-            "owner_openids": owner_openids,
-            "sales_openids": [],
-            "sales_identity_ids": [],
-            "recipient_scopes": owner_scopes,
-            "responsibility_source": "ORDER_CONFIRMATION_TASK_MISSING",
-            "responsibility_source_name": "原订单责任快照缺失，本次仅通知供应商负责人",
-            "unassigned_sales_material_ids": sorted(material_ids),
-        }
+    source_delivery_ids = []
+    if subplan_item:
+        scoped_sources, source_delivery_ids = _production_delivery_responsibility_scopes(
+            subplan_item, supplier, material_ids,
+        )
+        if source_delivery_ids:
+            responsibility_source = "ORDER_DELIVERY_TASK_SNAPSHOT"
+            responsibility_source_name = "原订单实际配送任务责任快照"
+        else:
+            responsibility_source = "NO_ORIGINAL_DELIVERY_TASK"
+            responsibility_source_name = "原生产物料未经过订单配送推送，本次仅通知供应商负责人"
+    else:
+        source_payload = {}
+        for workitem in WorkItem.objects.filter(
+            type="ORDER_PLAN_SUPPLIER_PREPARE",
+            biz_ref=f"sales.OrderPlan:{order_item.plan_id}",
+        ).order_by("id"):
+            payload = workitem.payload if isinstance(workitem.payload, dict) else {}
+            try:
+                payload_supplier_id = int(payload.get("supplier_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if payload_supplier_id == supplier.pk:
+                source_payload = payload
+                break
+        initial_scopes = source_payload.get("initial_recipient_scopes")
+        if isinstance(initial_scopes, dict):
+            source_scopes = initial_scopes
+            responsibility_source = "ORDER_CONFIRMATION_INITIAL_SNAPSHOT"
+            responsibility_source_name = "原订单首次确认配套不可变责任快照"
+        elif source_payload:
+            source_scopes = source_payload.get("recipient_scopes") or {}
+            responsibility_source = "ORDER_CONFIRMATION_TASK_SNAPSHOT_LEGACY"
+            responsibility_source_name = "原订单历史任务责任快照（兼容旧数据）"
+        else:
+            source_scopes = {}
+            responsibility_source = "ORDER_CONFIRMATION_TASK_MISSING"
+            responsibility_source_name = "原订单责任快照缺失，本次仅通知供应商负责人"
+        scoped_sources = [(scope, material_ids) for scope in source_scopes.values()]
 
-    source_payload = (
-        source_workitem.payload
-        if isinstance(source_workitem.payload, dict)
-        else {}
-    )
-    initial_scopes = source_payload.get("initial_recipient_scopes")
-    has_initial_snapshot = isinstance(initial_scopes, dict)
-    source_scopes = (
-        initial_scopes
-        if has_initial_snapshot
-        else source_payload.get("recipient_scopes")
-    ) or {}
     identity_materials = defaultdict(set)
-    for scope in source_scopes.values():
+    for scope, source_material_ids in scoped_sources:
         if not isinstance(scope, dict) or scope.get("role") != "supplier_sales":
             continue
         try:
@@ -1930,12 +2049,12 @@ def _original_supplier_task_recipients(*, inventory_item, supplier, material_ids
         if identity_id <= 0:
             continue
         scoped_material_ids = set()
-        for value in scope.get("material_ids", []):
+        for value in scope.get("material_ids", []) or []:
             try:
                 scoped_material_ids.add(int(value))
             except (TypeError, ValueError):
                 continue
-        identity_materials[identity_id].update(material_ids & scoped_material_ids)
+        identity_materials[identity_id].update(source_material_ids & scoped_material_ids)
 
     sales_identities = {
         identity.pk: identity
@@ -1982,20 +2101,92 @@ def _original_supplier_task_recipients(*, inventory_item, supplier, material_ids
         "sales_openids": sales_openids,
         "sales_identity_ids": sorted(sales_identities),
         "recipient_scopes": recipient_scopes,
-        "responsibility_source": (
-            "ORDER_CONFIRMATION_INITIAL_SNAPSHOT"
-            if has_initial_snapshot
-            else "ORDER_CONFIRMATION_TASK_SNAPSHOT_LEGACY"
-        ),
-        "responsibility_source_name": (
-            "原订单首次确认配套不可变责任快照"
-            if has_initial_snapshot
-            else "原订单历史任务责任快照（兼容旧数据）"
-        ),
+        "responsibility_source": responsibility_source,
+        "responsibility_source_name": responsibility_source_name,
+        "source_delivery_ids": source_delivery_ids,
         "unassigned_sales_material_ids": sorted(
             material_ids - assigned_material_ids
         ),
     }
+
+
+def _production_delivery_responsibility_scopes(subplan_item, supplier, material_ids):
+    """Read immutable scopes for the selected materials' recorded delivery lines."""
+    plan = subplan_item.order_plan_item.plan
+    production_subplan = subplan_item.production_subplan
+    allocations = OrderPlanSupplyDeliveryRequirement.objects.select_related(
+        "requirement", "delivery_line__delivery",
+    ).filter(
+        requirement__production_subplan_item=subplan_item,
+        requirement__supplier=supplier,
+        requirement__material_id__in=material_ids,
+    )
+    deliveries = defaultdict(dict)
+    for allocation in allocations:
+        line = allocation.delivery_line
+        delivery = line.delivery
+        requirement = allocation.requirement
+        if (
+            delivery.material_plan_id != production_subplan.material_plan_id
+            or delivery.supplier_id != supplier.pk
+            or line.material_id != requirement.material_id
+            or line.material_spec_id != requirement.material_spec_id
+        ):
+            raise FactoryReturnProcessError("原生产物料的配送明细关系不一致。")
+        if (
+            not delivery.dispatched_at
+            or not delivery.supplier_confirmed_at
+            or not production_subplan.production_completed_at
+            or not (
+                delivery.dispatched_at <= delivery.supplier_confirmed_at
+                <= production_subplan.production_completed_at
+            )
+        ):
+            raise FactoryReturnProcessError("原生产物料的配送确认记录缺失或时间顺序不一致。")
+        deliveries[delivery.pk][line.pk] = (line.material_id, line.material_spec_id)
+
+    scoped_sources = []
+    for delivery_id, lines in deliveries.items():
+        workitem = WorkItem.objects.filter(
+            type="ORDER_PLAN_SUPPLIER_DELIVERY",
+            biz_ref=f"sales.OrderPlan:{plan.pk}",
+            uniq_key=f"sales:order-plan:{plan.pk}:material-delivery:{delivery_id}",
+        ).first()
+        payload = (
+            workitem.payload if workitem and isinstance(workitem.payload, dict) else {}
+        )
+        scopes = payload.get("recipient_scopes")
+        snapshot_rows = payload.get("materials")
+        snapshot_lines = {
+            row.get("delivery_line_id"): (row.get("material_id"), row.get("material_spec_id"))
+            for row in (snapshot_rows if isinstance(snapshot_rows, list) else [])
+            if isinstance(row, dict)
+        }
+        if (
+            payload.get("order_plan_id") != plan.pk
+            or payload.get("factory_id") != plan.factory_organization_id
+            or payload.get("supplier_id") != supplier.pk
+            or payload.get("delivery_id") != delivery_id
+            or payload.get("material_plan_id") != production_subplan.material_plan_id
+            or any(snapshot_lines.get(line_id) != row for line_id, row in lines.items())
+            or not isinstance(scopes, dict)
+        ):
+            raise FactoryReturnProcessError("原订单配送任务或责任快照缺失，请核对原配送记录。")
+        delivery_material_ids = {material_id for material_id, _spec_id in lines.values()}
+        sales_task_openids = set(
+            workitem.user_tasks.filter(to_role_snapshot="supplier_sales")
+            .values_list("to_openid", flat=True)
+        )
+        scope_openids = {
+            openid for openid, scope in scopes.items()
+            if isinstance(scope, dict) and scope.get("role") == "supplier_sales"
+        }
+        if sales_task_openids != scope_openids:
+            raise FactoryReturnProcessError("原订单配送任务接收人和责任快照不一致。")
+        scoped_sources.extend(
+            (scopes[openid], delivery_material_ids) for openid in sorted(sales_task_openids)
+        )
+    return scoped_sources, sorted(deliveries)
 
 
 def _matching_bom_item(bom, source_bom_item):
@@ -2016,44 +2207,79 @@ def _matching_bom_item(bom, source_bom_item):
     )
 
 
-def _resolve_material_trace(inventory_item, source_bom_item, order_item=None):
-    """
-    Resolve a supplier without consulting the many-to-many spec supplier list.
+def _production_material_lots(requirement, *, factory_id):
+    return [
+        {
+            "factory_lot_id": row.material_lot_id,
+            "factory_batch_code": row.material_lot.batch_code,
+            "supplier_material_batch_id": row.supplier_batch_id,
+            "supplier_batch_code": row.material_lot.supplier_batch_code,
+            "consumed_milli": row.consumed_milli,
+        }
+        for row in with_supplier_batch_id(
+            consumed_material_lots(factory_id).filter(requirement=requirement)
+        ).select_related("material_lot").order_by("material_lot_id")
+    ]
 
-    The current project has no per-device material-binding table yet, so the
-    ACTUAL_BINDING branch intentionally remains an extension point. Existing
-    data starts at the confirmed production BOM and falls back to the source
-    BOM row; an unresolved supplier remains explicit.
-    """
 
-    order_item = order_item or _source_order_item(inventory_item)
+def _resolve_material_trace(
+    inventory_item,
+    source_bom_item,
+    order_item=_SOURCE_LOOKUP_REQUIRED,
+    *,
+    production_item=_SOURCE_LOOKUP_REQUIRED,
+):
+    """Trace the selected row against the device's own production material facts."""
+
+    if production_item is _SOURCE_LOOKUP_REQUIRED:
+        production_item = _source_production_subplan_item(inventory_item)
+    if production_item:
+        batch = inventory_item.source_production_batch
+        requirement = production_item.material_requirements.select_related("supplier").filter(
+            bom_item=source_bom_item,
+            bom_item__bom_id=batch.bom_id,
+            sales_bom_selection__order_plan_item_id=production_item.order_plan_item_id,
+            sales_bom_selection__frozen_bom_id=batch.bom_id,
+            material_id=source_bom_item.material_id,
+            material_spec_id=source_bom_item.material_spec_id,
+        ).first()
+        if not requirement:
+            raise FactoryReturnProcessError("所选物料缺少原生产批次的冻结物料明细，请先核对生产记录。")
+        material_lots = _production_material_lots(requirement, factory_id=batch.manufacturer_id)
+        if sum(row["consumed_milli"] for row in material_lots) != requirement.required_milli:
+            raise FactoryReturnProcessError("所选物料的原生产批次消耗记录不完整，请先核对物料批次。")
+        return {
+            "supplier": requirement.supplier,
+            "trace_source": DeviceMaterialFaultRecord.TraceSource.PRODUCTION_BATCH,
+            "trace_source_name": "原生产批次物料消耗",
+            "actual_binding_reference": "",
+            "material_batch": material_lots[0]["factory_batch_code"] if len(material_lots) == 1 else "",
+            "material_lots": material_lots,
+        }
+
+    if order_item is _SOURCE_LOOKUP_REQUIRED:
+        order_item = _source_order_item(inventory_item, production_item=None)
     confirmation = getattr(order_item, "bom_confirmation", None) if order_item else None
     confirmed_bom_item = _matching_bom_item(
         confirmation.confirmed_bom if confirmation else None,
         source_bom_item,
     )
     if confirmed_bom_item and confirmed_bom_item.supplier_id:
-        return {
-            "supplier": confirmed_bom_item.supplier,
-            "trace_source": DeviceMaterialFaultRecord.TraceSource.PRODUCTION_BATCH,
-            "trace_source_name": "原生产批次确认BOM",
-            "actual_binding_reference": "",
-            "material_batch": "",
-        }
-    if source_bom_item.supplier_id:
-        return {
-            "supplier": source_bom_item.supplier,
-            "trace_source": DeviceMaterialFaultRecord.TraceSource.BOM_INFERRED,
-            "trace_source_name": "BOM默认供应商推定",
-            "actual_binding_reference": "",
-            "material_batch": "",
-        }
+        supplier = confirmed_bom_item.supplier
+        trace_source = DeviceMaterialFaultRecord.TraceSource.PRODUCTION_BATCH
+    elif source_bom_item.supplier_id:
+        supplier = source_bom_item.supplier
+        trace_source = DeviceMaterialFaultRecord.TraceSource.BOM_INFERRED
+    else:
+        supplier = None
+        trace_source = DeviceMaterialFaultRecord.TraceSource.UNRESOLVED
     return {
-        "supplier": None,
-        "trace_source": DeviceMaterialFaultRecord.TraceSource.UNRESOLVED,
-        "trace_source_name": "供应商待确认",
+        "supplier": supplier,
+        "trace_source": trace_source,
+        "trace_source_name": trace_source.label,
         "actual_binding_reference": "",
         "material_batch": "",
+        "material_lots": [],
     }
 
 
@@ -2146,8 +2372,7 @@ def _serialize_material_warranty(snapshot):
     }
 
 
-def _bom_material_options(inventory_item):
-    order_item = _source_order_item(inventory_item)
+def _bom_material_options(inventory_item, *, order_item, production_item):
     existing = {
         row.source_bom_item_id: row
         for row in inventory_item.material_fault_records.select_related(
@@ -2175,7 +2400,9 @@ def _bom_material_options(inventory_item):
         "supplier",
     ).order_by("-material__is_key_part", "material__code", "id")
     for bom_item in bom_items:
-        trace = _resolve_material_trace(inventory_item, bom_item, order_item)
+        trace = _resolve_material_trace(
+            inventory_item, bom_item, order_item, production_item=production_item,
+        )
         fact = existing.get(bom_item.pk)
         repair_requirement = repair_existing.get(bom_item.pk)
         return_record = returned_existing.get(
@@ -2194,9 +2421,10 @@ def _bom_material_options(inventory_item):
             if return_record
             else (fact.trace_source if fact else trace["trace_source"])
         )
-        trace_name = dict(DeviceMaterialFaultRecord.TraceSource.choices).get(
-            trace_source,
-            trace["trace_source_name"],
+        trace_name = (
+            trace["trace_source_name"]
+            if trace_source == trace["trace_source"]
+            else dict(DeviceMaterialFaultRecord.TraceSource.choices).get(trace_source, "")
         )
         if return_record:
             warranty = {
@@ -2246,6 +2474,7 @@ def _bom_material_options(inventory_item):
                         else trace["material_batch"]
                     )
                 ),
+                "material_lots": trace["material_lots"],
                 # 关键件默认作为实物退回，生产经理可反选；故障标记独立。
                 "returned_selected": bool(return_record) or (
                     not has_return_records
@@ -2300,11 +2529,14 @@ def _create_repair_material_requirements(
 
     transfer = inventory_item.process.transfer
     device = inventory_item.transfer_item.device
-    order_item = _source_order_item(inventory_item)
+    production_item = _source_production_subplan_item(inventory_item)
+    order_item = _source_order_item(inventory_item, production_item=production_item)
     records = []
     for selection in selections:
         bom_item = bom_items[int(selection["bom_item_id"])]
-        trace = _resolve_material_trace(inventory_item, bom_item, order_item)
+        trace = _resolve_material_trace(
+            inventory_item, bom_item, order_item, production_item=production_item,
+        )
         spec = bom_item.material_spec
         supplier = trace["supplier"]
         records.append(
@@ -2341,8 +2573,22 @@ def _create_repair_material_requirements(
     return records
 
 
-def _serialize_repair_material_requirement(record):
+def _serialize_repair_material_requirement(record, *, production_item=_SOURCE_LOOKUP_REQUIRED):
     returned_record = getattr(record, "returned_material_record", None)
+    if (
+        not record.source_order_plan_item_id
+        or record.trace_source != DeviceMaterialFaultRecord.TraceSource.PRODUCTION_BATCH
+    ):
+        production_item = None
+    elif production_item is _SOURCE_LOOKUP_REQUIRED:
+        production_item = _source_production_subplan_item(record.inventory_item)
+    material_trace = (
+        _resolve_material_trace(
+            record.inventory_item, record.source_bom_item, production_item=production_item,
+        )
+        if production_item and production_item.order_plan_item_id == record.source_order_plan_item_id
+        else {}
+    )
     return {
         "id": record.pk,
         "schema_version": record.schema_version,
@@ -2356,7 +2602,14 @@ def _serialize_repair_material_requirement(record):
         "supplier_id": record.supplier_id,
         "supplier_name": record.supplier_name_snapshot or "供应商待确认",
         "trace_source": record.trace_source,
-        "trace_source_name": record.get_trace_source_display(),
+        "trace_source_name": material_trace.get("trace_source_name") or record.get_trace_source_display(),
+        "source_order_plan_id": record.source_order_plan_id,
+        "source_order_plan_item_id": record.source_order_plan_item_id,
+        "source_production_batch_id": record.source_production_batch_id,
+        "source_bom_id": record.source_bom_id,
+        "source_bom_item_id": record.source_bom_item_id,
+        "material_batch": material_trace.get("material_batch", ""),
+        "material_lots": material_trace.get("material_lots", []),
         "supplier_inferred": (
             record.trace_source
             == DeviceMaterialFaultRecord.TraceSource.BOM_INFERRED
@@ -2880,6 +3133,7 @@ def _publish_supplier_warranty_dispatches(*, inventory_item, actor, confirmed_at
                 "responsibility_source_name": recipients[
                     "responsibility_source_name"
                 ],
+                "source_delivery_ids": recipients.get("source_delivery_ids", []),
                 "unassigned_sales_material_ids": recipients[
                     "unassigned_sales_material_ids"
                 ],
@@ -2983,6 +3237,7 @@ def _publish_supplier_repair_material_requests(*, inventory_item, actor, confirm
                 "responsibility_source_name": recipients[
                     "responsibility_source_name"
                 ],
+                "source_delivery_ids": recipients.get("source_delivery_ids", []),
                 "unassigned_sales_material_ids": recipients[
                     "unassigned_sales_material_ids"
                 ],
@@ -3357,6 +3612,8 @@ def _serialize_inventory_item(item, can_post, role_codes=None):
     transfer_item = item.transfer_item
     device = transfer_item.device
     qrcode = getattr(device, "qrcode", None)
+    production_item = _source_production_subplan_item(item)
+    order_item = _source_order_item(item, production_item=production_item)
     fault_records = list(
         item.material_fault_records.select_related(
             "material",
@@ -3464,9 +3721,12 @@ def _serialize_inventory_item(item, can_post, role_codes=None):
             "version": item.source_bom.version,
             "version_no": item.source_bom.version_no,
         },
-        "bom_material_options": _bom_material_options(item),
+        "source_order": _source_order_trace(item, order_item, production_item),
+        "bom_material_options": _bom_material_options(
+            item, order_item=order_item, production_item=production_item,
+        ),
         "repair_material_requirements": [
-            _serialize_repair_material_requirement(record)
+            _serialize_repair_material_requirement(record, production_item=production_item)
             for record in repair_requirements
         ],
         "repair_material_summary": {
@@ -3789,6 +4049,7 @@ def _serialize_process(process, identity):
         inventory_summary[inventory_item.stock_status] += 1
     workflow_tasks = _serialize_role_workflow_tasks(transfer, identity)
     return {
+        "root_organization": goods_transfer_root_payload(transfer),
         "transfer": {
             "id": transfer.pk,
             "flow_no": transfer.flow_no,

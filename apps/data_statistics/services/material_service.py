@@ -1,22 +1,37 @@
-from django.db.models import Count, Q, Sum
+from django.db.models import Count, F, Q
 from django.utils import timezone
 
 from lifecycle.models import DeviceMaterialFaultRecord
-from sales.models import OrderPlanItemMaterialBatch
-from supply_chain.models import SupplierMaterialBatch
+from sales.services.supplier_batch_trace_service import consumed_material_lots
 from supply_chain.models import FactoryMaterialLot
 from supply_chain.services.material_inventory_service import quantity_text
 
 
+MATERIAL_METRIC_DEFINITIONS = {
+    "material_batch_count": {
+        "description": "存在实际配套消耗的去重厂家入库批次。",
+        "source_models": ["supply_chain.FactoryMaterialLot", "sales.OrderPlanMaterialLotAllocation"],
+    },
+    "material_covered_device_count": {
+        "description": "通过实际配套消耗关联至生产批次的已生成设备，按设备去重。",
+        "source_models": [
+            "sales.OrderPlanMaterialLotAllocation", "sales.OrderPlanProductionSubplanItem",
+            "manufacturing.ProductionBatch", "lifecycle.Device",
+        ],
+    },
+}
+
+
 def _usage_scope(identity):
-    qs = OrderPlanItemMaterialBatch.objects.select_related(
-        "supplier_material_batch__supplier", "bom_item__material",
-    )
     if identity.organization_type == "OWNER":
-        return qs.filter(order_plan_item__plan__factory_organization=identity.organization)
+        return consumed_material_lots(factory_id=identity.organization.pk)
     if identity.organization_type == "SUPPLIER":
-        return qs.filter(supplier_material_batch__supplier=identity.organization)
-    return qs.none()
+        root = identity.organization.get_factory_root()
+        if root:
+            return consumed_material_lots(factory_id=root.pk).filter(
+                requirement__supplier=identity.organization,
+            )
+    return consumed_material_lots().none()
 
 
 def _fault_scope(identity):
@@ -31,26 +46,36 @@ def _fault_scope(identity):
 def build_material_statistics(identity):
     usages = _usage_scope(identity)
     faults = _fault_scope(identity)
-    batch_ids = usages.values("supplier_material_batch_id")
-    batches = SupplierMaterialBatch.objects.filter(id__in=batch_ids)
-    # 同一订单明细会为多个 BOM 物料行各生成一条 usage，必须先按订单
-    # 明细去重，否则会把设备计划数量乘以 BOM 行数。
-    covered_quantity = sum(
-        row["order_plan_item__quantity"]
-        for row in usages.values(
-            "order_plan_item_id", "order_plan_item__quantity",
-        ).distinct()
+    subplan_item = "requirement__production_subplan_item"
+    batch = subplan_item + "__production_batch"
+    factory = subplan_item + "__order_plan_item__plan__factory_organization_id"
+    batch_count = Count("material_lot_id", distinct=True)
+    # Consumption can precede device creation. Count each real device once,
+    # even if it is covered by several requirements or receipt lots.
+    device_count = Count(
+        batch + "__devices",
+        filter=Q(**{batch + "__manufacturer_id": F(factory)}),
+        distinct=True,
     )
-    fault_devices = faults.values("device_id").distinct().count()
+    metrics = usages.aggregate(
+        material_batch_count=batch_count,
+        material_usage_count=Count("pk", distinct=True),
+        material_covered_device_count=device_count,
+    )
+    metrics["material_fault_device_count"] = faults.values("device_id").distinct().count()
     supplier_rows = list(
-        usages.values("supplier_material_batch__supplier_id", "supplier_material_batch__supplier__name")
-        .annotate(batch_count=Count("supplier_material_batch_id", distinct=True), planned_device_quantity=Sum("order_plan_item__quantity"))
-        .order_by("-planned_device_quantity")[:10]
+        usages.values(supplier_id=F("requirement__supplier_id"), supplier_name=F("requirement__supplier__name"))
+        .annotate(batch_count=batch_count, device_count=device_count)
+        .order_by("-device_count", "supplier_id")[:10]
     )
     material_rows = list(
-        usages.values("bom_item__material_id", "bom_item__material__code", "bom_item__material__name")
-        .annotate(batch_count=Count("supplier_material_batch_id", distinct=True), planned_device_quantity=Sum("order_plan_item__quantity"))
-        .order_by("-planned_device_quantity")[:10]
+        usages.values(
+            material_id=F("requirement__material_id"),
+            material_code=F("requirement__material__code"),
+            material_name=F("requirement__material__name"),
+        )
+        .annotate(batch_count=batch_count, device_count=device_count)
+        .order_by("-device_count", "material_id")[:10]
     )
     fault_rows = list(
         faults.exclude(material_id=None).values("material_id", "material__code", "material__name")
@@ -59,13 +84,8 @@ def build_material_statistics(identity):
     )
     return {
         "domain": "MATERIAL",
-        "metrics": {
-            "material_batch_count": batches.count(),
-            "material_usage_count": usages.count(),
-            "material_covered_device_count": covered_quantity,
-            "material_fault_device_count": fault_devices,
-        },
-        "metric_note": "配套设备数当前按订单明细计划数量统计；待建立逐台订单—设备绑定事实后升级为真实去重设备数。",
+        "metrics": metrics,
+        "metric_note": "物料批次按实际消耗的厂家入库批次去重。配套记录按物料需求与入库批次之间的实际消耗记录统计。配套设备按关联生产批次已生成的设备去重。",
         "charts": {
             "supplier_distribution": supplier_rows,
             "material_distribution": material_rows,
@@ -80,7 +100,7 @@ def build_factory_material_lot_catalog(identity, *, query="", cursor=None):
     The material warehouse page is for operations and targeted lookup. This
     read-only catalog is the only routine place to browse all historical lots.
     """
-    if identity.role.code != "factory_material_stock" or identity.organization_type != "OWNER":
+    if not identity.can_view_warehouse_lots:
         raise PermissionError("当前岗位无权查看厂家物料批次清单。")
     rows = FactoryMaterialLot.objects.select_related(
         "stock__supplier", "stock__material_spec__material",

@@ -32,6 +32,7 @@ class QualityTraceFoundationTests(TestCase):
         )
         cls.merchant = Organization.objects.create(
             name="质量测试商家", code="QUALITY-MERCHANT", organization_type=cls.merchant_type,
+            factory_root=cls.factory,
         )
         cls.factory_role = OrganizationRole.objects.get(
             organization_type=cls.factory_type, code="factory_chief_engineer",

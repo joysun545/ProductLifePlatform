@@ -1,0 +1,11 @@
+/* Persistent viewport backdrop; never intercepts content, links or QR scans. */
+#pldp-fourier-background{position:fixed;inset:0;width:100vw;height:100vh;height:100dvh;z-index:0;pointer-events:none;user-select:none;display:block;background:transparent}
+body>main{position:relative;z-index:1}
+body>header{z-index:30}
+@media print{#pldp-fourier-background{display:none!important}}
+/* Let the shared backdrop remain faintly visible through workflow panels. */
+#explore .demo{background:rgba(255,255,255,.66)}
+#explore .demo>aside:first-child{background:rgba(250,251,248,.78)}
+#explore .stage .action-card{background:rgba(245,247,242,.86)}
+#explore .result{background:rgba(237,242,237,.78)}
+/* The phone preview, its dialogs and the real login QR retain their solid backgrounds. */

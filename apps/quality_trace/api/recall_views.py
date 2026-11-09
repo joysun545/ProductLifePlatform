@@ -1,10 +1,7 @@
 import json
-from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import UUID
 
-from django.conf import settings
 from django.core.cache import cache
-from django.core.files.storage import FileSystemStorage
 from django.http import HttpResponse, JsonResponse
 from django.db.models import Q
 from django.utils import timezone
@@ -61,6 +58,10 @@ from quality_trace.services import (
     start_recall_post_disposition,
 )
 from quality_trace.services.recall_service import ensure_recall_campaign
+from quality_trace.services.recall_transport_service import (
+    FACTORY_ISOLATION_ROLES, FACTORY_RECEIPT_ROLES, MERCHANT_ROLES,
+)
+from quality_trace.services.recall_evidence_service import save_recall_evidence
 from quality_trace.services.recall_task_service import get_recall_task_scope
 from quality_trace.services.recall_batch_service import execute_recall_batch, get_recall_batch_groups
 from workflow.models import UserTask
@@ -99,7 +100,10 @@ def evidence_upload(request):
     user, error = _user(request)
     if error:
         return error
-    identity = _identity(user)
+    try:
+        identity = _identity(user)
+    except QualityRecallError as exc:
+        return _error(exc)
     from quality_trace.services.recall_access_service import FACTORY_RECALL_OBSERVER_ROLES
     if RecallViewer(user).has_role(FACTORY_RECALL_OBSERVER_ROLES):
         return _error("本岗位仅接收召回知晓通知，无凭证上传权限。")
@@ -116,23 +120,16 @@ def evidence_upload(request):
     )
     if not allowed:
         return _error("仅支持图片、视频或PDF凭证。")
-    suffix = Path(uploaded.name or "evidence").suffix.lower()[:12]
-    key = f"recall_evidence/{timezone.now():%Y/%m}/{uuid4().hex}{suffix}"
-    root = getattr(
-        settings, "QUALITY_RECALL_PRIVATE_ROOT",
-        settings.BASE_DIR / "private_quality_recall",
-    )
-    storage = FileSystemStorage(location=root, base_url=None)
-    saved_key = storage.save(key, uploaded)
+    try:
+        evidence = save_recall_evidence(
+            uploaded=uploaded, content_type=content_type, identity=identity,
+        )
+    except QualityRecallError as exc:
+        return _error(exc)
     return JsonResponse({
         "code": 0,
         "msg": "凭证上传成功",
-        "data": {
-            "storage_key": saved_key,
-            "original_name": uploaded.name,
-            "content_type": content_type,
-            "file_size": uploaded.size,
-        },
+        "data": evidence,
     }, status=200)
 
 
@@ -322,6 +319,10 @@ def _device(row, user=None):
         "id": row.pk,
         "device_id": row.device_id,
         "campaign_id": row.campaign_id,
+        "root_organization": {
+            "id": row.campaign.factory_organization_id,
+            "name": row.campaign.factory_organization.name,
+        },
         "sn": row.sn_snapshot,
         "status": row.status,
         "product_model": row.product_model_snapshot,
@@ -330,6 +331,24 @@ def _device(row, user=None):
         "source_state": ({"label": _device_source_state(row)["label"]} if supplier_view else _device_source_state(row)),
         "handover": None if supplier_view else _handover(row, user=user),
         "transport_legs": [] if supplier_view else [_leg(item) for item in transport_legs],
+        "available_actions": {
+            "transport_receive": bool(
+                viewer and viewer.allows(row) and row.campaign.status == "ACTIVE"
+                and latest_leg and latest_leg.status == "IN_TRANSIT"
+                and latest_leg.to_organization_id == viewer.organization_id
+                and viewer.has_role(
+                    FACTORY_RECEIPT_ROLES if latest_leg.is_factory_destination else MERCHANT_ROLES,
+                )
+                and has_action_task_copy(f"quality-recall-transport:{latest_leg.pk}:receive")
+            ),
+            "inventory_post": bool(
+                factory_actor and latest_leg and latest_leg.is_factory_destination
+                and latest_leg.to_organization_id == viewer.organization_id
+                and latest_leg.status == "RECEIVED" and not isolation
+                and viewer.has_role(FACTORY_ISOLATION_ROLES)
+                and has_action_task_copy(f"quality-recall-transport:{latest_leg.pk}:inventory-posting")
+            ),
+        },
         "current_stage": current_stage,
         "current_stage_label": current_stage_label,
         "next_step": stage["next_step"],
@@ -407,6 +426,10 @@ def _device(row, user=None):
 def _campaign(row, include_devices=False, *, device_count=None, scope_label="", viewer=None):
     data = {
         "id": row.pk,
+        "root_organization": {
+            "id": row.factory_organization_id,
+            "name": row.factory_organization.name,
+        },
         "recall_no": row.recall_no,
         "quality_case_id": row.quality_case_id,
         "title": row.title,
@@ -433,6 +456,14 @@ def _campaign(row, include_devices=False, *, device_count=None, scope_label="", 
         "all_accounted": accounted == row.device_count,
         "batch_confirmed": bool(confirmation),
         "confirmed_at": confirmation.confirmed_at.isoformat() if confirmation else "",
+        "can_confirm_batch": bool(
+            not confirmation and accounted == row.device_count and row.status == "ACTIVE"
+            and viewer and viewer.factory(row) and viewer.has_role(FACTORY_ISOLATION_ROLES)
+            and viewer.has_action_task_copy((
+                f"quality-recall:{row.pk}:batch-posting-confirm",
+                f"quality-recall:{row.pk}:org:{row.factory_organization_id}",
+            ))
+        ),
     }
     dispositions = row.post_dispositions.all()
     disposition_count = dispositions.count()
@@ -539,7 +570,10 @@ def campaigns(request):
     user, error = _user(request)
     if error:
         return error
-    identity = _identity(user)
+    try:
+        _identity(user)
+    except QualityRecallError as exc:
+        return _error(exc)
     if request.method == "POST":
         payload = _data(request)
         try:
@@ -624,6 +658,8 @@ def _post(request, callback):
         if RecallViewer(user).has_role(FACTORY_RECALL_OBSERVER_ROLES):
             raise QualityRecallError("本岗位仅接收召回知晓通知，无召回操作权限。")
         return callback(user, _data(request))
+    except QualityRecallCustomerHandover.DoesNotExist:
+        return _error("召回交接单不存在，请刷新召回详情后重试。")
     except (QualityCaseError, QualityRecallError, TypeError, ValueError) as exc:
         return _error(exc)
 
@@ -868,7 +904,9 @@ def merchant_transfer_accept(request):
         if not received and (handover.method_locked_at or not handover.merchant_transfer_expires_at
                              or handover.merchant_transfer_expires_at <= timezone.now()):
             return _error("临时召回流转码已失效，请让用户刷新交付方式。")
+        root = handover.campaign.factory_organization.get_factory_root()
         return JsonResponse({"code": 0, "msg": "", "data": {
+            "root_organization": {"id": root.pk, "name": root.name} if root else None,
             "recall_device_id": handover.recall_device_id,
             "campaign_id": handover.campaign_id, "recall_no": handover.campaign.recall_no,
             "sn": handover.recall_device.sn_snapshot,
@@ -882,10 +920,12 @@ def merchant_transfer_accept(request):
             token=data.get("token"),
             receipt_note=data.get("receipt_note"),
         )
+        root = handover.campaign.factory_organization.get_factory_root()
         return JsonResponse({
             "code": 0,
             "msg": "召回设备已由来源商家接管",
             "data": {
+                "root_organization": {"id": root.pk, "name": root.name} if root else None,
                 "handover_id": handover.pk,
                 "recall_device_id": handover.recall_device_id,
             },

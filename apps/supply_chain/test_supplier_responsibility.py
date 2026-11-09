@@ -88,8 +88,8 @@ class SupplierResponsibilityTests(TestCase):
         material = Material.objects.create(
             code=code,
             name=name,
-            product_category=self.category,
         )
+        material.product_categories.add(self.category)
         spec = MaterialSpec.objects.create(
             material=material,
             code=f"{code}-SPEC",
@@ -199,8 +199,8 @@ class SupplierResponsibilityTests(TestCase):
         other_material = Material.objects.create(
             code="RESP-OTHER-MATERIAL",
             name="非本组织供应物料",
-            product_category=self.category,
         )
+        other_material.product_categories.add(self.category)
 
         with self.assertRaises(SupplierResponsibilityError):
             self._assign(

@@ -1,0 +1,18 @@
+/* The formula canvas is the lowest decorative layer, below the existing
+   Fourier logo/QR wall. Both are fixed siblings before the page content. */
+#pldp-sea-slug-background {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
+  z-index: 0;
+  pointer-events: none;
+  user-select: none;
+  display: block;
+  background: transparent;
+}
+
+@media print {
+  #pldp-sea-slug-background { display: none !important; }
+}

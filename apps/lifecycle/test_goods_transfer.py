@@ -15,6 +15,7 @@ from account.models import (
     OrganizationRole,
     OrganizationType,
     RoleInvitationRule,
+    SeniorManagerProfile,
     User,
     UserOrganization,
 )
@@ -1039,6 +1040,59 @@ class GoodsTransferApiTests(TestCase):
         )
         self.assertEqual(forbidden_receipt.json()["code"], 1)
 
+    def test_vacant_factory_roles_receive_return_pickup_and_posting_tasks(self):
+        manager_role = OrganizationRole.objects.get(code="factory_senior_manager")
+        logistics = self._user("vacant_return_logistics", self.factory, manager_role)
+        posting = self._user("vacant_return_posting", self.factory, manager_role)
+        SeniorManagerProfile.objects.create(identity=logistics.organization_identity).managed_roles.add(
+            self.factory_logistics_role,
+        )
+        SeniorManagerProfile.objects.create(identity=posting.organization_identity).managed_roles.add(
+            self.factory_sales_assistant.organization_identity.role,
+            self.factory_stock.organization_identity.role,
+            self.factory_production_role,
+            self.factory_matching_role,
+        )
+        UserOrganization.objects.filter(
+            user__in=(self.factory_logistics, self.factory_sales_assistant,
+                      self.factory_stock, self.factory_production, self.factory_matching),
+        ).update(is_active=False)
+        device = self.devices[0]
+        self.set_owner(device, self.parent)
+        flow = self.create_flow(
+            self.parent_stock,
+            {"flow_type": "RETURN", "client_request_id": "vacant-return-roles",
+             "target_account_id": self.factory_sales.pk},
+        )
+        submitted = self.scan_and_submit(self.parent_stock, flow["id"], device)
+        self.assertEqual(submitted["status"], "PENDING_FACTORY_PICKUP")
+        prefix = f"{self.endpoint}{flow['id']}/factory-return/"
+        pickup_task = WorkItem.objects.get(type="FACTORY_RETURN_PICKUP")
+        self.assertEqual(
+            list(pickup_task.user_tasks.filter(need_action=True).values_list("to_openid", flat=True)),
+            [logistics.wx_openid],
+        )
+        rejected = self.client.post(prefix + "pickup/", {}, **self.auth(posting)).json()
+        self.assertNotEqual(rejected["code"], 0)
+        picked = self.client.post(prefix + "pickup/", {}, **self.auth(logistics)).json()
+        self.assertEqual(picked["code"], 0, picked)
+        post_task = WorkItem.objects.get(type="FACTORY_RETURN_POSTING")
+        self.assertTrue(post_task.user_tasks.filter(to_openid=posting.wx_openid, need_action=True).exists())
+        posted = self.client.post(
+            prefix + "posting/",
+            {"items": [{"item_id": picked["data"]["items"][0]["goods_transfer_item_id"],
+                        "stock_status": "PENDING_REPAIR"}]},
+            content_type="application/json",
+            **self.auth(posting),
+        ).json()
+        self.assertEqual(posted["code"], 0, posted)
+        process = FactoryReturnProcess.objects.get(transfer_id=flow["id"])
+        self.assertEqual(process.picked_by_id, logistics.pk)
+        self.assertEqual(process.posted_by_id, posting.pk)
+        self.assertTrue(WorkItem.objects.get(
+            type="FACTORY_RETURN_REPAIR_PRODUCTION",
+        ).user_tasks.filter(to_openid=posting.wx_openid, need_action=True).exists())
+
     def test_factory_return_final_submit_requires_goods_list_atomically(self):
         device = self.devices[0]
         self.set_owner(device, self.parent)
@@ -1540,9 +1594,12 @@ class GoodsTransferApiTests(TestCase):
                 },
             },
         )
-        with patch(
-            "lifecycle.services.factory_return_service._source_order_item",
-            return_value=SimpleNamespace(plan_id=9001),
+        with (
+            patch("lifecycle.services.factory_return_service._source_production_subplan_item", return_value=None),
+            patch(
+                "lifecycle.services.factory_return_service._source_order_item",
+                return_value=SimpleNamespace(plan_id=9001),
+            ),
         ):
             recipients = _original_supplier_task_recipients(
                 inventory_item=object(),
@@ -1594,9 +1651,12 @@ class GoodsTransferApiTests(TestCase):
                 },
             },
         )
-        with patch(
-            "lifecycle.services.factory_return_service._source_order_item",
-            return_value=SimpleNamespace(plan_id=9002),
+        with (
+            patch("lifecycle.services.factory_return_service._source_production_subplan_item", return_value=None),
+            patch(
+                "lifecycle.services.factory_return_service._source_order_item",
+                return_value=SimpleNamespace(plan_id=9002),
+            ),
         ):
             recipients = _original_supplier_task_recipients(
                 inventory_item=object(),

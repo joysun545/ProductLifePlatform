@@ -1,12 +1,15 @@
 import calendar
+import hashlib
+import logging
 import math
+import time
 import uuid
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from django.core.exceptions import ObjectDoesNotExist
-from django.db import transaction
+from django.db import IntegrityError, OperationalError, transaction
 from django.db.models import F, Q
 from django.utils import timezone
 
@@ -16,6 +19,7 @@ from account.services.role_delegation_service import (
     SENIOR_MANAGER_ROLE_CODES,
     has_open_action_task_copy,
     identity_has_role,
+    vacant_role_manager_openids,
 )
 from lifecycle.models import (
     AfterSalesApplication,
@@ -27,7 +31,11 @@ from lifecycle.models import (
     Device,
     LifecycleEvent,
 )
-from lifecycle.services.customer_service import CustomerDeviceService, CustomerFlowStateError
+from lifecycle.services.customer_service import (
+    CustomerDeviceService,
+    CustomerFlowPermissionError,
+    CustomerFlowStateError,
+)
 from supply_chain.models import (
     MaterialFaultCause,
     MaterialSpecSupplier,
@@ -75,6 +83,10 @@ class AfterSalesService:
     """
 
     APPLICATION_MEDIA_LIMIT = 9
+    DRAFT_EVIDENCE_PURPOSES = {
+        AfterSalesMedia.Purpose.APPLICATION_EVIDENCE,
+        AfterSalesMedia.Purpose.PLATE_PRESENCE_EVIDENCE,
+    }
     OTHER_MEDIA_LIMIT = 9
     IMAGE_MAX_BYTES = 20 * 1024 * 1024
     VIDEO_MAX_BYTES = 200 * 1024 * 1024
@@ -289,8 +301,10 @@ class AfterSalesService:
             }
         else:
             active_data = cls.serialize(active, detail=True) if active else None
+        root = device.batch.manufacturer
         return {
             **snapshot,
+            "root_organization": {"id": root.pk, "name": root.name},
             "applicant": {
                 "role_code": identity.role.code,
                 "role_name": identity.role.name,
@@ -342,6 +356,24 @@ class AfterSalesService:
             "expires_at": proof.expires_at.isoformat(),
         }
 
+    @staticmethod
+    def _require_activated_device(device):
+        if not CustomerDeviceService.is_activated(device):
+            raise AfterSalesError("设备尚未激活，请先完成激活后再申请售后")
+
+    @classmethod
+    def _require_live_draft_device(cls, application, user):
+        try:
+            identity, device, _ = CustomerDeviceService._owned_device_context(
+                device_id=application.device_id, user=user
+            )
+        except (CustomerFlowPermissionError, CustomerFlowStateError) as exc:
+            raise AfterSalesError(str(exc)) from exc
+        if identity.organization_id != application.customer_organization_id:
+            raise AfterSalesError("当前账号已无权办理此售后草稿")
+        cls._require_activated_device(device)
+        return identity
+
     @classmethod
     @transaction.atomic
     def save_draft(cls, *, device_id, user, data):
@@ -359,6 +391,7 @@ class AfterSalesService:
         incoming = ReplacementFlow.objects.filter(application__replacement_device=device).first()
         if incoming and (not incoming.swapped_at or not ActivationRecord.objects.filter(device=device,status='ACTIVATED').exists()):
             raise AfterSalesError('换新设备尚未完成签收或售后激活，请先扫描设备编码激活')
+        cls._require_activated_device(device)
         factory = device.batch.manufacturer if device.batch_id else None
         if not factory:
             raise AfterSalesError("设备缺少原生产厂家，暂不能申请售后")
@@ -371,6 +404,8 @@ class AfterSalesService:
             raise AfterSalesError("该设备已有进行中的售后申请")
         if application and application.applicant_id != user.id:
             raise AfterSalesError("该设备已有其他账号创建的售后草稿")
+        if application and application.customer_organization_id != identity.organization_id:
+            raise AfterSalesError("当前账号已无权办理此售后草稿")
 
         snapshot = cls._snapshot(device)
         activation_method = snapshot["activation"].get("activation_method") or ""
@@ -970,10 +1005,7 @@ class AfterSalesService:
         if media_allowed(cls, application, user, purpose):
             return True
         if (
-            purpose in {
-                AfterSalesMedia.Purpose.APPLICATION_EVIDENCE,
-                AfterSalesMedia.Purpose.PLATE_PRESENCE_EVIDENCE,
-            }
+            purpose in cls.DRAFT_EVIDENCE_PURPOSES
             and cls._is_applicant(application, user)
             and application.status == AfterSalesApplication.Status.DRAFT
         ):
@@ -1059,7 +1091,6 @@ class AfterSalesService:
         raise AfterSalesError("附件类型必须是图片、视频或单据")
 
     @classmethod
-    @transaction.atomic
     def upload_media(
         cls,
         *,
@@ -1070,7 +1101,41 @@ class AfterSalesService:
         purpose=None,
         duration_seconds=None,
         caption="",
+        evidence_context=None,
     ):
+        # A FileField saves storage before its INSERT. Reserve the database
+        # slot first inside _upload_media_once, and clean any new private file
+        # if that transaction fails. Retry whole transactions, never a broken
+        # savepoint; SQLite's select_for_update is not a row lock.
+        for attempt in range(3):
+            created_files = []
+            try:
+                if uploaded_file:
+                    uploaded_file.seek(0)
+                return cls._upload_media_once(
+                    application_id=application_id, user=user, uploaded_file=uploaded_file,
+                    media_type=media_type, purpose=purpose, duration_seconds=duration_seconds,
+                    caption=caption, evidence_context=evidence_context or {},
+                    created_files=created_files,
+                )
+            except Exception as exc:
+                for storage, name in created_files:
+                    try:
+                        storage.delete(name)
+                    except Exception:
+                        logging.getLogger(__name__).exception("Failed to clean rolled-back aftersales upload %s", name)
+                if evidence_context and isinstance(exc, (IntegrityError, OperationalError)):
+                    if attempt < 2:
+                        time.sleep(0.02 * (attempt + 1))
+                        continue
+                    raise AfterSalesError("本段附件正在由其他请求更新，请使用原上传标识重试") from exc
+                raise
+
+    @classmethod
+    @transaction.atomic
+    def _upload_media_once(cls, *, application_id, user, uploaded_file, media_type,
+                           purpose, duration_seconds, caption, evidence_context, created_files):
+        from lifecycle.services import aftersales_evidence_service as E
         application = (
             AfterSalesApplication.objects.select_for_update()
             .filter(pk=application_id)
@@ -1088,8 +1153,39 @@ class AfterSalesService:
             raise AfterSalesError("附件类型必须是图片、视频或单据")
         if purpose not in valid_purposes:
             raise AfterSalesError("附件用途不正确")
-        if not cls._media_purpose_allowed(application, user, purpose):
+        scope = None
+        request_id = None
+        digest = ""
+        existing = None
+        if evidence_context.get("evidence_action"):
+            if purpose != E.PURPOSE:
+                raise AfterSalesError("物流段凭证用途不正确")
+            try:
+                request_id = uuid.UUID(str(evidence_context.get("client_upload_id") or ""))
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise AfterSalesError("请提供本次文件的固定上传标识") from exc
+            existing = application.media.filter(uploaded_by=user, client_upload_id=request_id).first()
+            scope = E.resolve(application, user, evidence_context, require_pending=not bool(existing))
+            E.validate_type(scope, media_type)
+        elif E.requires_scope(application, user, purpose):
+            raise AfterSalesError("请刷新页面并选择本次物流段后上传凭证")
+        if not existing and not cls._media_purpose_allowed(application, user, purpose):
             raise AfterSalesError("当前身份或处理阶段不能上传该类附件")
+        cls._validate_uploaded_file(uploaded_file=uploaded_file, media_type=media_type)
+        if scope:
+            digest = hashlib.sha256()
+            for chunk in uploaded_file.chunks():
+                digest.update(chunk)
+            digest = digest.hexdigest()
+            uploaded_file.seek(0)
+            if existing:
+                if (existing.evidence_scope_key != scope["key"] or existing.evidence_kind != scope["kind"]
+                        or existing.purpose != purpose or existing.media_type != media_type
+                        or existing.content_sha256 != digest):
+                    raise AfterSalesError("上传标识已用于不同文件或物流段，请勿重复使用")
+                return cls.serialize_media(existing)
+        if purpose in cls.DRAFT_EVIDENCE_PURPOSES:
+            cls._require_live_draft_device(application, user)
         if (
             purpose == AfterSalesMedia.Purpose.PLATE_PRESENCE_EVIDENCE
             and media_type != AfterSalesMedia.MediaType.IMAGE
@@ -1102,9 +1198,14 @@ class AfterSalesService:
             if purpose == AfterSalesMedia.Purpose.PLATE_PRESENCE_EVIDENCE
             else cls.OTHER_MEDIA_LIMIT
         )
-        if application.media.filter(purpose=purpose).count() >= max_count:
+        slot = None
+        if scope:
+            used = set(application.media.filter(evidence_scope_key=scope["key"]).values_list("scope_slot", flat=True))
+            slot = next((value for value in range(1, E.LIMIT + 1) if value not in used), None)
+            if slot is None:
+                raise AfterSalesError("本段物流凭证合计最多上传9个")
+        elif application.media.filter(purpose=purpose, evidence_scope_key__isnull=True).count() >= max_count:
             raise AfterSalesError(f"该类附件最多上传{max_count}个")
-        cls._validate_uploaded_file(uploaded_file=uploaded_file, media_type=media_type)
         try:
             duration_seconds = int(duration_seconds) if duration_seconds else None
         except (TypeError, ValueError):
@@ -1116,15 +1217,33 @@ class AfterSalesService:
             application=application,
             media_type=media_type,
             purpose=purpose,
-            file=uploaded_file,
+            file="",
             original_name=uploaded_file.name,
             caption=caption,
             content_type=getattr(uploaded_file, "content_type", ""),
             file_size=uploaded_file.size,
             duration_seconds=duration_seconds,
+            evidence_scope_key=scope["key"] if scope else None,
+            scope_slot=slot,
+            evidence_kind=scope["kind"] if scope else "",
+            client_upload_id=request_id,
+            content_sha256=digest,
             sequence=application.media.count(),
             uploaded_by=user,
         )
+        field = AfterSalesMedia._meta.get_field("file")
+        storage = field.storage
+        name = field.generate_filename(media, uploaded_file.name)
+        while storage.exists(name):
+            name = field.generate_filename(media, uploaded_file.name)
+        # Track the intended random name before writing so a partially failed
+        # storage.save can be removed as well as a later database rollback.
+        created_files.append((storage, name))
+        saved_name = storage.save(name, uploaded_file, max_length=field.max_length)
+        if saved_name != name:
+            created_files.append((storage, saved_name))
+        media.file = saved_name
+        media.save(update_fields=("file",))
         cls._event(
             application,
             "MEDIA_UPLOADED",
@@ -1134,13 +1253,15 @@ class AfterSalesService:
                 "media_type": media_type,
                 "purpose": purpose,
                 "caption": caption,
+                "evidence_scope_key": media.evidence_scope_key,
+                "evidence_kind": media.evidence_kind,
             },
         )
         return cls.serialize_media(media)
 
     @classmethod
-    def _factory_aftersales_openids(cls, application):
-        return list(
+    def _factory_aftersales_openids(cls, application, *, need_action=False):
+        recipients = list(
             UserOrganization.objects.filter(
                 organization_id=application.factory_organization_id,
                 role__code="factory_aftersales",
@@ -1151,6 +1272,11 @@ class AfterSalesService:
             .exclude(user__wx_openid="")
             .values_list("user__wx_openid", flat=True)
         )
+        if need_action:
+            recipients.extend(vacant_role_manager_openids(
+                application.factory_organization, {"factory_aftersales"},
+            ))
+        return recipients
 
     @staticmethod
     def _link(application):
@@ -1339,7 +1465,9 @@ class AfterSalesService:
             title=title,
             summary=summary,
             link=cls._link(application),
-            recipients_openids=cls._factory_aftersales_openids(application),
+            recipients_openids=cls._factory_aftersales_openids(
+                application, need_action=need_action,
+            ),
             need_action=need_action,
             action_mode="ANYONE_DO",
             payload=cls._task_payload(
@@ -1471,19 +1599,30 @@ class AfterSalesService:
     @classmethod
     @transaction.atomic
     def submit(cls, *, application_id, user):
-        identity = CustomerDeviceService._customer_identity(user)
         application = (
             AfterSalesApplication.objects.select_for_update()
             .select_related("applicant", "factory_organization")
             .filter(pk=application_id)
             .first()
         )
-        if (
-            not application
-            or application.applicant_id != user.id
-            or application.status != AfterSalesApplication.Status.DRAFT
-        ):
+        if not application or application.applicant_id != user.id:
             raise AfterSalesError("当前售后申请不能提交")
+        if application.status != AfterSalesApplication.Status.DRAFT:
+            if not application.submitted_at:
+                raise AfterSalesError("当前售后申请不能提交")
+            from lifecycle.services.aftersales_access import visible_cases
+
+            identity = cls._identity(user)
+            if (
+                not identity
+                or identity.organization_id != application.customer_organization_id
+                or not visible_cases(user, identity).filter(pk=application.pk).exists()
+            ):
+                raise AfterSalesError("当前售后申请不能提交")
+            # The locked application already has its submission receipt.
+            # Return its current state without repeating events or task delivery.
+            return cls.serialize(application)
+        identity = cls._require_live_draft_device(application, user)
         if not application.fault_description:
             raise AfterSalesError("请填写故障描述")
         cls._validate_location(application)
@@ -1509,7 +1648,7 @@ class AfterSalesService:
             media_type=AfterSalesMedia.MediaType.IMAGE,
         ).exists():
             raise AfterSalesError("请拍摄并上传包含车牌号的实时照片")
-        recipients = cls._factory_aftersales_openids(application)
+        recipients = cls._factory_aftersales_openids(application, need_action=True)
         if not recipients:
             raise AfterSalesError("厂家尚未配置厂家售后经理，暂不能提交")
         application.status = AfterSalesApplication.Status.SUBMITTED
@@ -2884,6 +3023,10 @@ class AfterSalesService:
             "notice_type": "SUPPLIER_QUALITY",
             "notice_title": "售后物料质量知晓通知",
             "case_no": application.case_no,
+            "root_organization": {
+                "id": application.factory_organization_id,
+                "name": application.factory_organization.name,
+            },
             "factory_name": application.factory_organization.name,
             "supplier": {"id": supplier_id, "name": identity.organization.name},
             "device": {
@@ -3466,6 +3609,9 @@ class AfterSalesService:
             "caption": media.caption,
             "file_size": media.file_size,
             "duration_seconds": media.duration_seconds,
+            "evidence_scope_key": media.evidence_scope_key,
+            "evidence_kind": media.evidence_kind,
+            "client_upload_id": str(media.client_upload_id) if media.client_upload_id else "",
             "uploaded_by": _user_name(media.uploaded_by),
             "created_at": media.created_at.isoformat(),
             "url": f"/api/lifecycle/after-sales/media/{media.id}/file/",
@@ -3486,9 +3632,11 @@ class AfterSalesService:
             or application.device.physical_device_code
             or ""
         )
+        root = application.factory_organization
         data = {
             "escalation": application.escalation or {},
             "id": application.id,
+            "root_organization": {"id": root.pk, "name": root.name},
             "case_no": application.case_no,
             "status": application.status,
             "status_name": application.get_status_display(),

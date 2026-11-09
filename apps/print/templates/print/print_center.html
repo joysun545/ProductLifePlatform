@@ -7,13 +7,22 @@
   <style>
     *{box-sizing:border-box}body{margin:0;padding:28px;background:#f4f7f6;color:#17251f;font-family:"Microsoft YaHei",Arial,sans-serif}.container{max-width:1180px;margin:auto}.header,.panel{background:#fff;border-radius:16px;box-shadow:0 5px 20px rgba(0,0,0,.06)}.header{padding:24px;margin-bottom:22px;text-align:center}.header h1{margin:0;font-size:25px}.header p{margin:9px 0 0;color:#66756c}.panel{padding:24px;margin-bottom:22px}.panel-title{margin:0 0 18px;font-size:19px}label{display:block;margin:0 0 8px;font-weight:700}select{width:100%;min-height:44px;padding:10px 12px;border:1px solid #cfdad5;border-radius:8px;background:#fff;font-size:15px}.hint,.empty,.message{margin-top:14px;padding:13px 15px;border-radius:9px;line-height:1.7}.hint{background:#edf8f3;color:#315f4d}.empty{background:#f5f5f5;color:#777;text-align:center}.message{display:none;background:#fff2f0;color:#a33b31}.actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:18px}button{border:0;border-radius:8px;padding:11px 24px;font-size:15px;cursor:pointer}button.primary{background:#07c160;color:#fff}button.secondary{background:#e9f7f0;color:#087a45}button:disabled{cursor:not-allowed;opacity:.55}.qr-header{margin-bottom:16px;line-height:1.8}.qr-list{display:grid;grid-template-columns:repeat(3,minmax(220px,1fr));gap:16px}.qr-card{padding:14px;border:1px solid #d9e2de;border-radius:10px;text-align:center;break-inside:avoid}.qr-box{display:flex;justify-content:center;margin:10px auto}.qr-box img{width:150px;height:150px;image-rendering:pixelated}.qr-sn{font-weight:700}.qr-code-text{margin-top:7px;font-size:11px;word-break:break-all;color:#68736d}@media(max-width:760px){body{padding:12px}.qr-list{grid-template-columns:1fr}}@media print{body:not(.print-allowed) #result-panel{display:none!important}@page{size:A4;margin:10mm}body{padding:0;background:#fff}body>.container>:not(#result-panel){display:none!important}#result-panel{box-shadow:none;padding:0;margin:0}#result-panel .actions{display:none!important}.qr-list{grid-template-columns:repeat(3,1fr);gap:7mm}.qr-card{border:1px solid #aaa;padding:4mm}}
   </style>
-</head>
-<body>
+<style>
+html{height:100%;scroll-padding-top:0}body.pldp-web-page{margin:0!important;padding:0!important;height:100dvh!important;overflow:hidden!important;background:#f5f7f2!important;color:#152e2a;font-family:'Segoe UI','Microsoft YaHei',sans-serif}
+.pldp-site-header,.pldp-site-header *{box-sizing:border-box}.pldp-site-header{position:relative!important;z-index:100!important;height:72px!important;min-height:72px;display:flex!important;align-items:center;justify-content:space-between;padding:0 5%!important;margin:0!important;width:100%;max-width:none!important;background:#f5f7f2!important;color:#152e2a!important;border-bottom:1px solid #dfe7e2;box-shadow:none!important;border-radius:0!important}
+.pldp-brand{display:flex;align-items:center;gap:13px;text-decoration:none!important;color:#152e2a!important}.pldp-brand>b{background:#006d57;color:white;border-radius:12px;padding:7px 13px;font-size:23px;line-height:1.7}.pldp-brand span{font-size:21px;font-weight:700;line-height:1.3}.pldp-brand small{display:block;font-size:10px;font-weight:400;letter-spacing:2px;margin-top:4px}.pldp-site-header nav{display:flex;align-items:center;gap:30px;font:13px/1.7 'Segoe UI','Microsoft YaHei',sans-serif}.pldp-site-header nav a{color:#152e2a;text-decoration:none}.pldp-site-header .pldp-entry,.pldp-site-header button{width:auto!important;margin:0!important;background:#e7eddf!important;color:#006d57!important;border:1px solid #c4d9c9!important;border-radius:20px!important;padding:6px 13px!important;font:12px/1.7 inherit;cursor:pointer}
+.pldp-page-frame{box-sizing:border-box;height:calc(100dvh - 72px);display:flex;flex-direction:column;min-height:0;padding:20px clamp(18px,3vw,56px) 24px;gap:16px}.pldp-page-heading{flex:none;margin:0!important;padding:0!important;font-size:24px!important;line-height:1.4!important;letter-spacing:0!important;color:#152e2a!important}.pldp-page-content{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding:24px;background:white;border:1px solid #dfe7e2;border-radius:14px}
+.pldp-page-content>main,.pldp-page-content>.container,.pldp-page-content>.wrap{width:100%!important;max-width:none!important;margin:0!important;padding:0!important}.pldp-page-content>main.card{box-shadow:none;border:0;background:transparent}.pldp-page-content .pldp-old-heading{display:none!important}.pldp-page-content>header{height:auto;position:static;background:transparent;color:inherit;margin:0 0 18px;padding:0;border:0}.pldp-page-content .header{box-shadow:none;border-radius:0;padding:0 0 16px}.pldp-page-content table{max-width:100%}.pldp-page-content .grid{margin-top:16px}
+@media(max-width:700px){.pldp-site-header{padding-inline:16px!important}.pldp-site-header nav{gap:10px}.pldp-site-header nav>a:not(.pldp-entry){display:none}.pldp-brand small{font-size:8px;letter-spacing:0}.pldp-page-frame{padding:16px 12px;gap:12px}.pldp-page-content{padding:16px}.pldp-page-heading{font-size:20px!important}}
+@media print{body.pldp-web-page{height:auto!important;overflow:visible!important;background:#fff!important}.pldp-site-header,.pldp-page-heading{display:none!important}.pldp-page-frame,.pldp-page-content{display:block!important;height:auto!important;overflow:visible!important;margin:0!important;padding:0!important;border:0!important;box-shadow:none!important}.pldp-page-content>.container>:not(#result-panel){display:none!important}}
+</style></head>
+<body class="pldp-web-page"><header class="pldp-site-header"><a class="pldp-brand" href="/"><b>PL</b><span>PLDP<small>产品生命周期数字平台</small></span></a><nav><a href="/#explore">工作域演示</a><a href="/#principles">协同逻辑</a><a class="pldp-entry" href="/pldp/web/portal/">进入工作台</a><button type="button" id="pldp-shell-logout">退出登录</button></nav></header><div class="pldp-page-frame"><h1 class="pldp-page-heading">成品打印中心</h1><div class="pldp-page-content">
   <main class="container">
     <header class="header">
-      <h1>PLDP V2 二维码打印中心</h1>
+      <h1 class="pldp-old-heading">PLDP V2 二维码打印中心</h1>
       <p>{{ identity.organization.name }} · {{ identity.role.name }} · 已扫码登录</p>
-      <button id="logout-btn" class="secondary">退出打印中心</button>
+      <p>打印中心与工作台共用当前浏览器登录会话；退出登录会同时结束当前浏览器的工作台会话。</p>
+      <button id="logout-btn" class="secondary">退出登录</button>
     </header>
     <section class="panel">
       <h2 class="panel-title">第一步：选择已授权发货批次</h2>
@@ -38,23 +47,64 @@
   </main>
   <script>
     const PREPARE_URL="{% url 'pldp:web:print:prepare' %}",CONFIRM_URL="{% url 'pldp:web:print:confirm' %}",LOGOUT_URL="{% url 'pldp:web:print:logout' %}";
-    const $=id=>document.getElementById(id),state={shipmentId:null,result:null,busy:false};
+    const $=id=>document.getElementById(id),state={shipmentId:null,result:null,busy:false,epoch:0,loggingOut:false,loggedOut:false};
     const csrf="{{ csrf_token|escapejs }}";
-    async function api(url,body){const response=await fetch(url,{method:"POST",credentials:"same-origin",cache:"no-store",headers:{"Content-Type":"application/json","X-CSRFToken":csrf},body:JSON.stringify(body)});let payload;try{payload=await response.json()}catch(e){throw new Error("请求失败，请刷新页面重试。")}if(!response.ok||payload.code!==0){if(response.status===403){clearResult();setTimeout(()=>window.location.reload(),1200)}throw new Error(payload.msg||"请求失败")}return payload.data}
+    const logoutButtons=[$("logout-btn"),$("pldp-shell-logout")];
+    const expiresAt=Number("{{ grant_expires_at }}")*1000;
+    let forbiddenReloadTimer=null,expiryTimer=null;
+    function currentOperation(epoch){return epoch===state.epoch&&!state.loggingOut&&!state.loggedOut}
+    function updateControls(){const blocked=state.busy||state.loggingOut||state.loggedOut;$("shipment-select").disabled=blocked;$("generate-btn").disabled=blocked||!state.shipmentId;$("print-btn").disabled=blocked||!state.result;$("confirm-btn").disabled=blocked||!state.result;logoutButtons.forEach(button=>button.disabled=state.loggingOut||state.loggedOut)}
+    async function api(url,body,{epoch=state.epoch,reloadOnForbidden=true}={}){
+      const response=await fetch(url,{method:"POST",credentials:"same-origin",cache:"no-store",headers:{"Content-Type":"application/json","X-CSRFToken":csrf},body:JSON.stringify(body)});
+      let payload;try{payload=await response.json()}catch(e){throw new Error("请求失败，请刷新页面重试。")}
+      if(!response.ok||!payload||payload.code!==0){
+        if(response.status===403&&reloadOnForbidden&&currentOperation(epoch)){clearResult();clearTimeout(forbiddenReloadTimer);forbiddenReloadTimer=setTimeout(()=>{if(currentOperation(epoch))window.location.reload()},1200)}
+        throw new Error(payload&&payload.msg||"请求失败");
+      }
+      return payload.data;
+    }
     function showError(error){$("message").textContent=error.message||String(error);$("message").style.display="block"}function clearError(){$("message").style.display="none"}
-    function clearResult(){state.result=null;$("qr-list").textContent="";$("result-panel").hidden=true;document.body.classList.remove("print-allowed")}
+    function clearResult(){state.result=null;$("qr-header").textContent="";$("qr-list").textContent="";$("result-panel").hidden=true;document.body.classList.remove("print-allowed")}
     function renderQRCodes(data){state.result=data;$("qr-header").textContent=`${data.plan_code}｜${data.shipment_title}｜本批共 ${data.qrcodes.length} 张`;const list=$("qr-list");list.textContent="";data.qrcodes.forEach((entry,index)=>{const card=document.createElement("div");card.className="qr-card";const sequence=document.createElement("div");sequence.textContent=`${index+1} / ${data.qrcodes.length}`;const box=document.createElement("div");box.className="qr-box";const img=document.createElement("img");img.src=entry.qr_image;img.alt=entry.device_sn+"二维码";box.appendChild(img);const sn=document.createElement("div");sn.className="qr-sn";sn.textContent=entry.device_sn;const code=document.createElement("div");code.className="qr-code-text";code.textContent=entry.code;card.append(sequence,box,sn,code);list.appendChild(card)});$("result-panel").hidden=false;$("result-panel").scrollIntoView({behavior:"smooth"})}
-    $("shipment-select").onchange=event=>{state.shipmentId=event.target.value||null;clearResult();$("generate-btn").disabled=!state.shipmentId;clearError()};
-    $("generate-btn").onclick=async()=>{if(!state.shipmentId||state.busy)return;const selected=state.shipmentId;clearError();state.busy=true;$("generate-btn").disabled=true;$("shipment-select").disabled=true;try{renderQRCodes(await api(PREPARE_URL,{shipment_id:selected}))}catch(error){clearResult();showError(error)}finally{state.busy=false;$("shipment-select").disabled=false;$("generate-btn").disabled=!state.shipmentId}};
-    $("print-btn").onclick=async()=>{if(!state.result||state.busy)return;state.busy=true;$("print-btn").disabled=true;try{await api(PREPARE_URL,{shipment_id:state.result.shipment_id});await Promise.all(Array.from($("qr-list").querySelectorAll("img")).map(img=>img.decode()));document.body.classList.add("print-allowed");window.print()}catch(error){clearResult();showError(error)}finally{state.busy=false;$("print-btn").disabled=false;document.body.classList.remove("print-allowed")}};
-    $("confirm-btn").onclick=async()=>{if(!state.result||state.busy||!confirm("请确认本批二维码已实际打印并贴到对应包装。确认后不能再次生成打印清单。"))return;state.busy=true;$("confirm-btn").disabled=true;try{const shipmentId=state.result.shipment_id;await api(CONFIRM_URL,{shipment_id:shipmentId});clearResult();try{localStorage.setItem("pldp.printedShipment",JSON.stringify({shipmentId,at:Date.now()}))}catch(e){}alert("本批二维码已确认打印贴包。");window.location.replace("{% url 'pldp:web:print:center' %}")}catch(error){showError(error);$("confirm-btn").disabled=false}finally{state.busy=false}};
-    $("logout-btn").onclick=async()=>{try{await api(LOGOUT_URL,{});clearResult();window.location.replace("{% url 'pldp:web:print:center' %}")}catch(error){showError(error)}};
+    $("shipment-select").onchange=event=>{if(state.loggingOut||state.loggedOut)return;state.shipmentId=event.target.value||null;clearResult();clearError();updateControls()};
+    $("generate-btn").onclick=async()=>{
+      if(!state.shipmentId||state.busy||state.loggingOut||state.loggedOut)return;
+      const selected=state.shipmentId,epoch=state.epoch;clearError();state.busy=true;updateControls();
+      try{const data=await api(PREPARE_URL,{shipment_id:selected},{epoch});if(currentOperation(epoch))renderQRCodes(data)}
+      catch(error){if(currentOperation(epoch)){clearResult();showError(error)}}
+      finally{if(currentOperation(epoch)){state.busy=false;updateControls()}}
+    };
+    $("print-btn").onclick=async()=>{
+      if(!state.result||state.busy||state.loggingOut||state.loggedOut)return;
+      const shipmentId=state.result.shipment_id,epoch=state.epoch;state.busy=true;updateControls();
+      try{await api(PREPARE_URL,{shipment_id:shipmentId},{epoch});if(!currentOperation(epoch))return;await Promise.all(Array.from($("qr-list").querySelectorAll("img")).map(img=>img.decode()));if(!currentOperation(epoch))return;document.body.classList.add("print-allowed");window.print()}
+      catch(error){if(currentOperation(epoch)){clearResult();showError(error)}}
+      finally{if(currentOperation(epoch)){state.busy=false;updateControls();document.body.classList.remove("print-allowed")}}
+    };
+    $("confirm-btn").onclick=async()=>{
+      if(!state.result||state.busy||state.loggingOut||state.loggedOut||!confirm("请确认本批二维码已实际打印并贴到对应包装。确认后不能再次生成打印清单。"))return;
+      const shipmentId=state.result.shipment_id,epoch=state.epoch;state.busy=true;updateControls();
+      try{await api(CONFIRM_URL,{shipment_id:shipmentId},{epoch});if(!currentOperation(epoch))return;clearResult();try{localStorage.setItem("pldp.printedShipment",JSON.stringify({shipmentId,at:Date.now()}))}catch(e){}alert("本批二维码已确认打印贴包。");window.location.replace("{% url 'pldp:web:print:center' %}")}
+      catch(error){if(currentOperation(epoch))showError(error)}
+      finally{if(currentOperation(epoch)){state.busy=false;updateControls()}}
+    };
+    function scheduleExpiry(){const epoch=state.epoch;clearTimeout(expiryTimer);expiryTimer=setTimeout(()=>{if(!currentOperation(epoch))return;state.epoch++;clearResult();window.location.replace("{% url 'pldp:web:print:center' %}")},Math.max(0,expiresAt-Date.now()))}
+    async function logout(){
+      if(state.loggingOut||state.loggedOut)return;
+      state.epoch++;state.loggingOut=true;state.busy=false;clearTimeout(forbiddenReloadTimer);clearTimeout(expiryTimer);document.body.classList.remove("print-allowed");clearError();updateControls();
+      try{
+        const data=await api(LOGOUT_URL,{},{reloadOnForbidden:false});
+        if(!data||typeof data.redirect_url!=="string"||!data.redirect_url)throw new Error("退出响应无效，请重试。");
+        state.loggedOut=true;state.shipmentId=null;$("shipment-select").value="";clearResult();clearError();window.location.replace(data.redirect_url);
+      }catch(error){showError(error)}
+      finally{state.loggingOut=false;updateControls();if(!state.loggedOut)scheduleExpiry()}
+    }
+    logoutButtons.forEach(button=>button.onclick=logout);
     window.addEventListener("keydown",event=>{if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==="p"){event.preventDefault();$("print-btn").click()}});
     window.addEventListener("afterprint",()=>document.body.classList.remove("print-allowed"));
-    window.addEventListener("storage",event=>{if(event.key==="pldp.printedShipment"){let update;try{update=JSON.parse(event.newValue)}catch(e){return}if(update&&String(update.shipmentId)===String(state.shipmentId)){clearResult();window.location.reload()}}});
-    window.addEventListener("pageshow",event=>{if(event.persisted){clearResult();window.location.reload()}});
-    const expiresAt=Number("{{ grant_expires_at }}")*1000;
-    setTimeout(()=>{clearResult();window.location.replace("{% url 'pldp:web:print:center' %}")},Math.max(0,expiresAt-Date.now()));
+    window.addEventListener("storage",event=>{if(state.loggingOut||state.loggedOut)return;if(event.key==="pldp.printedShipment"){let update;try{update=JSON.parse(event.newValue)}catch(e){return}if(update&&String(update.shipmentId)===String(state.shipmentId)){state.epoch++;clearResult();window.location.reload()}}});
+    window.addEventListener("pageshow",event=>{if(!state.loggingOut&&!state.loggedOut&&event.persisted){state.epoch++;clearResult();window.location.reload()}});
+    scheduleExpiry();updateControls();
   </script>
-</body>
+</div></div></body>
 </html>

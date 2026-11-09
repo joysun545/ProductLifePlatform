@@ -6,6 +6,7 @@ from copy import deepcopy
 from django.db import transaction
 from django.utils import timezone
 from account.models import User
+from account.services.role_delegation_service import vacant_role_manager_openids
 from lifecycle.models import AfterSalesApplication, AfterSalesMedia, Device, OrganizationDevice, LifecycleEvent, CustomerDeviceBinding, InstallationRecord, ActivationRecord
 
 PENDING = 'PENDING_ESCALATION'
@@ -110,7 +111,9 @@ def execute(*, application_id, user, data):
     action = str(data.get('action') or '')
     from lifecycle.services import factory_transport_service as F
     if action in F.ACTIONS:return F.execute(application_id,user,data)
-    if F.get(app) and action not in {'REQUEST','DECIDE'}:raise AfterSalesError('本单已使用厂家物流返件流程，请刷新后按交接段操作')
+    from lifecycle.services.replacement_v6_service import RECOVERY_ACTIONS
+    if F.get(app) and action not in {'REQUEST','DECIDE'} | RECOVERY_ACTIONS:
+        raise AfterSalesError('本单已使用厂家物流返件流程，请刷新后按交接段操作')
     permissions = actions(S, app, user)
     mapping = {'REQUEST':'can_escalation_request', 'DECIDE':'can_escalation_decide',
                'HANDOVER':'can_escalation_handover', 'RECEIVE':'can_escalation_receipt',
@@ -208,6 +211,9 @@ def execute(*, application_id, user, data):
             from account.models import UserOrganization
             recipients=list(UserOrganization.objects.filter(organization=app.factory_organization,is_active=True,user__is_active=True,
                 role__is_active=True,role__code__in=['factory_aftersales','factory_logistics']).exclude(user__wx_openid='').values_list('user__wx_openid',flat=True))
+            recipients.extend(vacant_role_manager_openids(
+                app.factory_organization, {"factory_aftersales", "factory_logistics"},
+            ))
             S._publish_task(app,step='direct-repair-pickup',task_type='AFTERSALES_DIRECT_REPAIR_PICKUP',title='返厂维修：待厂家物流取货确认',
                 summary=S._summary(app),recipients_openids=recipients,actor_openid=user.wx_openid or '')
         event=info

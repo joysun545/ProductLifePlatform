@@ -22,6 +22,7 @@ from account.services.role_delegation_service import (
     has_open_action_task_copy,
     identity_can_perform_shared_operation,
     shared_operation_recipient_role_codes,
+    vacant_role_manager_openids,
 )
 from workflow.models import UserTask, WorkItem
 
@@ -180,6 +181,39 @@ class SeniorManagerDelegationInvitationTests(TestCase):
         task.save(update_fields=("state",))
         self.assertFalse(has_open_action_task_copy(identity, (key,)))
 
+    def test_vacant_role_fallback_requires_current_explicit_same_organization_grant(self):
+        manager = self._user("vacancy-manager")
+        manager_identity = UserOrganization.objects.create(
+            user=manager, organization=self.factory, role=self.manager_role,
+        )
+        profile = SeniorManagerProfile.objects.create(identity=manager_identity)
+        profile.managed_roles.add(self.sales_role, self.stock_role)
+        other_factory = Organization.objects.create(
+            name="另一厂家", code="VACANCY-OTHER-FACTORY", organization_type=self.owner_type,
+        )
+        other_manager = UserOrganization.objects.create(
+            user=self._user("vacancy-other-manager"),
+            organization=other_factory, role=self.manager_role,
+        )
+        SeniorManagerProfile.objects.create(identity=other_manager).managed_roles.add(self.stock_role)
+
+        requested = {self.sales_role.code, self.stock_role.code}
+        self.assertEqual(vacant_role_manager_openids(self.factory, requested), [manager.wx_openid])
+        self.assertEqual(vacant_role_manager_openids(self.factory, "factory_logistics"), [])
+
+        stock_user = self._user("vacancy-stock")
+        stock_identity = UserOrganization.objects.create(
+            user=stock_user, organization=self.factory, role=self.stock_role,
+        )
+        self.assertEqual(vacant_role_manager_openids(self.factory, self.stock_role.code), [])
+        self.assertEqual(vacant_role_manager_openids(self.factory, requested), [manager.wx_openid])
+
+        stock_identity.is_active = False
+        stock_identity.save(update_fields=("is_active",))
+        self.assertEqual(vacant_role_manager_openids(self.factory, self.stock_role.code), [manager.wx_openid])
+        profile.managed_roles.remove(self.stock_role)
+        self.assertEqual(vacant_role_manager_openids(self.factory, self.stock_role.code), [])
+
 
 class MerchantSeniorManagerOperationPermissionTests(TestCase):
     def setUp(self):
@@ -222,6 +256,22 @@ class MerchantSeniorManagerOperationPermissionTests(TestCase):
             role=self.roles[role_code],
             inviter=inviter,
         )
+
+    def test_receipt_owner_stays_eligible_when_manager_cannot_receive_tasks(self):
+        self.profile.managed_roles.add(self.roles["merchant_stock"])
+        self.assertEqual(
+            shared_operation_recipient_role_codes(self.organization.pk, "goods_transfer_receipt"),
+            {"merchant_stock"},
+        )
+
+        manager = self.manager_identity.user
+        manager.wx_openid = None
+        manager.save(update_fields=("wx_openid",))
+        self.assertEqual(
+            shared_operation_recipient_role_codes(self.organization.pk, "goods_transfer_receipt"),
+            {"merchant_stock", "merchant_owner"},
+        )
+        self.assertTrue(identity_can_perform_shared_operation(self.owner_identity, "goods_transfer_receipt"))
 
     def test_sales_keeps_only_transfer_and_stock_manager_takes_over_goods_flow(self):
         sales_identity = self._identity("sales", "merchant_sales")

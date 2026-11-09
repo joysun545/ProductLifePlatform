@@ -138,6 +138,11 @@ class V2OrderPlanFixture(TestCase):
             organization_type=supplier_type,
             region="重庆",
         )
+        OrganizationRelation.objects.create(
+            source_organization=self.factory,
+            target_organization=self.supplier,
+            relation_type=OrganizationRelationType.SUPPLY,
+        )
 
         self.sales_user = self._user_with_identity(
             "order-sales",

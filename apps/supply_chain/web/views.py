@@ -1,8 +1,9 @@
-from django.db import models
 # apps/supply_chain/web/views.py
 
 import json
 
+from django.core.exceptions import ValidationError
+from django.db import IntegrityError, models, transaction
 from django.shortcuts import render
 from django.http import JsonResponse
 from django.views.decorators.http import require_POST
@@ -16,9 +17,17 @@ from supply_chain.models import (
 
 from account.models import Organization
 from product.models import ProductCategory
+from supply_chain.services.supply_scope import active_supplier_ids, supplier_can_supply
 
 
 MATERIAL_CODE_SEPARATOR = "-"
+
+
+def _material_factory_id(request):
+    principal = getattr(request, "web_portal_principal", {})
+    if principal.get("kind") == "factory":
+        return principal["organization_id"]
+    return None
 
 
 def build_material_code(category_code, input_code):
@@ -62,11 +71,15 @@ def material_config(request):
 # =========================
 
 
+def _material_category_names(material):
+    return "、".join(category.name for category in material.product_categories.all())
+
+
 def get_materials(request):
 
 
-    materials = Material.objects.select_related(
-        "product_category"
+    materials = Material.objects.prefetch_related(
+        "product_categories"
     ).order_by(
         "code"
     )
@@ -85,7 +98,7 @@ def get_materials(request):
     if category_id:
 
         materials = materials.filter(
-            product_category_id=category_id
+            product_categories__id=category_id
         )
 
 
@@ -123,9 +136,7 @@ def get_materials(request):
 
 
             "category":
-            material.product_category.name
-            if material.product_category
-            else "",
+            _material_category_names(material),
 
 
             "is_key_part":
@@ -154,9 +165,8 @@ def get_materials(request):
 def get_material_specs(request):
 
 
-    specs = MaterialSpec.objects.select_related(
-        "material",
-        "material__product_category"
+    specs = MaterialSpec.objects.select_related("material").prefetch_related(
+        "material__product_categories"
     )
 
 
@@ -178,7 +188,7 @@ def get_material_specs(request):
     if category_id:
 
         specs = specs.filter(
-            material__product_category_id=category_id
+            material__product_categories__id=category_id
         )
 
 
@@ -235,9 +245,7 @@ def get_material_specs(request):
 
 
             "category":
-            spec.material.product_category.name
-            if spec.material.product_category
-            else "",
+            _material_category_names(spec.material),
 
 
             "performance_description":
@@ -264,9 +272,7 @@ def get_material_specs(request):
 def get_suppliers(request):
 
     suppliers = Organization.objects.filter(
-        organization_type__code="SUPPLIER",
-        organization_type__is_active=True,
-        is_active=True,
+        pk__in=active_supplier_ids(_material_factory_id(request)),
     ).values(
         "id",
         "name",
@@ -288,9 +294,6 @@ def get_suppliers(request):
 def get_suppliers_by_category(request):
 
 
-    from django.db.models import Q
-
-
     category_id = request.GET.get(
         "category"
     )
@@ -307,11 +310,9 @@ def get_suppliers_by_category(request):
 
 
     suppliers = Organization.objects.filter(
-        organization_type__code="SUPPLIER",
-        organization_type__is_active=True,
-        is_active=True,
+        pk__in=active_supplier_ids(_material_factory_id(request)),
 
-        supplied_material_specs__material_spec__material__product_category_id=category_id
+        supplied_material_specs__material_spec__material__product_categories__id=category_id
 
     ).distinct().values(
 
@@ -337,154 +338,71 @@ def get_suppliers_by_category(request):
 
 @require_POST
 def add_material(request):
+    try:
+        data = json.loads(request.body)
+    except ValueError:
+        return JsonResponse({"success": False, "message": "物料数据格式错误"})
+    if not isinstance(data, dict):
+        return JsonResponse({"success": False, "message": "物料数据格式错误"})
+
+    input_code = str(data.get("code") or "").strip()
+    name = str(data.get("name") or "").strip()
+    if not input_code or not name:
+        return JsonResponse({"success": False, "message": "物料编码和名称不能为空"})
+
+    category_id = data.get("product_category_id")
+    if not category_id:
+        return JsonResponse({"success": False, "message": "请选择所属产品分类"})
+
+    extra_category_ids = data.get("product_category_ids", [])
+    if not isinstance(extra_category_ids, list):
+        return JsonResponse({"success": False, "message": "适用产品分类格式错误"})
+    submitted_ids = [str(value) for value in (category_id, *extra_category_ids)]
+    if any(
+        not value.isascii() or not value.isdecimal() or len(value) > 19
+        or not 0 < int(value) < 2**63
+        for value in submitted_ids
+    ):
+        return JsonResponse({"success": False, "message": "所选产品分类不存在"})
+
+    category_ids = {int(value) for value in submitted_ids}
+    categories = ProductCategory.objects.in_bulk(category_ids)
+    if categories.keys() != category_ids:
+        return JsonResponse({"success": False, "message": "所选产品分类不存在"})
+
+    code = build_material_code(categories[int(category_id)].code, input_code)
+    if not code:
+        return JsonResponse({"success": False, "message": "物料编码不能为空"})
+    if len(code) > Material._meta.get_field("code").max_length:
+        return JsonResponse({
+            "success": False,
+            "message": "品类编码与物料编码组合后不能超过64个字符",
+        })
+    if Material.objects.filter(code=code).exists():
+        return JsonResponse({"success": False, "message": f"物料编码 {code} 已存在"})
 
     try:
-
-        data = json.loads(
-            request.body.decode("utf-8")
-        )
-
-
-        input_code = str(data.get("code") or "").strip()
-        name = str(data.get("name") or "").strip()
-        category_id = data.get("product_category_id")
-
-        is_key_part = data.get(
-            "is_key_part",
-            False
-        )
-
-        description = data.get(
-            "description",
-            ""
-        )
-
-
-        if not input_code or not name:
-
-            return JsonResponse({
-
-                "success":False,
-
-                "message":
-                "物料编码和名称不能为空"
-
-            })
-
-
-        if not category_id:
-
-            return JsonResponse({
-
-                "success":False,
-
-                "message":
-                "请选择所属产品分类"
-
-            })
-
-
-        try:
-
-            category = ProductCategory.objects.get(
-                id=category_id
+        with transaction.atomic():
+            material = Material.objects.create(
+                code=code,
+                name=name,
+                is_key_part=data.get("is_key_part", False),
+                description=data.get("description", ""),
             )
+            material.product_categories.add(*categories.values())
+    except IntegrityError:
+        if Material.objects.filter(code=code).exists():
+            return JsonResponse({"success": False, "message": f"物料编码 {code} 已存在"})
+        return JsonResponse({"success": False, "message": "物料及适用产品分类未保存，请重新提交"})
+    except (TypeError, ValueError, ValidationError):
+        return JsonResponse({"success": False, "message": "物料数据格式错误"})
 
-        except (TypeError, ValueError, ProductCategory.DoesNotExist):
-
-            return JsonResponse({
-
-                "success":False,
-
-                "message":
-                "所选产品分类不存在"
-
-            })
-
-
-        code = build_material_code(
-            category.code,
-            input_code
-        )
-
-
-        if not code:
-
-            return JsonResponse({
-
-                "success":False,
-
-                "message":
-                "物料编码不能为空"
-
-            })
-
-
-        if len(code) > Material._meta.get_field("code").max_length:
-
-            return JsonResponse({
-
-                "success":False,
-
-                "message":
-                "品类编码与物料编码组合后不能超过64个字符"
-
-            })
-
-
-        if Material.objects.filter(
-            code=code
-        ).exists():
-
-            return JsonResponse({
-
-                "success":False,
-
-                "message":
-                f"物料编码 {code} 已存在"
-
-            })
-
-
-        material = Material.objects.create(
-
-            code=code,
-
-            name=name,
-
-            product_category=category,
-
-            is_key_part=is_key_part,
-
-            description=description
-
-        )
-
-
-        return JsonResponse({
-
-            "success":True,
-
-            "id":material.id,
-
-            "code":material.code,
-
-            "message":
-            "物料创建成功"
-
-        })
-
-
-    except Exception as e:
-
-
-        return JsonResponse({
-
-            "success":False,
-
-            "message":str(e)
-
-        })
+    return JsonResponse({
+        "success": True,
+        "id": material.id,
+        "code": material.code,
+        "message": "物料创建成功",
+    })
 
 
 # =========================
@@ -606,6 +524,16 @@ def add_material_spec_supplier_ajax(request):
             request.body
         )
 
+        supplier_id = str(data.get("supplier_id") or "")
+        if (
+            not supplier_id.isascii() or not supplier_id.isdecimal()
+            or len(supplier_id) > 19 or not 0 < int(supplier_id) < 2**63
+        ):
+            return JsonResponse({"success": False, "error": "请选择有效的供应商"}, status=400)
+        if not supplier_can_supply(_material_factory_id(request), supplier_id):
+            return JsonResponse({
+                "success": False, "error": "该供应商在当前厂家链路内没有有效供货关系",
+            }, status=403)
 
         relation = MaterialSpecSupplier.objects.create(
 
@@ -614,9 +542,7 @@ def add_material_spec_supplier_ajax(request):
             ),
 
 
-            supplier_id=data.get(
-                "supplier_id"
-            ),
+            supplier_id=supplier_id,
 
 
             warranty_months=data.get(
@@ -850,7 +776,8 @@ def delete_material_spec_supplier(request):
 
 
         relation = MaterialSpecSupplier.objects.get(
-            id=relation_id
+            id=relation_id,
+            supplier_id__in=active_supplier_ids(_material_factory_id(request)),
         )
 
 
@@ -903,6 +830,7 @@ def get_material_supplier_list(request):
 
     from django.db.models import Q
 
+    supplier_ids = set(active_supplier_ids(_material_factory_id(request)))
 
     materials = Material.objects.prefetch_related(
         "specs__suppliers__supplier"
@@ -927,14 +855,15 @@ def get_material_supplier_list(request):
     if category_id:
 
         materials = materials.filter(
-            product_category_id=category_id
+            product_categories__id=category_id
         )
 
 
     if supplier_id:
 
         materials = materials.filter(
-            specs__suppliers__supplier_id=supplier_id
+            specs__suppliers__supplier_id=supplier_id,
+            specs__suppliers__supplier_id__in=supplier_ids,
         )
 
 
@@ -947,7 +876,8 @@ def get_material_supplier_list(request):
             |
             Q(specs__code__icontains=keyword)
             |
-            Q(specs__suppliers__supplier__name__icontains=keyword)
+            Q(specs__suppliers__supplier__name__icontains=keyword,
+              specs__suppliers__supplier_id__in=supplier_ids)
         )
 
 
@@ -973,7 +903,8 @@ def get_material_supplier_list(request):
                 |
                 Q(code__icontains=keyword)
                 |
-                Q(suppliers__supplier__name__icontains=keyword)
+                Q(suppliers__supplier__name__icontains=keyword,
+                  suppliers__supplier_id__in=supplier_ids)
             ).distinct()
 
 
@@ -986,6 +917,8 @@ def get_material_supplier_list(request):
 
             for relation in spec.suppliers.all():
 
+                if relation.supplier_id not in supplier_ids:
+                    continue
 
                 if supplier_id and str(relation.supplier.id) != str(supplier_id):
 
@@ -1068,6 +1001,7 @@ def get_material_supplier_list(request):
 
 def material_list(request):
 
+    supplier_ids = set(active_supplier_ids(_material_factory_id(request)))
 
     materials = Material.objects.prefetch_related(
         "specs__suppliers__supplier"
@@ -1091,6 +1025,9 @@ def material_list(request):
 
 
             for relation in spec.suppliers.all():
+
+                if relation.supplier_id not in supplier_ids:
+                    continue
 
                 suppliers.append({
 
@@ -1218,7 +1155,7 @@ def get_materials_by_category(request):
     if category_id:
 
         materials = materials.filter(
-            product_category_id=category_id
+            product_categories__id=category_id
         )
 
 

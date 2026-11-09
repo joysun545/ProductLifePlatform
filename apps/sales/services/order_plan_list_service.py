@@ -15,6 +15,7 @@ from supply_chain.services.supplier_responsibility_service import (
     get_responsible_material_ids,
     get_v2_supplier_delivery_snapshot_access,
 )
+from supply_chain.services.supply_scope import supplier_can_supply
 
 
 class OrderPlanListError(Exception):
@@ -133,12 +134,19 @@ def get_order_plan_list(user, status="", limit=50):
     elif scope == "merchant":
         plans = plans.filter(merchant_organization=identity.organization)
         visibility = "merchant_v2"
-    elif role == "supplier_owner":
-        plans = plans.filter(material_plan__supply_deliveries__supplier=identity.organization).distinct()
-        visibility = "supplier_v2"
     else:
-        plans = plans.filter(_supplier_sales_query(identity)).distinct()
-        visibility = "supplier_responsibility_v2"
+        factory_id = identity.organization.factory_root_id
+        plans = (
+            plans.filter(factory_organization_id=factory_id)
+            if supplier_can_supply(factory_id, identity.organization_id)
+            else plans.none()
+        )
+        if role == "supplier_owner":
+            plans = plans.filter(material_plan__supply_deliveries__supplier=identity.organization).distinct()
+            visibility = "supplier_v2"
+        else:
+            plans = plans.filter(_supplier_sales_query(identity)).distinct()
+            visibility = "supplier_responsibility_v2"
 
     status = str(status or "").strip()
     if status:

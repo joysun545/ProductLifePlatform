@@ -1,6 +1,11 @@
+from base64 import b64decode
 from datetime import timedelta
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 from uuid import uuid4
 
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 from django.utils import timezone
 
@@ -19,7 +24,8 @@ from product.models import BOM, ProductCategory, ProductModel
 from quality_trace.models import (
     BatchQualityAffectedDevice, BatchQualityCase, QualityRecallBatchOperation,
     QualityRecallCampaign, QualityRecallCustomerHandover, QualityRecallDevice,
-    QualityRecallIsolationReceipt, QualityRecallTransportLeg, QualityTraceEvent,
+    QualityRecallInventoryBatchConfirmation, QualityRecallIsolationReceipt,
+    QualityRecallTransportLeg, QualityTraceEvent,
 )
 from quality_trace.services.recall_batch_service import (
     execute_recall_batch, get_recall_batch_groups,
@@ -27,13 +33,38 @@ from quality_trace.services.recall_batch_service import (
 from quality_trace.services.recall_service import (
     QualityRecallError, create_recall_campaign, launch_recall_campaign,
 )
+from quality_trace.services import recall_transport_service
 from quality_trace.services.recall_transport_service import (
     confirm_recall_inventory_batch, create_next_recall_transport_leg,
 )
 from workflow.models import WorkItem
 
 
-class RecallBatchTests(TestCase):
+class RecallEvidenceUploadMixin:
+    def setUp(self):
+        super().setUp()
+        self.evidence_root = Path(self.enterContext(TemporaryDirectory()))
+        self.enterContext(self.settings(QUALITY_RECALL_PRIVATE_ROOT=self.evidence_root))
+
+    def upload_evidence(self, user):
+        image = b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1Pe"
+            "AAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"
+        )
+        response = self.client.post(
+            "/pldp/api/quality-trace/recall-evidence/upload/",
+            {"file": SimpleUploadedFile("dispatch.png", image, content_type="image/png")},
+            HTTP_AUTHORIZATION=f"Bearer {issue_access_token(user)}",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        body = response.json()
+        self.assertEqual(body["code"], 0, body)
+        evidence = body["data"]
+        self.assertTrue((self.evidence_root / evidence["storage_key"]).is_file())
+        return evidence
+
+
+class RecallBatchTests(RecallEvidenceUploadMixin, TestCase):
     @classmethod
     def setUpTestData(cls):
         factory_type = OrganizationType.objects.get(code="OWNER")
@@ -94,13 +125,15 @@ class RecallBatchTests(TestCase):
         payload = dict(
             user=user, campaign_id=self.campaign.pk, action=action,
             recall_device_ids=[row.pk for row in (self.rows if rows is None else rows)],
-            client_request_id=uuid4().hex, evidence={"storage_key": "private/recall/batch.jpg"},
+            client_request_id=uuid4().hex, evidence=None,
             logistics_provider="测试物流" if action == "DISPATCH" else "",
             tracking_no="RB-SHIPMENT" if action == "DISPATCH" else "",
             isolation_location="召回隔离-A01" if action == "ISOLATE" else "",
             receipt_note="已逐台核对实物",
         )
         payload.update(overrides)
+        if "evidence" not in overrides:
+            payload["evidence"] = self.upload_evidence(user)
         return execute_recall_batch(**payload)
 
     def groups(self, user):
@@ -150,22 +183,85 @@ class RecallBatchTests(TestCase):
             type__in=["QUALITY_RECALL_BATCH_RECEIPT", "QUALITY_RECALL_BATCH_RETURN", "QUALITY_RECALL_BATCH_INVENTORY_POSTING"], status="OPEN",
         ).exists())
 
+    def test_inactive_batch_cannot_create_a_posting_confirmation(self):
+        self.transport_to_factory()
+        self.run_batch(self.logistics, "RECEIVE")
+        self.run_batch(self.assistant, "ISOLATE")
+        self.assertEqual(self.campaign.isolation_receipts.count(), self.campaign.device_count)
+        work_count = WorkItem.objects.count()
+        trace_count = QualityTraceEvent.objects.count()
+        auth = {"HTTP_AUTHORIZATION": f"Bearer {issue_access_token(self.assistant)}"}
+
+        def confirm(campaign_id):
+            response = self.client.post(
+                f"/pldp/api/quality-trace/recalls/{campaign_id}/inventory-confirm/", {}, **auth,
+            )
+            self.assertEqual(response.status_code, 200)
+            return response.json()
+
+        missing = confirm(self.campaign.pk + 1)
+        self.assertEqual(missing["code"], 1)
+        self.assertIn("召回批次不存在", missing["msg"])
+        for status in ("SUPERSEDED", "CANCELLED", "DRAFT", "COMPLETED"):
+            with self.subTest(status=status):
+                QualityRecallCampaign.objects.filter(pk=self.campaign.pk).update(status=status)
+                result = confirm(self.campaign.pk)
+                self.assertEqual(result["code"], 1)
+                self.assertIn("当前不能确认入库记账", result["msg"])
+                self.assertFalse(QualityRecallInventoryBatchConfirmation.objects.exists())
+                self.assertEqual(WorkItem.objects.count(), work_count)
+                self.assertEqual(QualityTraceEvent.objects.count(), trace_count)
+
+        QualityRecallCampaign.objects.filter(pk=self.campaign.pk).update(status="ACTIVE")
+        success = confirm(self.campaign.pk)
+        self.assertEqual(success["code"], 0)
+        QualityRecallCampaign.objects.filter(pk=self.campaign.pk).update(status="COMPLETED")
+        self.assertEqual(confirm(self.campaign.pk)["data"], success["data"])
+        self.assertEqual(QualityRecallInventoryBatchConfirmation.objects.count(), 1)
+        self.assertEqual(WorkItem.objects.filter(
+            uniq_key=f"quality-recall:{self.campaign.pk}:post-recall-disposition",
+        ).count(), 1)
+
+    def test_disappearing_inventory_returns_business_error_without_partial_dispatch(self):
+        row = self.rows[1]
+        upstream = recall_transport_service._upstream_target
+
+        def change_inventory(current, factory_id):
+            relation = upstream(current, factory_id)
+            if OrganizationDevice.objects.filter(device_id=self.rows[0].device_id, status="RETURNED").exists():
+                OrganizationDevice.objects.filter(device_id=row.device_id).delete()
+            return relation
+
+        models = (QualityRecallBatchOperation, QualityRecallTransportLeg, QualityTraceEvent, WorkItem, LifecycleEvent)
+        before = [model.objects.count() for model in models]
+        with patch.object(recall_transport_service, "_upstream_target", side_effect=change_inventory):
+            with self.assertRaisesMessage(QualityRecallError, "设备库存状态已变化"):
+                self.run_batch(self.owners[2], "DISPATCH", self.rows[:2])
+        self.assertEqual(before, [model.objects.count() for model in models])
+        self.assertEqual(OrganizationDevice.objects.filter(
+            device_id__in=[item.device_id for item in self.rows[:2]], status="IN_STOCK",
+        ).count(), 2)
+
     def test_repeat_submission_returns_original_result_without_new_tasks_or_records(self):
-        first = self.run_batch(self.owners[2], "DISPATCH", self.rows[:2], client_request_id="retry-1")
+        evidence = self.upload_evidence(self.owners[2])
+        request = {"client_request_id": "retry-1", "evidence": evidence}
+        first = self.run_batch(self.owners[2], "DISPATCH", self.rows[:2], **request)
         counts = [model.objects.count() for model in (QualityRecallBatchOperation, QualityRecallTransportLeg, QualityTraceEvent, WorkItem, LifecycleEvent)]
-        second = self.run_batch(self.owners[2], "DISPATCH", self.rows[:2], client_request_id="retry-1")
+        (self.evidence_root / evidence["storage_key"]).unlink()
+        second = self.run_batch(self.owners[2], "DISPATCH", self.rows[:2], **request)
         self.assertTrue(second["idempotent_replay"])
         self.assertEqual(first["operation_id"], second["operation_id"])
         self.assertEqual(counts, [model.objects.count() for model in (QualityRecallBatchOperation, QualityRecallTransportLeg, QualityTraceEvent, WorkItem, LifecycleEvent)])
         with self.assertRaises(QualityRecallError):
-            self.run_batch(self.owners[2], "DISPATCH", self.rows[:2], client_request_id="retry-1", tracking_no="CHANGED")
+            self.run_batch(self.owners[2], "DISPATCH", self.rows[:2], tracking_no="CHANGED", **request)
         with self.assertRaises(QualityRecallError):
             self.run_batch(self.owners[2], "DISPATCH", self.rows[:2])
 
     def test_wrong_owner_wrong_role_and_unreceived_downstream_cannot_dispatch(self):
+        evidence = self.upload_evidence(self.owners[2])
         for user in (self.owners[0], self.owners[1], self.outsider, self.chief):
             with self.assertRaises(QualityRecallError):
-                self.run_batch(user, "DISPATCH", self.rows[:2])
+                self.run_batch(user, "DISPATCH", self.rows[:2], evidence=evidence)
         self.run_batch(self.owners[2], "DISPATCH", self.rows[:2])
         with self.assertRaises(QualityRecallError):
             self.run_batch(self.owners[1], "DISPATCH", self.rows[:2])
@@ -232,7 +328,10 @@ class RecallBatchTests(TestCase):
     def test_user_handover_and_inventory_can_share_return_without_losing_activation(self):
         row = self.rows[0]
         customer_type, _ = OrganizationType.objects.get_or_create(code="CUSTOMER", defaults={"name": "用户"})
-        customer = Organization.objects.create(name="用户组织", code="RB-CUSTOMER", organization_type=customer_type)
+        customer = Organization.objects.create(
+            name="用户组织", code="RB-CUSTOMER", organization_type=customer_type,
+            factory_root=self.factory,
+        )
         activation = ActivationRecord.objects.create(device=row.device, organization=customer, operator=self.owners[2])
         binding = CustomerDeviceBinding.objects.create(device=row.device, customer_organization=customer, source_organization=self.merchants[2])
         OrganizationDevice.objects.filter(device=row.device).update(organization=customer, status="SOLD")
@@ -265,7 +364,7 @@ class RecallBatchTests(TestCase):
         self.assertEqual({row["campaign_id"] for row in data["devices"]}, {self.campaign.pk})
         body = {"action": "DISPATCH", "recall_device_ids": [row.pk for row in self.rows[:2]],
                 "client_request_id": "api-batch", "logistics_provider": "测试物流", "tracking_no": "API-1",
-                "evidence": {"storage_key": "private/recall/api.jpg"}}
+                "evidence": self.upload_evidence(self.owners[2])}
         response = self.client.post(url + "batch-operations/", body, content_type="application/json", **auth)
         self.assertEqual(response.status_code, 200, response.content)
         self.assertEqual(response.json()["data"]["processed_count"], 2)
@@ -275,6 +374,67 @@ class RecallBatchTests(TestCase):
         self.assertEqual(upstream.status_code, 200, upstream.content)
         receive = [g for g in upstream.json()["data"]["batch_flow"]["groups"] if g["action"] == "RECEIVE"]
         self.assertEqual(receive[0]["device_count"], 2)
+        for leg in QualityRecallTransportLeg.objects.filter(status="IN_TRANSIT"):
+            self.assertEqual(leg.dispatch_evidence["storage_key"], body["evidence"]["storage_key"])
+            self.assertNotIn("upload_receipt", leg.dispatch_evidence)
+
+    def test_dispatch_rejects_unverified_wrong_scope_or_removed_evidence_without_changes(self):
+        user = self.owners[2]
+        deleted = self.upload_evidence(user)
+        (self.evidence_root / deleted["storage_key"]).unlink()
+        changed = self.upload_evidence(user)
+        (self.evidence_root / changed["storage_key"]).write_bytes(b"")
+        own = self.upload_evidence(user)
+        other = self.upload_evidence(self.owners[1])
+        peer = self.make_user("peer", self.merchants[2], "merchant_stock")
+        peer_evidence = self.upload_evidence(peer)
+        fabricated = {"storage_key": "recall_evidence/never-uploaded.png"}
+        models = (QualityRecallBatchOperation, QualityRecallTransportLeg, QualityTraceEvent, WorkItem, LifecycleEvent)
+        before = [model.objects.count() for model in models]
+        statuses = list(
+            self.campaign.devices.order_by("pk").values_list("status", flat=True)
+        )
+        url = f"/pldp/api/quality-trace/recalls/{self.campaign.pk}/batch-operations/"
+        auth = {"HTTP_AUTHORIZATION": f"Bearer {issue_access_token(user)}"}
+        for evidence, reason in (
+            (fabricated, "未通过上传校验"),
+            ({"storage_key": own["storage_key"]}, "未通过上传校验"),
+            ({**own, "storage_key": fabricated["storage_key"]}, "不符"),
+            ({**own, "upload_receipt": "fabricated"}, "未通过上传校验"),
+            (other, "不符"),
+            (peer_evidence, "不符"),
+            (deleted, "已失效"),
+            (changed, "已失效"),
+        ):
+            with self.subTest(reason=reason, evidence=evidence["storage_key"]):
+                response = self.client.post(url, {
+                    "action": "DISPATCH", "recall_device_ids": [row.pk for row in self.rows[:2]],
+                    "client_request_id": "repair-retry-1", "logistics_provider": "测试物流",
+                    "tracking_no": "API-2", "evidence": evidence,
+                }, content_type="application/json", **auth)
+                self.assertEqual(response.status_code, 200, response.content)
+                self.assertEqual(response.json()["code"], 1, response.json())
+                self.assertIn(reason, response.json()["msg"])
+                self.assertEqual(before, [model.objects.count() for model in models])
+                self.assertEqual(statuses, list(
+                    self.campaign.devices.order_by("pk").values_list("status", flat=True)
+                ))
+                self.assertEqual(OrganizationDevice.objects.filter(status="IN_STOCK").count(), 3)
+                self.assertFalse(WorkItem.objects.filter(type="QUALITY_RECALL_BATCH_RECEIPT").exists())
+
+        response = self.client.post(url, {
+            "action": "DISPATCH", "recall_device_ids": [row.pk for row in self.rows[:2]],
+            "client_request_id": "repair-retry-1", "logistics_provider": "测试物流",
+            "tracking_no": "API-2", "evidence": {**own, "original_name": "tampered.png"},
+        }, content_type="application/json", **auth)
+        self.assertEqual(response.json()["code"], 0, response.json())
+        self.assertEqual(QualityRecallTransportLeg.objects.filter(status="IN_TRANSIT").count(), 2)
+        self.assertEqual(WorkItem.objects.filter(type="QUALITY_RECALL_BATCH_RECEIPT", status="OPEN").count(), 1)
+        operation = QualityRecallBatchOperation.objects.get(client_request_id="repair-retry-1")
+        self.assertEqual(operation.request_payload["evidence"]["original_name"], "dispatch.png")
+        self.assertNotIn("upload_receipt", operation.request_payload["evidence"])
+        for leg in QualityRecallTransportLeg.objects.filter(status="IN_TRANSIT"):
+            self.assertEqual(leg.dispatch_evidence["original_name"], "dispatch.png")
 
     def test_superseded_campaign_and_invalid_lists_are_rejected(self):
         for ids in ([], [self.rows[0].pk, self.rows[0].pk], [True], ["1"], [999999], [1] * 1001):

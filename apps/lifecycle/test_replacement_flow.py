@@ -1,11 +1,16 @@
 from contextlib import ExitStack
 from copy import deepcopy
 from datetime import timedelta
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
+import uuid
+from django.core.files.storage import FileSystemStorage
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 from django.utils import timezone
 from account.models import OrganizationRelation
+from account.services.auth_service import issue_access_token
 from lifecycle.models import (Device, DeviceState, OrganizationDevice, QRCode, ActivationRecord, CustomerDeviceBinding,
     CustomerVehicle, DriverVehicleBinding, PhysicalDeviceCode, AfterSalesMedia, ReplacementFlow, ReplacementLeg,
     ReplacementInventoryEntry, InstallationRecord, VehicleDeviceAssignment, AfterSalesApplication)
@@ -15,6 +20,27 @@ from lifecycle.services.repair_escalation_service import execute as api_execute
 from lifecycle.services.replacement_flow_service import execute, approve, pending_for_plan, statistics, describe
 from lifecycle.services.aftersales_access import visible_cases
 import lifecycle.test_aftersales_access_basis as fixtures
+
+
+def upload_transport_proof(test, user, *, leg=None, kind='LOGISTICS', direction=None, index=None, expected_status=201):
+    """Use the real media API for proofs consumed by a transport action."""
+    test.case.refresh_from_db()
+    context={'evidence_kind':kind,'client_upload_id':str(uuid.uuid4())}
+    if leg is not None:
+        context.update(evidence_action='SEND_REPLACEMENT_LEG',leg_id=leg.pk)
+    else:
+        context.update(evidence_action='FACTORY_TRANSPORT_SEND',
+            transport_id=test.case.escalation['factory_transport']['transport_id'],
+            direction=direction,index=index)
+    response=test.client.post(f'/pldp/api/lifecycle/after-sales/applications/{test.case.pk}/media/',{
+        'purpose':'REPAIR_RETURN_SHIPMENT_DOCUMENT','media_type':'IMAGE',
+        'file':SimpleUploadedFile('proof.jpg',b'\xff\xd8\xff\xe0replacement-test',content_type='image/jpeg'),
+        **context,
+    },HTTP_AUTHORIZATION='Bearer '+issue_access_token(user))
+    test.assertEqual(response.status_code,expected_status,response.json())
+    if expected_status!=201:return None
+    return AfterSalesMedia.objects.get(pk=response.json()['data']['id'])
+
 
 class ReplacementFlowTests(TestCase):
     user=classmethod(fixtures.AfterSalesAccessBasisTests.user.__func__)
@@ -43,6 +69,9 @@ class ReplacementFlowTests(TestCase):
 
     def setUp(self):
         self.stack=ExitStack();self.addCleanup(self.stack.close)
+        media_root=self.stack.enter_context(TemporaryDirectory())
+        self.stack.enter_context(patch.object(AfterSalesMedia._meta.get_field('file'),
+            'storage',FileSystemStorage(location=media_root)))
         for name in ('_publish_task','_complete_tasks','_complete_factory_workorder','_send_factory_close_task','_publish_applicant_notice','_publish_supplier_quality_notices'):
             self.stack.enter_context(patch.object(S,name))
         self.stack.enter_context(patch('lifecycle.services.replacement_flow_service.enforce_device_operation',return_value={'allowed':True}))
@@ -95,12 +124,16 @@ class ReplacementFlowTests(TestCase):
         flow.refresh_from_db();return flow,new
 
     def send(self,leg,user,qr):
-        self.proof(user)
+        leg=ReplacementLeg.objects.select_related('flow__application','from_organization','to_organization').get(pk=leg.pk)
         evidence={}
         if leg.direction=='OLD':
-            image=AfterSalesMedia.objects.create(application=self.case,purpose='REPAIR_RETURN_SHIPMENT_DOCUMENT',media_type='IMAGE',file='old.jpg',uploaded_by=user)
-            doc=AfterSalesMedia.objects.create(application=self.case,purpose='REPAIR_RETURN_SHIPMENT_DOCUMENT',media_type='IMAGE',file='waybill.jpg',uploaded_by=user)
-            evidence={'device_image_ids':[image.pk],'logistics_document_ids':[doc.pk]}
+            from lifecycle.services.replacement_flow_service import can_send
+            self.case.refresh_from_db()
+            if can_send(leg,user):
+                image=upload_transport_proof(self,user,leg=leg,kind='DEVICE')
+                doc=upload_transport_proof(self,user,leg=leg,kind='LOGISTICS')
+                evidence={'device_image_ids':[image.pk],'logistics_document_ids':[doc.pk]}
+        else:self.proof(user)
         return self.call('SEND_REPLACEMENT_LEG',user,leg_id=leg.pk,qr_text=qr,
             handover_method='SHIPMENT',note='按链路发出',logistics_company='顺丰',tracking_no='SF-'+str(leg.pk),**evidence)
 

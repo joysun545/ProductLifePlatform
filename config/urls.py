@@ -26,3 +26,10 @@ urlpatterns = [
     ),
 
 ]
+
+# PLDP_PUBLIC_HOME_V1
+from pldp.homepage_view import public_homepage
+urlpatterns.insert(0, path("", public_homepage, name="pldp_public_homepage"))
+
+# PLDP_UNIFIED_WEB_LOGIN_V1
+urlpatterns.insert(0, path("pldp/web/portal/", include("web_portal.urls")))

@@ -172,10 +172,12 @@ def get_active_identity(user: User):
         )
         .first()
     )
-    # Legacy organizations with an ambiguous or missing factory root are
-    # deliberately fail-closed until an administrator reviews and assigns one.
-    if identity and not identity.organization.get_factory_root():
-        return None
+    # A suspended root makes its existing business identities ineffective
+    # without changing their own status or historical organization links.
+    if identity:
+        factory_root = identity.organization.get_factory_root()
+        if not factory_root or not factory_root.is_active:
+            return None
     return identity
 
 

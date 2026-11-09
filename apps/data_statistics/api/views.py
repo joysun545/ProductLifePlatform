@@ -3,11 +3,21 @@ from django.http import JsonResponse
 from account.services.auth_service import ApiAuthenticationError, authenticate_request
 from data_statistics.models import DailyMetricSnapshot, MetricDefinition
 from data_statistics.services import StatisticsAccessError, build_dashboard, get_statistics_identity
-from data_statistics.services.material_service import build_factory_material_lot_catalog
+from data_statistics.services.material_service import (
+    MATERIAL_METRIC_DEFINITIONS,
+    build_factory_material_lot_catalog,
+)
 
 
 def _error(message, code=1, status=200):
     return JsonResponse({"code": code, "msg": str(message), "data": {}}, status=status)
+
+
+def _access_denied(message):
+    return JsonResponse({
+        "code": 1, "msg": str(message), "data": {},
+        "error_code": "STATISTICS_ACCESS_DENIED",
+    })
 
 
 def _identity(request):
@@ -17,7 +27,7 @@ def _identity(request):
     except ApiAuthenticationError as exc:
         return None, _error(exc, code=401, status=401)
     except StatisticsAccessError as exc:
-        return None, _error(exc)
+        return None, _access_denied(exc)
 
 
 def _get_only(request):
@@ -31,7 +41,9 @@ def dashboard(request):
     identity, error = _identity(request)
     if error:
         return error
-    return JsonResponse({"code": 0, "msg": "", "data": build_dashboard(identity)})
+    return JsonResponse({"code": 0, "msg": "", "data": build_dashboard(
+        identity, requested_finance_root=request.GET.get("root_organization_id"),
+    )})
 
 
 def _domain(request, code):
@@ -41,10 +53,16 @@ def _domain(request, code):
     identity, error = _identity(request)
     if error:
         return error
-    data = build_dashboard(identity, requested_domain=code)
+    data = build_dashboard(identity, requested_domain=code,
+                           requested_finance_root=request.GET.get("root_organization_id"))
     if not data["sections"]:
-        return _error("当前岗位无权查看该统计专题。")
-    return JsonResponse({"code": 0, "msg": "", "data": data["sections"][0]})
+        return _access_denied("当前岗位无权查看该统计专题。")
+    section = data["sections"][0]
+    if section.get("access_denied"):
+        return _access_denied(section["metric_note"])
+    if code == "MATERIAL":
+        section["can_view_warehouse_lots"] = identity.can_view_warehouse_lots
+    return JsonResponse({"code": 0, "msg": "", "data": section})
 
 
 def material(request):
@@ -62,7 +80,9 @@ def material_warehouse_lots(request):
         data = build_factory_material_lot_catalog(
             identity, query=request.GET.get("q", ""), cursor=request.GET.get("cursor"),
         )
-    except (PermissionError, ValueError) as exc:
+    except PermissionError as exc:
+        return _access_denied(exc)
+    except ValueError as exc:
         return _error(exc)
     return JsonResponse({"code": 0, "msg": "", "data": data})
 
@@ -79,6 +99,10 @@ def quality(request):
     return _domain(request, "QUALITY")
 
 
+def finance(request):
+    return _domain(request, "FINANCE")
+
+
 def metric_definitions(request):
     error = _get_only(request)
     if error:
@@ -92,6 +116,8 @@ def metric_definitions(request):
         "code", "name", "domain", "unit", "description",
         "numerator_definition", "denominator_definition", "source_models",
     ))
+    for item in items:
+        item.update(MATERIAL_METRIC_DEFINITIONS.get(item["code"], {}))
     return JsonResponse({"code": 0, "msg": "", "data": {"items": items}})
 
 
@@ -143,7 +169,7 @@ def repair_basis(request):
     from lifecycle.services.aftersales_access import capabilities
     from lifecycle.services.repair_basis_service import catalog
     if not capabilities(identity.user)["can_view_repair_basis"]:
-        return _error("当前岗位无权查看维修结算依据。")
+        return _access_denied("当前岗位无权查看维修结算依据。")
     try:
         result = catalog(identity.user, request.GET.get("cursor"))
     except ValueError as exc:
