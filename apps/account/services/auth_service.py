@@ -23,7 +23,7 @@ WECHAT_BINDING_SALT = "account.api-access.wechat-binding.v1"
 # dedicated tourist accounts and the factory material-stock handovers.
 # Legacy tokens contain only user_id, so affected IDs must sign in again;
 # unrelated legacy sessions remain valid. New tokens are binding-aware.
-LEGACY_TOKEN_RELOGIN_USER_IDS = frozenset({2, 3, 4, 7, 8, 9, 24, 26, 27, 33, 35, 49, 51, 55, 57, 59})
+LEGACY_TOKEN_RELOGIN_USER_IDS = frozenset({1, 2, 3, 4, 7, 8, 9, 24, 26, 27, 33, 35, 49, 51, 55, 57, 59})
 
 
 class ApiAuthenticationError(Exception):
@@ -203,8 +203,9 @@ def build_user_payload(user: User) -> dict:
         factory_root_id = factory_root.pk if factory_root else None
         factory_root_name = factory_root.name if factory_root else ""
     else:
-        role_code = "tourist"
-        role_name = "游客"
+        is_platform_admin = bool(user.is_active and user.is_superuser)
+        role_code = "platform_admin" if is_platform_admin else "tourist"
+        role_name = "超级管理员" if is_platform_admin else "游客"
         company_name = ""
         region = ""
         organization_id = None

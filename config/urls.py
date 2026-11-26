@@ -33,3 +33,5 @@ urlpatterns.insert(0, path("", public_homepage, name="pldp_public_homepage"))
 
 # PLDP_UNIFIED_WEB_LOGIN_V1
 urlpatterns.insert(0, path("pldp/web/portal/", include("web_portal.urls")))
+# PLDP_ROOT_TRIAL_V1
+urlpatterns.insert(0, path("", include("root_trial.urls")))

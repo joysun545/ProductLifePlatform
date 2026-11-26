@@ -171,3 +171,6 @@ MIDDLEWARE.insert(MIDDLEWARE.index('django.contrib.auth.middleware.Authenticatio
 for _pldp_template_engine in TEMPLATES:
     if _pldp_template_engine.get('BACKEND') == 'django.template.backends.django.DjangoTemplates':
         _pldp_template_engine['DIRS'] = [BASE_DIR / 'pldp/web_templates'] + list(_pldp_template_engine.get('DIRS', []))
+# PLDP_ROOT_TRIAL_V1
+if 'root_trial' not in INSTALLED_APPS:
+    INSTALLED_APPS = list(INSTALLED_APPS) + ['root_trial']

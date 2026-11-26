@@ -1,0 +1,21 @@
+{% extends "admin/base_site.html" %}
+{% block content %}
+<div id="content-main">
+  <p><a href="{% url 'admin:root_trial_roottrialapplication_changelist' %}">返回申请列表</a></p>
+  <h2>{{ application.organization_name }}</h2>
+  <p>平台范围 · 申请编号：{{ application.id }} · 状态：{{ application.get_status_display }}</p>
+  <p>申请人：{{ application.applicant }} · 提交时间：{{ application.created_at }}</p>
+  <p><a href="{{ license_url }}" target="_blank" rel="noopener">查看企业营业执照</a></p>
+  {% if application.status == 'PENDING' %}
+  <p>审核通过后才会建立独立根组织，并将申请人设为厂家负责人。</p>
+  <form method="post">{% csrf_token %}
+    {{ form.as_p }}
+    <input type="submit" value="确认审核决定">
+  </form>
+  {% else %}
+  <p>审核人：{{ application.reviewed_by }} · 审核时间：{{ application.reviewed_at }}</p>
+  <p>审核说明：{{ application.review_reason|default:"无" }}</p>
+  {% if application.organization %}<p>根组织：{{ application.organization }}</p>{% endif %}
+  {% endif %}
+</div>
+{% endblock %}
