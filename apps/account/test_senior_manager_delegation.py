@@ -92,6 +92,51 @@ class SeniorManagerDelegationInvitationTests(TestCase):
             wx_openid=f"senior-test-openid-{suffix}",
         )
 
+    def test_owner_can_allocate_existing_role_holder_without_changing_inviter(self):
+        from account.services.auth_service import issue_access_token
+
+        employee = UserOrganization.objects.create(
+            user=self._user("existing"), organization=self.factory,
+            role=self.sales_role, inviter=self.owner,
+        )
+        manager = self._user("existing-manager")
+        membership = UserOrganization.objects.create(
+            user=manager, organization=self.factory, role=self.manager_role,
+        )
+        profile = SeniorManagerProfile.objects.create(identity=membership)
+        url = "/pldp/api/account/subordinates/managed-roles/"
+        token = {"HTTP_AUTHORIZATION": f"Bearer {issue_access_token(self.owner)}"}
+        update = self.client.post(url, {
+            "manager_id": manager.pk, "role_codes": [self.sales_role.code],
+        }, content_type="application/json", **token)
+        self.assertEqual(update.json()["code"], 0, update.json())
+        options = self.client.get(url, {"manager_id": manager.pk}, **token).json()["data"]["options"]
+        self.assertTrue(next(row for row in options if row["code"] == self.sales_role.code)["selected"])
+        self.assertEqual(list(profile.managed_roles.all()), [self.sales_role])
+        employee.refresh_from_db()
+        self.assertEqual(employee.inviter_id, self.owner.pk)
+
+        manager_token = {"HTTP_AUTHORIZATION": f"Bearer {issue_access_token(manager)}"}
+        denied = self.client.post(url, {
+            "manager_id": manager.pk, "role_codes": [],
+        }, content_type="application/json", **manager_token)
+        self.assertEqual(denied.json()["code"], 1)
+        self.assertTrue(profile.managed_roles.filter(pk=self.sales_role.pk).exists())
+
+    def test_retired_roles_are_excluded_from_invitation_options_and_new_invitations(self):
+        retired = OrganizationRole.objects.get(code="factory_purchase")
+        rule = RoleInvitationRule.objects.get(
+            inviter_role=self.owner_role, target_role=retired, scope=InvitationScope.SAME_ORGANIZATION,
+        )
+        rules = get_available_invitation_roles(self.owner)
+        self.assertNotIn(retired.code, {row["role"] for row in rules})
+        manager = next(row for row in rules if row["role"] == self.manager_role.code)
+        self.assertNotIn(retired.code, {
+            option["code"] for option in manager["senior_manager_setup"]["managed_role_options"]
+        })
+        with self.assertRaises(InvitationError):
+            create_staff_invitation(inviter=self.owner, rule_id=rule.pk)
+
     def test_owner_configures_manager_and_manager_invites_only_selected_role(self):
         owner_roles = get_available_invitation_roles(self.owner)
         manager_option = next(

@@ -80,6 +80,44 @@ class OrderPlanAccessoryFlowTests(V2OrderPlanFixture):
         self.assertTrue(created)
         return OrderPlan.objects.get(pk=result["plan"]["id"])
 
+    def test_accessory_prices_share_tiers_but_have_separate_and_cumulative_amounts(self):
+        from sales.models import OrderPlanFinance
+        from sales.services.factory_account_service import accounts
+        from sales.services.order_finance_service import OrderFinanceError
+        from sales.services.order_pricing_service import confirm_quote, quote, save_catalog_row, save_merchant_price
+
+        assistant = self.factory_assistant_1
+        _material, spec, _stock, _lot, _mapping = self._accessory(suffix="PRICE", stock_milli=10000)
+        plan = self._create_plan(request_id="accessory-priced", accessory_spec=spec, accessory_quantity="2.500")
+        device_key = str(self.generator.pk)
+        part_key = f"accessory-{spec.pk}"
+        save_catalog_row(assistant, device_key, {"A": "10", "B": "20", "C": "30"})
+        save_merchant_price(assistant, self.merchant.pk, "C")
+        self.assertFalse(quote(assistant, plan.pk, mini_program=True)["can_confirm"])
+        with self.assertRaisesRegex(OrderFinanceError, "尚未初始化"):
+            confirm_quote(assistant, plan.pk, "C", {}, {device_key: "30.00", part_key: None})
+        self.assertIsNone(OrderPlanFinance.objects.get(order_plan=plan).receivable_amount)
+
+        save_catalog_row(assistant, part_key, {"A": "1", "B": "2", "C": "3"})
+        prices = {device_key: "30.00", part_key: "3.00"}
+        first = confirm_quote(assistant, plan.pk, "C", {part_key: "3.01"}, prices)
+        self.assertEqual((first["version"], first["device_subtotal"], first["accessory_subtotal"], first["total"]),
+                         ("C-01", "60.00", "7.53", "67.53"))
+        self.assertEqual(confirm_quote(assistant, plan.pk, "C", {part_key: "3.01"}, prices), first)
+
+        save_catalog_row(assistant, device_key, {"A": "10", "B": "20", "C": "40"})
+        save_catalog_row(assistant, part_key, {"A": "1", "B": "2", "C": "4"})
+        next_plan = self._create_plan(request_id="accessory-priced-next", accessory_spec=spec, accessory_quantity=1)
+        prices = {line["price_key"]: line["unit_price"] for line in quote(assistant, next_plan.pk)["lines"]}
+        self.assertEqual(prices, {device_key: "40.00", part_key: "3.01"})
+        second = confirm_quote(assistant, next_plan.pk, "C", {}, prices, initialized_prices_only=True)
+        self.assertEqual((second["version"], second["total"]), ("C-01", "83.01"))
+        self.assertEqual(quote(assistant, plan.pk)["total"], "67.53")
+
+        account = next(row for row in accounts(self.merchant_owner)["accounts"] if row["merchant_id"] == self.merchant.pk)
+        self.assertEqual((account["device_receivable"], account["accessory_receivable"], account["receivable_amount"]),
+                         ("140.00", "10.54", "150.54"))
+
     def test_accessory_quantity_is_separate_and_moves_through_first_device_batch(self):
         _material, spec, _stock, lot, _mapping = self._accessory(
             suffix="MOVE", stock_milli=5_000

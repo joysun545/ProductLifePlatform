@@ -594,7 +594,11 @@ def _allocated_to_case_total(case):
 
 
 def _credit_allocated_total(case):
-    return case.credit_allocations.aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+    from sales.models import FactoryAccountFunding
+
+    legacy = case.credit_allocations.aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+    posted = FactoryAccountFunding.objects.filter(return_credit=case).values_list("amount", flat=True).first()
+    return legacy + (posted or Decimal("0.00"))
 
 
 def _case_outstanding(case):
@@ -1070,6 +1074,9 @@ def allocate_goods_transfer_credit(
         raise GoodsTransferAccountError("只有已确认的退货冲抵额度可以关联应收批次。")
     if identity.organization_id != case.upper_organization_id:
         raise GoodsTransferAccountError("只有直属上级组织可以执行应收冲抵。")
+    from sales.models import FactoryAccountFunding
+    if FactoryAccountFunding.objects.filter(return_credit=case).exists():
+        raise GoodsTransferAccountError("该退货额度已进入厂家与直属商家的累计往来账。")
     allocation_amount = _parse_amount(amount, "冲抵金额")
     available = case.confirmed_amount - _credit_allocated_total(case)
     if allocation_amount > available:

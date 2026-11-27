@@ -762,6 +762,7 @@ class AfterSalesService:
             )
             .filter(
                 status=AfterSalesServiceStationApplication.Status.APPROVED,
+                organization__organization_type__code="MERCHANT",
                 organization__is_active=True,
                 organization__factory_root_id=root.pk,
             )
@@ -1412,6 +1413,26 @@ class AfterSalesService:
         }
         if payload:
             extra.update(payload)
+        if application.customer_organization_id:
+            from lifecycle.services.customer_task_scope import (
+                AFTERSALES_CUSTOMER_NOTICE, device_customer_openids,
+            )
+
+            peers = device_customer_openids(
+                application.customer_organization_id,
+                [pk for pk in (application.device_id, application.replacement_device_id) if pk],
+            )
+            peers = [peer for peer in peers if peer != openid]
+            if peers:
+                publish_workitem(
+                    domain="AFTERSALE", type=AFTERSALES_CUSTOMER_NOTICE,
+                    biz_id=str(application.pk), biz_ref=f"AfterSalesApplication:{application.pk}",
+                    uniq_key=f"aftersales:{application.pk}:customer-collaboration",
+                    title=title, summary=summary, link=cls._link(application),
+                    recipients_openids=peers, need_action=False,
+                    payload=cls._task_payload(application, extra={"applicant_update_topic": topic}),
+                    actor_openid=actor_openid,
+                )
         return publish_workitem(
             domain="AFTERSALE",
             type=cls.APPLICANT_WORKORDER_TYPE,
@@ -1690,12 +1711,10 @@ class AfterSalesService:
 
     @classmethod
     def _triage_dispatch_route_choices(cls):
-        """Current review UI uses service stations; keep the old route for history."""
+        route = AfterSalesApplication.DispatchRoute
         return tuple(
-            choice
-            for choice in AfterSalesApplication.DispatchRoute.choices
-            if choice[0]
-            != AfterSalesApplication.DispatchRoute.MERCHANT_ELECTRICIAN
+            (choice.value, choice.label)
+            for choice in (route.ORIGINAL_INSTALLER, route.SERVICE_STATION, route.FACTORY_AFTERSALES)
         )
 
     @classmethod
@@ -1831,22 +1850,6 @@ class AfterSalesService:
         return rows
 
     @classmethod
-    def _third_party_snapshot(cls, data):
-        name = str(data.get("third_party_name") or "").strip()
-        contact_name = str(data.get("third_party_contact_name") or "").strip()
-        phone = str(data.get("third_party_phone") or "").strip()
-        address = str(data.get("third_party_address") or "").strip()
-        if not name or not phone or not address:
-            raise AfterSalesError("第三方维修路径需填写维修店名称、联系电话和详细地址")
-        return {
-            "name": name,
-            "contact_name": contact_name,
-            "phone": phone,
-            "address": address,
-            "assigned_at": timezone.now().isoformat(),
-        }
-
-    @classmethod
     def _applicant_instruction(cls, application):
         snapshot = application.assignee_snapshot or {}
         route = application.dispatch_route
@@ -1869,10 +1872,6 @@ class AfterSalesService:
                 "contact": snapshot,
                 "repair_plan": application.repair_plan,
             }
-        if route==AfterSalesApplication.DispatchRoute.FACTORY_AFTERSALES and data.get('factory_transport_version')==1:
-            from lifecycle.services.factory_transport_service import begin
-            begin(application,user,'REPAIR','DIRECT')
-            return cls.serialize(application)
         if route in {
             AfterSalesApplication.DispatchRoute.MERCHANT_ELECTRICIAN,
             AfterSalesApplication.DispatchRoute.FACTORY_AFTERSALES,
@@ -1956,7 +1955,6 @@ class AfterSalesService:
                 raise AfterSalesError(installer_check["message"])
         if route in {
             AfterSalesApplication.DispatchRoute.ORIGINAL_INSTALLER,
-            AfterSalesApplication.DispatchRoute.MERCHANT_ELECTRICIAN,
             AfterSalesApplication.DispatchRoute.FACTORY_AFTERSALES,
         }:
             requested_id = str(data.get("assigned_user_id") or "")
@@ -2019,11 +2017,7 @@ class AfterSalesService:
                 "missing_materials": fallback_preview.get("missing_materials"),
                 "selection_rule": "NEAREST_ELIGIBLE_STATION_ONLY",
             }
-        application.third_party_snapshot = (
-            cls._third_party_snapshot(data)
-            if route == AfterSalesApplication.DispatchRoute.THIRD_PARTY
-            else {}
-        )
+        application.third_party_snapshot = {}
         cls._complete_tasks(
             application,
             steps=["review"],
@@ -2051,18 +2045,6 @@ class AfterSalesService:
                 "third_party": application.third_party_snapshot,
             },
         )
-
-        if route == AfterSalesApplication.DispatchRoute.REMOTE:
-            application.status = AfterSalesApplication.Status.SUBMITTED
-            application.execution_stage = AfterSalesApplication.ExecutionStage.NONE
-            cls._close_application(
-                application,
-                user=user,
-                identity=identity,
-                data=data,
-                event_type="REMOTE_RESOLVED_AND_CLOSED",
-            )
-            return cls.serialize(application)
 
         if route == AfterSalesApplication.DispatchRoute.ORIGINAL_INSTALLER:
             application.status = AfterSalesApplication.Status.PROCESSING
@@ -2142,35 +2124,10 @@ class AfterSalesService:
             )
             return cls.serialize(application)
 
-        if route in {
-            AfterSalesApplication.DispatchRoute.MERCHANT_ELECTRICIAN,
-            AfterSalesApplication.DispatchRoute.FACTORY_AFTERSALES,
-        }:
-            application.status = AfterSalesApplication.Status.ROUTING
-            application.execution_stage = (
-                AfterSalesApplication.ExecutionStage.AWAITING_APPLICANT_SHIPMENT
-            )
-            application.save()
-            cls._publish_applicant_workorder(
-                application,
-                topic="applicant-shipment-required",
-                title="请寄送设备至指定维修人",
-                summary=(
-                    f"{cls._summary(application)}｜寄送至 "
-                    f"{application.assignee_snapshot.get('organization_name') or ''}，"
-                    "请按服务单地址上传物流单据后确认寄送"
-                ),
-                actor_openid=user.wx_openid or "",
-                need_action=True,
-            )
-            cls._publish_assignee_workorder(
-                application,
-                topic="awaiting-applicant-shipment",
-                title="已接受售后指派，等待发起人寄送设备",
-                summary=f"{cls._summary(application)}｜发起人尚未确认寄送",
-                actor_openid=user.wx_openid or "",
-                need_action=False,
-            )
+        if data.get("factory_transport_version") == 1:
+            from lifecycle.services.factory_transport_service import begin
+
+            begin(application, user, "REPAIR", "DIRECT")
             cls._event(
                 application,
                 "DISPATCHED",
@@ -2180,26 +2137,30 @@ class AfterSalesService:
             )
             return cls.serialize(application)
 
-        application.status = AfterSalesApplication.Status.PROCESSING
+        application.status = AfterSalesApplication.Status.ROUTING
         application.execution_stage = (
-            AfterSalesApplication.ExecutionStage.THIRD_PARTY_REPAIR
+            AfterSalesApplication.ExecutionStage.AWAITING_APPLICANT_SHIPMENT
         )
         application.save()
-        recipients = cls._factory_aftersales_openids(application)
-        cls._publish_factory_workorder(
+        cls._publish_applicant_workorder(
             application,
-            topic="third-party-material-shipment-required",
-            title="第三方紧急维修：登记备件寄送",
-            summary=cls._summary(application),
+            topic="applicant-shipment-required",
+            title="请寄送设备至指定维修人",
+            summary=(
+                f"{cls._summary(application)}｜寄送至 "
+                f"{application.assignee_snapshot.get('organization_name') or ''}，"
+                "请按服务单地址上传物流单据后确认寄送"
+            ),
             actor_openid=user.wx_openid or "",
             need_action=True,
         )
-        cls._publish_applicant_notice(
+        cls._publish_assignee_workorder(
             application,
-            topic="third-party-assigned",
-            title="厂家已安排第三方紧急维修",
-            summary=f"{cls._summary(application)}｜请留意厂家后续处理通知",
+            topic="awaiting-applicant-shipment",
+            title="已接受售后指派，等待发起人寄送设备",
+            summary=f"{cls._summary(application)}｜发起人尚未确认寄送",
             actor_openid=user.wx_openid or "",
+            need_action=False,
         )
         cls._event(
             application,
@@ -2834,7 +2795,7 @@ class AfterSalesService:
             application,
             actor_openid=user.wx_openid or "",
         )
-        is_remote_guidance = event_type == "REMOTE_RESOLVED_AND_CLOSED"
+        is_remote_guidance = solution_type == AfterSalesApplication.SolutionType.REMOTE_GUIDANCE
         cls._publish_applicant_notice(
             application,
             topic="factory-closed",

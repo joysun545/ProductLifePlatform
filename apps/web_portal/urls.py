@@ -1,6 +1,8 @@
 from django.urls import path
 from . import views
+from . import merchant_accounts
 urlpatterns=[
+ path("merchant-accounts/",merchant_accounts.workbench,name="merchant_accounts"),
  path('',views.workbench,name='workbench'),
  path('api/start/',views.start,name='start'),
  path('api/approve/',views.approve,name='approve'),

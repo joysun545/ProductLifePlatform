@@ -19,6 +19,7 @@ from sales.models import OrderPlan, OrderPlanCancellationAudit, OrderPlanFinance
 from workflow.models import WorkItem
 from workflow.services.workflow_service import publish_workitem
 
+from .pricing_totals import pricing_amounts
 from .order_receivable_service import (
     allocate_payment_fifo, financial_write_errors, invoice_totals, lock_receivable_account,
     pair_context, synchronize_receivable_account,
@@ -228,7 +229,7 @@ def initialize_order_finance(plan, user=None):
         return finance
     if not finance.statement_submitted_at:
         _task(plan, stage="statement", work_type="ORDER_PLAN_FINANCE_STATEMENT",
-              title="订单清单待制作", role="factory_sales_assistant", user=user)
+              title="订单清单待确认计价", role="factory_sales_assistant", user=user)
     else:
         _reconcile(finance, user)
     return finance
@@ -468,6 +469,8 @@ def serialize_order_finance(*, user, plan):
             "receivable_amount": format(context["receivable_amount"], ".2f"),
             "received_amount": format(context["received_amount"], ".2f"),
             "outstanding_amount": format(context["outstanding_amount"], ".2f"),
+            "balance_amount": format(context["balance_amount"], ".2f"),
+            "return_credit_amount": format(context["return_credit_amount"], ".2f"),
             "overpaid_amount": format(context["overpaid_amount"], ".2f"),
             "carry_forward_amount": format(context["carry_forward_amount"], ".2f"),
             "orders": [{
@@ -488,15 +491,20 @@ def serialize_order_finance(*, user, plan):
         "allocated_received_amount": format(totals["allocated_received_amount"], ".2f"),
         "unapplied_amount": format(totals["unapplied_amount"], ".2f"),
         "outstanding_amount": format(totals["outstanding_amount"] or zero, ".2f"),
+        "return_credit_amount": format(totals.get("return_credit_amount", zero), ".2f"),
         "overpaid_amount": format(totals["overpaid_amount"], ".2f"),
         "rolling_receivables": rolling,
         "excluded_from_rolling": not active,
         "statement_submitted_at": _date(finance.statement_submitted_at) if finance else None,
         "statement_original_name": finance.statement_original_name if finance else "",
         "statement_url": f"/pldp/api/sales/order-plans/{plan.pk}/finance/statement/file/" if finance and finance.statement_image else "",
-        "can_submit_statement": bool(active and assistant and not submitted),
-        "can_upload_payment": bool(active and owner and submitted and is_current
-                                   and context["outstanding_amount"] > 0 and not pending_ids),
+        "can_submit_statement": False,
+        "can_price_order": bool(active and assistant and not submitted),
+        "priced_lines": finance.priced_lines if finance else [],
+        **pricing_amounts(finance.priced_lines if finance else []),
+        "pricing_version": finance.pricing_version if finance else "",
+        "can_open_factory_payment": bool(owner),
+        "can_upload_payment": False,
         "next_sequence_no": max(own_sequences, default=0) + 1,
         "payments": payment_rows,
     }

@@ -242,7 +242,6 @@ class MerchantShipmentDocumentsOnlyTests(TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(b"".join(response.streaming_content), png_bytes())
             self.assertEqual(response["Cache-Control"], "private, no-store")
-            response.close()
         response = self.client.get(self.url(flow, "statement-file/"), **self.auth(self.outsider))
         self.assertNotEqual(response.json()["code"], 0)
 
@@ -258,7 +257,6 @@ class MerchantShipmentDocumentsOnlyTests(TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(b"".join(response.streaming_content), png_bytes())
             self.assertEqual(response["Cache-Control"], "private, no-store")
-            response.close()
         response = self.client.get(self.url(flow, f"logistics-documents/{document_id}/file/"), **self.auth(self.outsider))
         self.assertNotEqual(response.json()["code"], 0)
         self.assert_no_money()

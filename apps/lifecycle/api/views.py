@@ -1313,6 +1313,23 @@ class DriverVehicleInvitationCreateAPI(APIView):
         return Response({"code": 0, "msg": "success", "data": data}, status=201)
 
 
+class DriverVehicleShareRevokeAPI(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, vehicle_id, driver_id):
+        try:
+            user = authenticate_request(request)
+            data = CustomerDeviceService.revoke_driver_share(
+                vehicle_id=vehicle_id, driver_id=driver_id, user=user,
+            )
+        except ApiAuthenticationError as exc:
+            return Response({"code": 401, "msg": str(exc), "data": {}}, status=401)
+        except (CustomerFlowPermissionError, CustomerFlowStateError) as exc:
+            return _customer_flow_error_response(exc)
+        return Response({"code": 0, "data": data})
+
+
 class DriverVehicleInvitationDetailAPI(APIView):
     """司机打开车辆分享链接时读取车辆及设备清单。"""
 

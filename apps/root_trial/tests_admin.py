@@ -117,4 +117,4 @@ class RootTrialAdminTests(TestCase):
         self.assertEqual(response["Content-Type"], "image/png")
         self.assertIn("private", response["Cache-Control"])
         self.assertIn("no-store", response["Cache-Control"])
-        response.close()
+        self.assertTrue(b"".join(response.streaming_content).startswith(b"\x89PNG\r\n\x1a\n"))

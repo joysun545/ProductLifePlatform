@@ -10,15 +10,16 @@ from django.utils import timezone
 
 
 class OrderRollingReceivablesMigrationTests(TransactionTestCase):
-    serialized_rollback = True
-
     def test_upgrade_caps_origin_allocations_preserves_excess_and_all_original_audits(self):
         executor = MigrationExecutor(connection)
         latest = executor.loader.graph.leaf_nodes()
         old_target = [("sales", "0021_shipment_outbound_and_evidence")]
         executor.migrate(old_target)
         self.addCleanup(lambda: MigrationExecutor(connection).migrate(latest))
-        old = executor.loader.project_state(old_target).apps
+        # The downgrade targets only this domain. Account and workflow tables
+        # keep their current shape, so fixtures must use those model states.
+        retained = [target for target in latest if target[0] in {"account", "workflow"}]
+        old = executor.loader.project_state([*old_target, *retained]).apps
         now = timezone.now()
         OrgType = old.get_model("account", "OrganizationType")
         Organization = old.get_model("account", "Organization")
@@ -111,7 +112,12 @@ class OrderRollingReceivablesMigrationTests(TransactionTestCase):
         self.assertFalse(Allocation.objects.filter(payment_id=pending.pk).exists())
         self.assertEqual(Payment.objects.get(pk=paid2.pk).confirmed_amount, Decimal("700"))
         for name, expected in snapshots.items():
-            self.assertEqual(list(current.get_model("sales", name).objects.order_by("pk").values()), expected)
+            actual = list(current.get_model("sales", name).objects.order_by("pk").values())
+            if name == "OrderPlanFinance":
+                for row in actual:
+                    self.assertEqual(row.pop("priced_lines"), [])
+                    self.assertEqual(row.pop("pricing_version"), "")
+            self.assertEqual(actual, expected)
         self.assertEqual(list(current.get_model("workflow", "WorkItem").objects.order_by("pk").values()), works)
         self.assertEqual(list(current.get_model("workflow", "UserTask").objects.order_by("pk").values()), tasks)
         allocated = list(Allocation.objects.order_by("pk").values())

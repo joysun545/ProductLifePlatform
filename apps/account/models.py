@@ -528,6 +528,16 @@ class UserOrganization(models.Model):
     def clean(self):
         super().clean()
 
+        from account.services.retired_roles import RETIRED_ROLE_CODES
+
+        if self.is_active and self.role_id and self.role.code in RETIRED_ROLE_CODES:
+            retains_existing = self.pk and type(self).objects.filter(
+                pk=self.pk, user_id=self.user_id, organization_id=self.organization_id,
+                role_id=self.role_id, is_active=True,
+            ).exists()
+            if not retains_existing:
+                raise ValidationError({"role": "该岗位已退出新增分配"})
+
         if self.is_active and self.organization_id:
             factory_root = self.organization.get_factory_root()
             if not factory_root:

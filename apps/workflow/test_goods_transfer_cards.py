@@ -1,4 +1,4 @@
-"""One personal inbox card for one physical goods flow, including its money."""
+"""One personal inbox card for one physical goods flow and its documents."""
 
 from datetime import timedelta
 from tempfile import TemporaryDirectory
@@ -73,8 +73,8 @@ class GoodsTransferCardProjectionTests(TestCase):
         first = self.task(state="DONE", title="货品清单和物流单据已提交")
         initial = self.cards()[0]
         pending = self.task(
-            need_action=True, state="READ", task_type="GOODS_TRANSFER_PAYMENT_CONFIRM",
-            title="第1笔商品收款待确认",
+            need_action=True, state="READ", task_type="GOODS_TRANSFER_DOCUMENTS_UPLOAD",
+            title="货品清单待提交",
             link=f"/pages/stock/goods_transfer_settlement/goods_transfer_settlement?transfer_id={self.transfer.pk}",
         )
         notice = self.task(task_type="GOODS_TRANSFER_NOTICE", title="收货方已确认商品入库")
@@ -87,7 +87,7 @@ class GoodsTransferCardProjectionTests(TestCase):
         self.assertEqual(card["group_id"], initial["group_id"])
         self.assertEqual(card["card_id"], initial["card_id"])
         self.assertEqual(card["entry_task_id"], pending.pk)
-        self.assertIn("收款待确认", card["title"])
+        self.assertIn("清单待提交", card["title"])
         self.assertIn("goods_transfer_settlement", card["link"])
         self.assertEqual(card["child_count"], 3)
         self.assertEqual(card["unread_count"], 1)
@@ -99,7 +99,7 @@ class GoodsTransferCardProjectionTests(TestCase):
 
     def test_two_unread_operations_count_as_one_attention_but_remain_executable(self):
         receipt = self.task(need_action=True)
-        payment = self.task(need_action=True, task_type="GOODS_TRANSFER_PAYMENT_UPLOAD", title="上传付款凭证")
+        documents = self.task(need_action=True, task_type="GOODS_TRANSFER_DOCUMENTS_UPLOAD", title="上传商业单据")
         summary = get_task_summary(self.user.wx_openid)
         self.assertEqual(summary["unread_count"], 1)
         self.assertEqual(summary["action_pending_count"], 1)
@@ -108,7 +108,7 @@ class GoodsTransferCardProjectionTests(TestCase):
         self.assertEqual(card["child_unread_count"], 2)
         self.assertEqual(card["child_action_pending_count"], 2)
         open_task(self.user.wx_openid, receipt.pk)
-        for task in (receipt, payment):
+        for task in (receipt, documents):
             task.refresh_from_db()
             task.workitem.refresh_from_db()
             self.assertEqual(task.state, "READ")
@@ -120,7 +120,7 @@ class GoodsTransferCardProjectionTests(TestCase):
     def test_distinct_transfers_to_same_counterparty_stay_separate(self):
         for transfer in (self.transfer, self.second):
             self.task(transfer=transfer, need_action=True)
-            self.task(transfer=transfer, task_type="GOODS_TRANSFER_PAYMENT_UPLOAD", need_action=True)
+            self.task(transfer=transfer, task_type="GOODS_TRANSFER_DOCUMENTS_UPLOAD", need_action=True)
         cards = self.cards()
         self.assertEqual(len(cards), 2)
         self.assertEqual(len({card["group_id"] for card in cards}), 2)
@@ -170,7 +170,7 @@ class GoodsTransferCardProjectionTests(TestCase):
     def test_opening_completed_old_card_acknowledges_only_own_flow_updates(self):
         old = self.task(state="DONE", title="货品清单和物流单据已提交")
         notice = self.task(task_type="GOODS_TRANSFER_NOTICE")
-        pending = self.task(need_action=True, task_type="GOODS_TRANSFER_PAYMENT_CONFIRM",
+        pending = self.task(need_action=True, task_type="GOODS_TRANSFER_DOCUMENTS_UPLOAD",
                             link=f"/pages/stock/goods_transfer_settlement/goods_transfer_settlement?transfer_id={self.transfer.pk}")
         peer_notice = UserTask.objects.create(workitem=notice.workitem, to_openid=self.peer.wx_openid)
         peer_pending = UserTask.objects.create(workitem=pending.workitem, to_openid=self.peer.wx_openid, need_action=True)
@@ -288,57 +288,38 @@ class GoodsTransferCardLifecycleTests(TestCase):
         self.one_card(self.child_c_owner, group_id=second_child_group)
         self.assertEqual(GoodsTransfer.objects.get(pk=second["id"]).status, "PENDING_RECEIPT")
 
-    def test_receipt_and_two_payment_rounds_update_original_card_for_collaborators(self):
+    def test_receipt_and_document_updates_keep_the_original_cards(self):
         flow = self.start_shipment(self.devices[0], self.child_b_owner, "cards-full-flow")
         base = f"{self.endpoint}{flow['id']}/"
-        users = (self.parent_owner, self.parent_sales, self.parent_stock,
-                 self.child_b_owner, self.child_b_sales, self.child_b_stock)
-        groups = {user.pk: self.one_card(user)["group_id"] for user in users}
-        original_receipt = UserTask.objects.get(
+        upstream = (self.parent_owner, self.parent_sales, self.parent_stock)
+        receivers = (self.child_b_owner, self.child_b_stock)
+        groups = {user.pk: self.one_card(user)["group_id"] for user in (*upstream, *receivers)}
+        receipt = UserTask.objects.get(
             to_openid=self.child_b_owner.wx_openid,
             workitem__type="GOODS_TRANSFER_RECEIPT_CONFIRM",
             workitem__biz_ref=f"lifecycle.GoodsTransfer:{flow['id']}",
         )
         self.post(base + "settlement/statement/", self.parent_owner, {
-            "receivable_amount": "1000.00", "statement_image": self.image_file("statement.png"),
+            "statement_image": self.image_file("statement.png"),
         })
-        before_receipt = self.one_card(self.child_b_owner, group_id=groups[self.child_b_owner.pk])
-        self.assertEqual(before_receipt["child_action_pending_count"], 2)
-        self.assertEqual(before_receipt["action_pending_count"], 1)
+        for user in upstream:
+            self.assertEqual(self.one_card(user, group_id=groups[user.pk])["action_pending_count"], 1)
+        for user in receivers:
+            self.assertEqual(self.one_card(user, group_id=groups[user.pk])["child_action_pending_count"], 1)
+
         self.post(base + "settlement/logistics-documents/", self.parent_stock, {
             "client_request_id": "cards-logistics", "document_file": self.image_file("logistics.png"),
         })
         self.post(base + "receipt/", self.child_b_stock)
         self.assertEqual(OrganizationDevice.objects.get(device=self.devices[0]).organization_id, self.child_b.pk)
-        # Receipt by a collaborating stock keeper ends only the receipt action.
-        lower_card = self.one_card(self.child_b_owner, group_id=groups[self.child_b_owner.pk])
-        self.assertEqual(lower_card["child_action_pending_count"], 1)
-        self.assertEqual(lower_card["entry_task_type"], "GOODS_TRANSFER_PAYMENT_UPLOAD")
-        original_receipt.refresh_from_db()
-        self.assertEqual(original_receipt.state, "DONE")
-        open_task(self.child_b_owner.wx_openid, original_receipt.pk)
-        self.assertEqual(get_task_summary(self.child_b_owner.wx_openid)["action_pending_count"], 1)
-        historical_ids = set(UserTask.objects.values_list("pk", flat=True))
-        for sequence, amount in ((1, "400.00"), (2, "600.00")):
-            voucher = self.post(base + "settlement/payments/", self.child_b_owner, {
-                "client_request_id": f"cards-payment-{sequence}",
-                "voucher_image": self.image_file(f"payment-{sequence}.png"),
-            })
-            payment = voucher["payments"][-1]
-            for user in (self.parent_owner, self.parent_sales, self.parent_stock):
-                card = self.one_card(user, group_id=groups[user.pk])
-                self.assertEqual(card["entry_task_type"], "GOODS_TRANSFER_PAYMENT_CONFIRM")
-                self.assertEqual(card["action_pending_count"], 1)
-            confirmed = self.post(base + f"settlement/payments/{payment['id']}/confirm/", self.parent_sales,
-                                  {"confirmed_amount": amount}, json=True)
-            self.assertEqual(confirmed["outstanding_amount"], "600.00" if sequence == 1 else "0.00")
-            for user in users:
-                self.one_card(user, group_id=groups[user.pk])
-        self.assertEqual(confirmed["confirmed_received_amount"], "1000.00")
-        self.assertEqual(confirmed["state"], "FULLY_RECEIVED")
-        self.assertTrue(historical_ids.issubset(set(UserTask.objects.values_list("pk", flat=True))))
-        for user in users:
+        receipt.refresh_from_db()
+        self.assertEqual(receipt.state, "DONE")
+        self.assertFalse(WorkItem.objects.filter(
+            biz_ref=f"lifecycle.GoodsTransfer:{flow['id']}",
+            type__startswith="GOODS_TRANSFER_PAYMENT_",
+        ).exists())
+        for user in (*upstream, *receivers):
             card = self.one_card(user, group_id=groups[user.pk])
+            self.assertEqual(card["action_pending_count"], 0)
             open_task(user.wx_openid, card["entry_task_id"])
             self.assertEqual(get_task_summary(user.wx_openid)["attention_count"], 0)
-            self.assertEqual(self.one_card(user, group_id=groups[user.pk])["state"], "DONE")

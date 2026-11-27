@@ -469,3 +469,28 @@ def accept_invitation(request):
         {"code": 0, "msg": "加入成功", "data": result},
         status=200,
     )
+
+@csrf_exempt
+def subordinate_managed_roles(request):
+    from account.services.role_delegation_service import (
+        ManagedRoleConflict, read_managed_roles, update_managed_roles,
+    )
+
+    if request.method not in {"GET", "POST"}:
+        return _method_error("GET 或 POST")
+    user, error_response = _authenticated_user(request)
+    if error_response:
+        return error_response
+    data = request.GET if request.method == "GET" else _request_data(request)
+    try:
+        raw_id = data.get("manager_id")
+        if not isinstance(raw_id, (str, int)) or not str(raw_id).isascii() or not str(raw_id).isdecimal() or len(str(raw_id)) > 19:
+            raise ManagedRoleConflict("高级经理账号无效")
+        manager_id = int(raw_id)
+        if request.method == "POST":
+            result = {"managed_roles": update_managed_roles(user, manager_id, data.get("role_codes"))}
+        else:
+            result = {"options": read_managed_roles(user, manager_id)}
+    except ManagedRoleConflict as exc:
+        return JsonResponse({"code": 1, "msg": str(exc)}, status=200)
+    return JsonResponse({"code": 0, "data": result}, status=200)

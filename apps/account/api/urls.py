@@ -20,6 +20,7 @@ urlpatterns = [
         views.subordinates,
         name="subordinates",
     ),
+    path("subordinates/managed-roles/", views.subordinate_managed_roles, name="subordinate_managed_roles"),
     path(
         "subordinates/after-sales-qualification/",
         views.update_subordinate_after_sales_qualification,

@@ -911,6 +911,8 @@ def _task_groups(openid):
         .filter(to_openid=openid, badge_group="MY")
         .order_by("-cursor_time", "-id")
     )
+    from lifecycle.services.customer_task_scope import filter_aftersales_customer_tasks
+    tasks = filter_aftersales_customer_tasks(tasks, openid)
     _prime_goods_transfer_scopes(tasks)
     tasks = _without_discontinued_merchant_finance(tasks)
     grouped = {}

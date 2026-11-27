@@ -87,6 +87,37 @@ class FactoryTransportTests(TestCase):
             self.call('DECIDE',decision='REPLACEMENT',replacement_flow_version=3,execution_mode='FACTORY',receiving_address='厂家收件地址',factory_transport_version=1)
         else:F.begin(self.case,self.af,kind,route)
         return self.refresh()
+    def test_factory_triage_starts_direct_transport_before_applicant_reads_detail(self):
+        self.factory.address = "厂家收件地址"
+        self.factory.save(update_fields=["address"])
+        self.case.status = "SUBMITTED"
+        self.case.execution_stage = "NONE"
+        self.case.dispatch_route = ""
+        self.case.escalation = {}
+        self.case.save()
+        url = f"/pldp/api/lifecycle/after-sales/applications/{self.case.pk}/"
+        dispatch = self.client.post(
+            url + "triage/",
+            {
+                "preliminary_fault_type": "INSTALLATION_OR_WIRING",
+                "diagnosis_note": "依据设备视频检查线路。",
+                "repair_plan": "直接返厂检查。",
+                "dispatch_route": "FACTORY_AFTERSALES",
+                "assigned_user_id": self.af.pk,
+                "factory_transport_version": 1,
+            },
+            content_type="application/json",
+            HTTP_AUTHORIZATION="Bearer " + issue_access_token(self.af),
+        )
+        self.assertEqual(dispatch.status_code, 200, dispatch.json())
+        self.assertEqual(self.refresh()["route"], "DIRECT")
+        self.assertEqual(self.case.assigned_user_id, self.af.pk)
+        detail = self.client.get(
+            url, HTTP_AUTHORIZATION="Bearer " + issue_access_token(self.case.applicant)
+        )
+        self.assertEqual(detail.status_code, 200, detail.json())
+        self.assertEqual(detail.json()["data"]["factory_transport"]["state"], "INBOUND")
+
     def send(self,direction,index,user):
         proof=self.proof(user,direction,index)
         return self.call('FACTORY_TRANSPORT_SEND',user,direction=direction,index=index,document_ids=[proof.pk],logistics_company='顺丰',tracking_no='SF-'+direction+str(index))

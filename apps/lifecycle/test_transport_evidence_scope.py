@@ -579,6 +579,9 @@ class FactoryTransportConcurrentMediaAcceptance(UploadAssertions, TransactionTes
     ft_upload = FactoryTransportMediaAcceptance.ft_upload
 
     def setUp(self):
+        from account.test_reference import restore_account_test_reference
+
+        restore_account_test_reference()
         self.fixture.setUpTestData.__func__(type(self))
         self.baseline.setUp(self)
 

@@ -736,6 +736,30 @@ class CustomerDeviceService:
         }
 
     @classmethod
+    @transaction.atomic
+    def revoke_driver_share(cls, *, vehicle_id, driver_id, user):
+        identity = cls._customer_identity(user)
+        if identity.role.code != "customer_owner":
+            raise CustomerFlowPermissionError("只有用户负责人可以取消车辆分享")
+        bindings = DriverVehicleBinding.objects.filter(
+            vehicle_id=vehicle_id, vehicle__customer_organization_id=identity.organization_id,
+            driver_id=driver_id,
+        )
+        if not bindings.exists():
+            raise CustomerFlowStateError("未找到本组织该车辆的司机分享")
+        # Match acceptance's lock order for this driver. Old unclaimed links
+        # are general vehicle invitations and could otherwise restore access.
+        User.objects.select_for_update().get(pk=driver_id)
+        if not bindings.filter(is_active=True).exists():
+            return {"vehicle_id": vehicle_id, "driver_id": driver_id, "changed": False}
+        now = timezone.now()
+        DriverVehicleInvitation.objects.filter(
+            vehicle_id=vehicle_id, status=DriverVehicleInvitation.Status.PENDING,
+        ).update(status=DriverVehicleInvitation.Status.CANCELLED, updated_at=now)
+        changed = bindings.filter(is_active=True).update(is_active=False, updated_at=now)
+        return {"vehicle_id": vehicle_id, "driver_id": driver_id, "changed": bool(changed)}
+
+    @classmethod
     def create_driver_invitation(cls, *, vehicle_id, user):
         identity = cls._customer_identity(user)
         if identity.role.code != "customer_owner":

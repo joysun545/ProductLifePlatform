@@ -335,7 +335,7 @@ class LinkedReplacementHandoffTests(TestCase):
         )
         self.assertEqual(carrier.items.count(), 1)
         self.assertFalse(carrier.items.filter(device=replacement).exists())
-        self.assertEqual(carrier.settlement.receivable_amount, Decimal("500.00"))
+        self.assertIsNone(carrier.settlement.receivable_amount)
         self._assert_normal(order, shipment, ids, replacement, "SHIPPED")
         normal_receipt_task = WorkItem.objects.get(
             type="ORDER_PLAN_V2_MERCHANT_RECEIPT",

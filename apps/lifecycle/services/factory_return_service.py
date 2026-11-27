@@ -1094,6 +1094,9 @@ def _sync_assistant_action(transfer, actor):
             "required_substeps": ["CREDIT_AMOUNT", "INVENTORY_POSTING"],
         },
     )
+    if amount_done and posting_done:
+        from sales.services.factory_account_service import post_return_credit
+        post_return_credit(account_case, actor)
     if amount_done and posting_done and workitem.status == "OPEN":
         _complete_action(
             transfer,

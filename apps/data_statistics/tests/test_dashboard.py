@@ -7,7 +7,7 @@ from data_statistics.services.flow_service import _counts
 from data_statistics.services.flow_service import build_flow_statistics
 from lifecycle.models import ActivationRecord, AfterSalesApplication, Device, InstallationRecord, OrganizationDevice
 from manufacturing.models import ProductionBatch
-from product.models import BOM, Brand, ProductCategory, ProductModel
+from product.models import BOM, ProductCategory, ProductModel
 from supply_chain.models import FactoryMaterialLot, FactoryMaterialStock, Material, MaterialSpec
 from data_statistics.services.material_service import build_factory_material_lot_catalog
 
@@ -25,8 +25,7 @@ class DataStatisticsDashboardTests(TestCase):
         cls.user = User.objects.create_user(username="stats-chief")
         UserOrganization.objects.create(user=cls.user, organization=cls.factory, role=role)
         category = ProductCategory.objects.create(name="统计品类", code="STATS-CATEGORY")
-        brand = Brand.objects.create(name="统计品牌", code="STATS-BRAND")
-        product = ProductModel.objects.create(code="STATS-MODEL", name="统计型号", category=category, brand=brand)
+        product = ProductModel.objects.create(code="STATS-MODEL", name="统计型号", category=category)
         bom = BOM.objects.create(product_model=product, version="V1", created_by=cls.user)
         batch = ProductionBatch.objects.create(
             batch_no="STATS-BATCH", product_model=product, bom=bom,
@@ -81,7 +80,7 @@ class DataStatisticsDashboardTests(TestCase):
         role = OrganizationRole.objects.get(organization_type__code="OWNER", code="factory_material_stock")
         keeper = User.objects.create_user(username="stats-material-keeper")
         UserOrganization.objects.create(user=keeper, organization=self.factory, role=role)
-        supplier = Organization.objects.create(name="南方供应商", code="STATS-SUPPLIER", organization_type=OrganizationType.objects.get(code="SUPPLIER"))
+        supplier = Organization.objects.create(name="南方供应商", code="STATS-SUPPLIER", organization_type=OrganizationType.objects.get(code="SUPPLIER"), factory_root=self.factory)
         material = Material.objects.create(code="STATS-MATERIAL", name="物料控制器")
         spec = MaterialSpec.objects.create(material=material, code="STATS-SPEC", name="统计规格")
         stock = FactoryMaterialStock.objects.create(factory=self.factory, supplier=supplier, material_spec=spec, unit="件")

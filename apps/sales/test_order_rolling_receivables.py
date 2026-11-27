@@ -104,6 +104,89 @@ class OrderRollingReceivablesTests(TestCase):
     def rolling(self, plan):
         return self.details(plan)["rolling_receivables"]
 
+    def test_standalone_prepayment_and_order_receipt_apply_to_one_account(self):
+        from sales.services.factory_account_service import accounts, confirm, submit
+
+        merchant, assistant = self.merchant_owner, self.factory_assistant_1
+        payment_id = submit(merchant, self.factory.pk, "prepayment", self.image())["payment_id"]
+        self.assertEqual(submit(merchant, self.factory.pk, "prepayment", self.image())["payment_id"], payment_id)
+        self.assertEqual(accounts(merchant)["accounts"][0]["balance_amount"], "0.00")
+        with self.assertRaisesRegex(OrderFinanceError, "只有厂家销售助理"):
+            confirm(merchant, payment_id, "120")
+        confirm(assistant, payment_id, "120")
+        confirm(assistant, payment_id, "120")
+        self.assertEqual(accounts(merchant)["accounts"][0]["balance_amount"], "-120.00")
+
+        self.order("100")
+        latest = self.order("70")
+        self.assertEqual(self.rolling(latest)["balance_amount"], "50.00")
+        self.assertEqual(self.rolling(latest)["received_amount"], "120.00")
+        payment = self.upload(latest)
+        self.confirm(latest, payment, "50")
+        self.assertEqual(self.rolling(latest)["balance_amount"], "0.00")
+        self.assertEqual(accounts(merchant)["accounts"][0]["received_amount"], "170.00")
+
+    def test_pricing_custom_tier_inherits_latest_unmodified_prices(self):
+        from sales.services.order_plan_material_flow_service import create_material_flow_order_plan
+        from sales.services.order_pricing_service import confirm_quote, quote, save_catalog_row
+
+        assistant = self.factory_assistant_1
+        models = (self.generator, self.air_conditioner)
+        for model in models:
+            save_catalog_row(assistant, model.pk, {"A": "80", "B": "90", "C": "100"})
+
+        def make_order(key):
+            payload, _ = create_material_flow_order_plan(
+                user=self.sales_user, merchant_id=self.merchant.pk, client_request_id=key,
+                items=[{"category_id": model.category_id, "product_model_id": model.pk,
+                        "source_bom_id": model.boms.get(version="active-v2").pk, "quantity": 1}
+                       for model in models],
+            )
+            return payload["plan"]["id"]
+
+        first = make_order("tier-first")
+        first_prices = {str(model.pk): "100.00" for model in models}
+        result = confirm_quote(assistant, first, "C", {str(self.generator.pk): "95"}, first_prices)
+        self.assertEqual((result["total"], result["version"]), ("195.00", "C-01"))
+        stale = make_order("tier-second")
+        previous = {str(row["model_id"]): row["unit_price"] for row in quote(assistant, stale)["lines"]}
+        for model in models:
+            save_catalog_row(assistant, model.pk, {"A": "80", "B": "90", "C": "120"})
+        with self.assertRaisesRegex(OrderFinanceError, "默认单价已更新"):
+            confirm_quote(assistant, stale, "C", {}, previous)
+        prices = {str(row["model_id"]): row["unit_price"] for row in quote(assistant, stale)["lines"]}
+        self.assertEqual(prices, {str(self.generator.pk): "95.00", str(self.air_conditioner.pk): "120.00"})
+        result = confirm_quote(assistant, stale, "C", {str(self.air_conditioner.pk): "110"}, prices)
+        self.assertEqual((result["total"], result["version"]), ("205.00", "C-01"))
+        self.assertEqual(quote(assistant, first)["total"], "195.00")
+        self.assertEqual(self.rolling(OrderPlan.objects.get(pk=stale))["receivable_amount"], "400.00")
+
+    def test_mini_program_only_confirms_prices_already_initialized_on_web(self):
+        from sales.services.order_pricing_service import save_catalog_row, save_merchant_price
+
+        assistant = self.factory_assistant_1
+        plan = self.order()
+        self.assertEqual(plan.items.count(), 1)
+        item = plan.items.get()
+        model = item.product_model_id
+        save_catalog_row(assistant, model, {"A": "80", "B": "90", "C": "100"})
+        url = f"/pldp/api/sales/factory-payments/orders/{plan.pk}/"
+        headers = {"HTTP_AUTHORIZATION": self.factory_assistant_1_authorization}
+        payload = {"tier": "C", "expected": {str(model): "100.00"}}
+        result = self.client.post(url + "confirm/", payload, content_type="application/json", **headers).json()
+        self.assertEqual(result["code"], 1)
+        save_merchant_price(assistant, self.merchant.pk, "C")
+        save_merchant_price(assistant, self.merchant.pk, "C", model, "95")
+        quote = self.client.get(url + "quote/", **headers).json()["data"]
+        self.assertTrue(quote["can_confirm"])
+        self.assertEqual(quote["version"], "C-01")
+        self.assertEqual(quote["lines"][0]["unit_price"], "95.00")
+        payload["expected"] = {str(model): "95.00"}
+        result = self.client.post(url + "confirm/", payload, content_type="application/json", **headers).json()
+        self.assertEqual(result["code"], 0, result)
+        self.assertTrue(result["data"]["confirmed"])
+        self.assertEqual(self.rolling(plan)["receivable_amount"], f"{item.quantity * 95}.00")
+
     def finance_tasks(self, plan=None, status="OPEN"):
         qs = WorkItem.objects.filter(type__in=("ORDER_PLAN_PAYMENT_UPLOAD", "ORDER_PLAN_PAYMENT_CONFIRM"))
         if plan is not None:
@@ -302,11 +385,16 @@ class OrderRollingReceivablesTests(TestCase):
             organization_type=OrganizationType.objects.get(code="OWNER"))
         peer = self._user_with_identity("other-factory-assistant", "other-factory-assistant-wx", other_factory,
             self.factory_sales_assistant_role)
-        other_pair = self.clone_pair_order(first, seller=other_factory)
+        other_factory_buyer = Organization.objects.create(
+            code="ROLLING-OTHER-FACTORY-BUYER", name="另一厂家商家",
+            organization_type=OrganizationType.objects.get(code="MERCHANT"),
+            factory_root=other_factory,
+        )
+        other_pair = self.clone_pair_order(first, seller=other_factory, buyer=other_factory_buyer, creator=peer)
         submit_order_finance_statement(user=peer, plan_id=other_pair.pk, receivable_amount="700", statement_file=self.image())
         self.assertEqual(self.rolling(first)["outstanding_amount"], "100.00")
         self.assertEqual(self.details(other_buyer, self.factory_assistant_1)["rolling_receivables"]["outstanding_amount"], "500.00")
-        self.assertEqual(self.rolling(other_pair)["outstanding_amount"], "700.00")
+        self.assertEqual(self.details(other_pair, peer)["rolling_receivables"]["outstanding_amount"], "700.00")
         with self.assertRaises(OrderFinanceError):
             self.confirm(other_buyer, payment, "100")
         with self.assertRaises(OrderFinanceError):
@@ -338,7 +426,8 @@ class OrderRollingReceivablesTests(TestCase):
         cancel_order_finance_tasks(second, self.sales_user)
         self.assertEqual(self.rolling(first)["active_order_plan_id"], first.pk)
         self.assertEqual(self.rolling(first)["outstanding_amount"], "100.00")
-        self.assertTrue(self.details(first)["can_upload_payment"])
+        self.assertFalse(self.details(first)["can_upload_payment"])
+        self.assertTrue(self.details(first)["can_open_factory_payment"])
         self.assertEqual(self.finance_tasks(first).filter(type="ORDER_PLAN_PAYMENT_UPLOAD").count(), 1)
         self.assertEqual(list(old_task.user_tasks.values()), history)
         self.assertFalse(self.finance_tasks(second).exists())
@@ -395,7 +484,8 @@ class OrderRollingReceivablesTests(TestCase):
         result = cancel_material_flow_order_plan(user=self.sales_user, plan_id=second.pk, reason="客户取消")
         self.assertEqual(result["cancellation_status"], "CANCELLED")
         self.assertEqual(self.rolling(first)["outstanding_amount"], "100.00")
-        self.assertTrue(self.details(first)["can_upload_payment"])
+        self.assertFalse(self.details(first)["can_upload_payment"])
+        self.assertTrue(self.details(first)["can_open_factory_payment"])
         self.assertFalse(self.finance_tasks(second).exists())
 
     def test_real_pending_then_final_physical_cancellation_keeps_previous_finance_entry(self):

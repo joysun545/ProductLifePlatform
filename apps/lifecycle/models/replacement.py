@@ -3,7 +3,6 @@ from django.conf import settings
 from django.db import models
 
 class ReplacementFlow(models.Model):
-    id = models.BigAutoField(primary_key=True)
     application = models.OneToOneField('lifecycle.AfterSalesApplication',on_delete=models.PROTECT,related_name='replacement_flow')
     protocol_version = models.PositiveSmallIntegerField(default=5)
     service_mode = models.CharField(max_length=8,blank=True,default='')
@@ -19,7 +18,6 @@ class ReplacementFlow(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
 class ReplacementLeg(models.Model):
-    id = models.BigAutoField(primary_key=True)
     flow = models.ForeignKey(ReplacementFlow,on_delete=models.PROTECT,related_name='legs')
     direction = models.CharField(max_length=16,choices=[('OLD','旧机返厂'),('SUPPLY','换新补发'),('USER','新机交付用户')])
     sequence = models.PositiveIntegerField()
@@ -39,7 +37,6 @@ class ReplacementLeg(models.Model):
         ordering=['direction','sequence']
 
 class ReplacementInventoryEntry(models.Model):
-    id = models.BigAutoField(primary_key=True)
     flow = models.ForeignKey(ReplacementFlow,on_delete=models.PROTECT,related_name='inventory_entries')
     leg = models.ForeignKey(ReplacementLeg,on_delete=models.PROTECT)
     organization = models.ForeignKey('account.Organization',on_delete=models.PROTECT)

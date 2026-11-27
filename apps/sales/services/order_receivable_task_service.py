@@ -103,7 +103,8 @@ def _publish(active, key, *, sequence, outstanding, payment=None, user=None):
         domain="SALES", type=PAYMENT_TYPES[1] if payment else PAYMENT_TYPES[0],
         biz_id=plan.plan_code, biz_ref=f"sales.OrderPlan:{plan.pk}", uniq_key=key,
         title=title, summary=summary,
-        link=f"/pages/sales/order_plan_detail/order_plan_detail?order_plan_id={plan.pk}",
+        link=(f"/pages/sales/order_plan_detail/order_plan_detail?order_plan_id={plan.pk}" if payment
+              else "/pages/sales/factory_payments/factory_payments"),
         recipients_openids=_recipients(plan, "factory_sales_assistant" if payment else "merchant_owner"),
         need_action=True, action_mode="ANYONE_DO", payload=payload,
         actor_openid=getattr(user, "wx_openid", "") or "",
@@ -130,6 +131,7 @@ def reconcile_order_receivable_tasks(finance, user=None):
             desired = {_confirmation_key(active.order_plan, payment): payment for payment in pending}
         elif context["outstanding_amount"] > 0:
             desired[_upload_key(active.order_plan, sequence)] = None
+
     tasks = WorkItem.objects.select_for_update().filter(
         biz_ref__in=[f"sales.OrderPlan:{pk}" for pk in pair_orders],
         type__in=PAYMENT_TYPES, status="OPEN",
@@ -156,6 +158,9 @@ def reconcile_order_receivable_tasks(finance, user=None):
         existing = WorkItem.objects.filter(uniq_key=key, status="OPEN").first()
         if existing:
             if payment is None:
+                WorkItem.objects.filter(pk=existing.pk).exclude(link="/pages/sales/factory_payments/factory_payments").update(
+                    link="/pages/sales/factory_payments/factory_payments",
+                )
                 summary = f"累计待付 ¥{context['outstanding_amount']:.2f}，包含前单未收余额"
                 if existing.summary != summary:
                     WorkItem.objects.filter(pk=existing.pk).update(summary=summary)

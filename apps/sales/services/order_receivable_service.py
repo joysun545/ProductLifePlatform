@@ -8,12 +8,12 @@ from decimal import Decimal
 from functools import wraps
 
 from django.db import OperationalError, connections
-from django.db.models import Sum
+from django.db.models import Q, Sum
 from django.utils import timezone
 
 from sales.models import (
     OrderPlanFinance, OrderPlanPayment, OrderPlanPaymentAllocation,
-    OrderPlanReceivableAccount,
+    OrderPlanReceivableAccount, FactoryAccountFunding, FactoryAccountAllocation,
 )
 
 ZERO = Decimal("0.00")
@@ -74,12 +74,15 @@ def _require_atomic(alias="default"):
 
 
 def lock_receivable_account(plan):
-    alias = plan._state.db or "default"
+    return lock_factory_account(**_pair(plan), alias=plan._state.db or "default")
+
+
+def lock_factory_account(*, factory_organization_id, merchant_organization_id, alias="default"):
     _require_atomic(alias)
-    if plan.factory_organization_id == plan.merchant_organization_id:
+    if factory_organization_id == merchant_organization_id:
         raise OrderReceivableError("厂家与商家不能为同一组织。")
     query = OrderPlanReceivableAccount.objects.using(alias)
-    pair = _pair(plan)
+    pair = {"factory_organization_id": factory_organization_id, "merchant_organization_id": merchant_organization_id}
     # A zero-row UPDATE still obtains a SQLite write reservation before INSERT.
     # Updating a column to itself preserves the audit timestamp for a no-op sync.
     from django.db.models import F
@@ -106,6 +109,14 @@ def _invoice_rows(finances):
         ).order_by().values("finance_id").annotate(total=Sum("amount"))
         .values_list("finance_id", "total")
     )
+    extra = {
+        (finance_id, is_credit): amount
+        for finance_id, is_credit, amount in FactoryAccountAllocation.objects.filter(
+            finance_id__in=ids, released_at__isnull=True,
+        ).annotate(is_credit=~Q(funding__return_credit__isnull=True))
+        .order_by().values("finance_id", "is_credit").annotate(total=Sum("amount"))
+        .values_list("finance_id", "is_credit", "total")
+    }
     payments = list(_confirmed_payments(ids).order_by("id"))
     cash_used = dict(
         OrderPlanPaymentAllocation.objects.filter(
@@ -119,16 +130,18 @@ def _invoice_rows(finances):
         unused[payment.finance_id] += max(amount - (cash_used.get(payment.pk) or ZERO), ZERO)
     rows = []
     for finance in finances:
-        received = allocated.get(finance.pk) or ZERO
+        received = (allocated.get(finance.pk) or ZERO) + extra.get((finance.pk, False), ZERO)
+        credit = extra.get((finance.pk, True), ZERO)
         own_unused = unused[finance.pk]
         charge = finance.receivable_amount
         rows.append({
             "finance": finance,
             "receivable_amount": charge,
             "allocated_received_amount": received,
+            "return_credit_amount": credit,
             "unapplied_amount": own_unused,
             "received_amount": received + own_unused,
-            "outstanding_amount": None if charge is None else max(charge - received, ZERO),
+            "outstanding_amount": None if charge is None else max(charge - received - credit, ZERO),
             "overpaid_amount": own_unused,
         })
     return rows
@@ -145,8 +158,16 @@ def invoice_totals(finance):
 
 def pair_context(finance):
     """Read-only balances; no task, account, payment, or allocation changes."""
-    plan = finance.order_plan
-    finances = list(eligible_finances(plan))
+    return factory_account_context(**_pair(finance.order_plan))
+
+
+def factory_account_context(*, factory_organization_id, merchant_organization_id):
+    pair = {"factory_organization_id": factory_organization_id, "merchant_organization_id": merchant_organization_id}
+    finances = list(_eligible_pair(factory_organization_id, merchant_organization_id))
+    extra = FactoryAccountFunding.objects.filter(account__factory_organization_id=factory_organization_id,
+                                                  account__merchant_organization_id=merchant_organization_id)
+    cash = extra.filter(return_credit__isnull=True).aggregate(total=Sum("amount"))["total"] or ZERO
+    credit = extra.filter(return_credit__isnull=False).aggregate(total=Sum("amount"))["total"] or ZERO
     ids = [row.pk for row in finances]
     rows = _invoice_rows(finances)
     payments = OrderPlanPayment.objects.filter(finance_id__in=ids)
@@ -158,17 +179,19 @@ def pair_context(finance):
         finance_id__in=ids, released_at__isnull=True,
         payment__status=OrderPlanPayment.Status.CONFIRMED,
     ).exclude(payment__finance_id__in=ids).aggregate(total=Sum("amount"))["total"] or ZERO
-    received = own_cash + retained_cash
+    received = own_cash + retained_cash + cash
     charge = sum((row["receivable_amount"] or ZERO for row in rows), ZERO)
     active = finances[-1] if finances else None
     return {
-        "account": OrderPlanReceivableAccount.objects.filter(**_pair(plan)).first(),
+        "account": OrderPlanReceivableAccount.objects.filter(**pair).first(),
         "active_finance": active,
         "rows": rows,
         "receivable_amount": charge,
         "received_amount": received,
-        "outstanding_amount": max(charge - received, ZERO),
-        "overpaid_amount": max(received - charge, ZERO),
+        "return_credit_amount": credit,
+        "balance_amount": charge - received - credit,
+        "outstanding_amount": max(charge - received - credit, ZERO),
+        "overpaid_amount": max(received + credit - charge, ZERO),
         "unapplied_amount": sum((row["unapplied_amount"] for row in rows), ZERO),
         "carry_forward_amount": sum((row["outstanding_amount"] or ZERO for row in rows[:-1]), ZERO),
         "pending_payments": list(payments.filter(status=OrderPlanPayment.Status.PENDING)
@@ -203,7 +226,10 @@ def synchronize_receivable_account(account, *, plan=None):
     ).exclude(finance_id__in=eligible_ids).update(
         released_at=timezone.now(), release_reason="TARGET_ORDER_INELIGIBLE",
     )
-    changed = bool(released)
+    released_extra = FactoryAccountAllocation.objects.filter(
+        funding__account=account, released_at__isnull=True,
+    ).exclude(finance_id__in=eligible_ids).update(released_at=timezone.now())
+    changed = bool(released or released_extra)
     payments = list(_confirmed_payments(all_ids).select_for_update().order_by("confirmed_at", "id"))
     by_payment = {payment.pk: [] for payment in payments}
     all_allocations = list(OrderPlanPaymentAllocation.objects.filter(
@@ -219,9 +245,9 @@ def synchronize_receivable_account(account, *, plan=None):
     remaining_debt = {}
     for row in rows:
         amount = row["receivable_amount"]
-        if amount is None or amount <= ZERO or row["allocated_received_amount"] > amount:
+        if amount is None or amount <= ZERO or row["allocated_received_amount"] + row["return_credit_amount"] > amount:
             raise OrderReceivableError("历史订单应收与收款分配不一致，请核实后处理。")
-        remaining_debt[row["finance"].pk] = amount - row["allocated_received_amount"]
+        remaining_debt[row["finance"].pk] = amount - row["allocated_received_amount"] - row["return_credit_amount"]
     created = []
     for payment in payments:
         amount = payment.confirmed_amount
@@ -266,6 +292,27 @@ def synchronize_receivable_account(account, *, plan=None):
             remaining_debt[target.pk] -= value
             if available == ZERO:
                 break
+    for funding in account.funding.filter(amount__isnull=False).order_by("confirmed_at", "pk"):
+        active_allocations = {row.finance_id: row for row in funding.allocations.filter(released_at__isnull=True)}
+        available = funding.amount - sum((row.amount for row in active_allocations.values()), ZERO)
+        if available < ZERO:
+            raise OrderReceivableError("往来款分配超过已入账金额。")
+        for target in finances:
+            if not available:
+                break
+            amount = min(available, remaining_debt[target.pk])
+            if not amount:
+                continue
+            previous = active_allocations.get(target.pk)
+            if previous:
+                previous.released_at = timezone.now()
+                previous.save(update_fields=("released_at",))
+            FactoryAccountAllocation.objects.create(
+                funding=funding, finance=target, amount=amount + (previous.amount if previous else ZERO),
+            )
+            available -= amount
+            remaining_debt[target.pk] -= amount
+            changed = True
     active = finances[-1] if finances else None
     active_id = active.pk if active else None
     if account.active_finance_id != active_id:
@@ -273,12 +320,15 @@ def synchronize_receivable_account(account, *, plan=None):
         changed = True
     if changed:
         account.save(update_fields=("active_finance", "updated_at"))
-    # Conservation: eligible cash + retained cancelled-origin cash equals all
-    # live eligible debt allocations plus available excess eligible cash.
     if active is not None:
         context = pair_context(active)
         allocated = sum((row["allocated_received_amount"] for row in context["rows"]), ZERO)
-        if allocated + context["unapplied_amount"] != context["received_amount"]:
+        pair_funding = account.funding.filter(return_credit__isnull=True)
+        extra_cash = pair_funding.aggregate(total=Sum("amount"))["total"] or ZERO
+        extra_used = FactoryAccountAllocation.objects.filter(
+            funding__in=pair_funding, released_at__isnull=True,
+        ).aggregate(total=Sum("amount"))["total"] or ZERO
+        if allocated + context["unapplied_amount"] + extra_cash - extra_used != context["received_amount"]:
             raise OrderReceivableError("订单累计收款与分配明细不一致，请核实后处理。")
     return {
         "active_finance": active, "released": released,

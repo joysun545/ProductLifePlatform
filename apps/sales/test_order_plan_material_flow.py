@@ -21,6 +21,7 @@ from manufacturing.models import ProductionBatch
 from sales.models import (
     FactoryFinishedGoodsInventoryItem,
     OrderPlan,
+    OrderPlanAccessoryCompatibility,
     OrderPlanCancellationAudit,
     OrderPlanFinance,
     OrderPlanMaterialLotAllocation,
@@ -683,6 +684,10 @@ class OrderPlanMaterialFlowTests(TestCase):
 
         self._create_lot(10_000, suffix="READY-REVIEW-GATE")
         plan = self._create_v2_plan(request_id="v2-ready-must-review")
+        notice = WorkItem.objects.get(
+            uniq_key=f"sales:order-plan:{plan.pk}:material-created:matching",
+        )
+        self.assertFalse(notice.user_tasks.get(to_openid=self.matching_user.wx_openid).need_action)
         material_plan = OrderPlanMaterialPlan.objects.get(order_plan=plan)
         self.assertFalse(material_plan.warehouse_reviewed_at)
         self.assertEqual(
@@ -1014,7 +1019,7 @@ class OrderPlanMaterialFlowTests(TestCase):
                 {
                     "category_id": self.generator_category.pk,
                     "product_model_id": self.generator.pk,
-                    "quantity": 10,
+                    "quantity": 9,
                     "use_return_inventory": True,
                     "source_bom_id": self.generator_bom.pk,
                 }
@@ -1027,7 +1032,7 @@ class OrderPlanMaterialFlowTests(TestCase):
             order_plan_item__plan=next_plan,
             finished_inventory_item__isnull=False,
         )
-        self.assertEqual(reused_allocations.count(), 10)
+        self.assertEqual(reused_allocations.count(), 9)
         self.assertTrue(
             reused_allocations.filter(
                 inventory_item__isnull=True,
@@ -1039,8 +1044,36 @@ class OrderPlanMaterialFlowTests(TestCase):
                 source_order_plan=plan,
                 stock_status=FactoryFinishedGoodsInventoryItem.StockStatus.RESERVED_FOR_ORDER,
             ).count(),
-            10,
+            9,
         )
+        self.assertFalse(WorkItem.objects.filter(
+            uniq_key=f"sales:order-plan:{next_plan.pk}:material-created:matching",
+        ).exists())
+
+        spec = self.generator_material[1]
+        self._create_lot(1_000, suffix="REUSED-WITH-ACCESSORY")
+        OrderPlanAccessoryCompatibility.objects.create(
+            factory_organization=self.factory, product_model=self.generator, material_spec=spec,
+        )
+        result, created = create_material_flow_order_plan(
+            user=self.sales_user, merchant_id=self.merchant.pk,
+            client_request_id="reuse-last-with-accessory",
+            items=[{
+                "category_id": self.generator_category.pk, "product_model_id": self.generator.pk,
+                "quantity": 1, "use_return_inventory": True, "source_bom_id": self.generator_bom.pk,
+            }],
+            accessories=[{
+                "category_id": self.generator_category.pk, "product_model_id": self.generator.pk,
+                "material_spec_id": spec.pk, "quantity": "1",
+            }],
+        )
+        self.assertTrue(created)
+        accessory_plan = OrderPlan.objects.get(pk=result["plan"]["id"])
+        self.assertFalse(accessory_plan.material_plan.production_subplans.exists())
+        notice = WorkItem.objects.get(
+            uniq_key=f"sales:order-plan:{accessory_plan.pk}:material-created:matching",
+        )
+        self.assertFalse(notice.user_tasks.get(to_openid=self.matching_user.wx_openid).need_action)
 
     def test_v2_subplan_shipment_lifecycle_uses_exact_devices_and_v2_tasks(self):
         """One completed subplan has its own QR/ship/receipt/accounting chain.
@@ -1440,7 +1473,9 @@ class OrderPlanMaterialFlowTests(TestCase):
         )
         authorize_material_flow_shipment(user=self.sales_user, plan_id=plan.pk, shipment_id=shipment.pk)
         work = WorkItem.objects.get(type="ORDER_PLAN_V2_QRCODE_PRINT")
-        self.assertFalse(work.user_tasks.filter(to_openid=manager.wx_openid).exists())
+        task = work.user_tasks.get(to_openid=manager.wx_openid)
+        self.assertTrue(task.need_action)
+        task.delete()
         with self.assertRaisesMessage(OrderPlanMaterialFlowError, "不是本批打码任务的处理人"):
             prepare_material_flow_shipment_qrcodes(user=manager, plan_id=plan.pk, shipment_id=shipment.pk)
         self.assertFalse(shipment.device_allocations.exists())
@@ -1449,7 +1484,7 @@ class OrderPlanMaterialFlowTests(TestCase):
         )
         self.assertEqual(len(prepared["qrcodes"]), 5)
 
-    def test_v2_stock_senior_manager_can_confirm_receipt_without_task(self):
+    def test_v2_stock_senior_manager_receives_pending_receipt_after_allocation(self):
         plan, _subplan, shipment = self._ready_production_shipment(
             request_id="v2-senior-proactive-receipt",
             quantity=5,
@@ -1486,7 +1521,7 @@ class OrderPlanMaterialFlowTests(TestCase):
                 for action in row["available_actions"]
             )
         )
-        self.assertFalse(
+        self.assertTrue(
             WorkItem.objects.filter(
                 type="ORDER_PLAN_V2_MERCHANT_RECEIPT",
                 user_tasks__to_openid=self.merchant_senior_manager.wx_openid,

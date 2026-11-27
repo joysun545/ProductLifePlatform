@@ -15,10 +15,14 @@ from account.services.auth_service import (
 )
 
 
+APPROVED_SLOTS = frozenset({1, 2, 3, 4, 7, 8, 9, 24, 26, 27, 33, 35, 49, 51, 55, 57, 59})
+CONTROL_SLOT = 61
+
+
 class WeChatBindingGuardTests(TestCase):
     @classmethod
     def setUpTestData(cls):
-        for user_id in (2, 3, 4, 7, 8, 9, 26, 35, 49, 51, 55, 57, 59, 61):
+        for user_id in sorted(APPROVED_SLOTS | {CONTROL_SLOT}):
             User.objects.create_user(
                 pk=user_id,
                 username=f"handover-guard-test-{user_id}",
@@ -38,22 +42,22 @@ class WeChatBindingGuardTests(TestCase):
     def test_all_approved_handovers_reject_legacy_tokens(self):
         self.assertEqual(
             LEGACY_TOKEN_RELOGIN_USER_IDS,
-            frozenset({2, 3, 4, 7, 8, 9, 26, 35, 49, 51, 55, 57, 59}),
+            APPROVED_SLOTS,
         )
-        for user_id in (2, 3, 4, 7, 8, 9, 26, 35, 49, 51, 55, 57, 59):
+        for user_id in sorted(APPROVED_SLOTS):
             with self.subTest(user_id=user_id):
                 with self.assertRaises(ApiAuthenticationError):
                     self._authenticate(self._sign({"user_id": user_id}))
         self.assertEqual(self._authenticate(self._sign({"user_id": 61})).pk, 61)
 
     def test_new_tokens_authenticate_all_handover_slots_and_unrelated_user(self):
-        for user_id in (2, 3, 4, 7, 8, 9, 26, 35, 49, 51, 55, 57, 59, 61):
+        for user_id in sorted(APPROVED_SLOTS | {CONTROL_SLOT}):
             with self.subTest(user_id=user_id):
                 user = User.objects.get(pk=user_id)
                 self.assertEqual(self._authenticate(issue_access_token(user)).pk, user_id)
 
     def test_old_binding_fails_after_openid_moves_and_fresh_binding_works(self):
-        for user_id in (2, 3, 4, 7, 8, 9, 26, 35, 49, 51, 55, 57, 59, 61):
+        for user_id in sorted(APPROVED_SLOTS | {CONTROL_SLOT}):
             with self.subTest(user_id=user_id):
                 user = User.objects.get(pk=user_id)
                 previous_token = issue_access_token(user)

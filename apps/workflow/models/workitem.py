@@ -105,6 +105,8 @@ class WorkItem(models.Model):
     )
 
 
+    role_delivery = models.JSONField(default=dict, blank=True, editable=False)
+
     action_mode = models.CharField(
         max_length=16,
         choices=ACTION_MODE_CHOICES,

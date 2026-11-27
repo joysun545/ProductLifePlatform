@@ -99,11 +99,13 @@ class GoodsTransferApiTests(TestCase):
         cls.supplier = Organization.objects.create(
             name="流转测试配套供应商",
             code="FLOW-SUPPLIER",
+            factory_root=cls.factory,
             organization_type=supplier_type,
         )
         cls.other_supplier = Organization.objects.create(
             name="同规格备选供应商",
             code="FLOW-OTHER-SUPPLIER",
+            factory_root=cls.factory,
             organization_type=supplier_type,
         )
 
@@ -1508,6 +1510,33 @@ class GoodsTransferApiTests(TestCase):
         self.assertTrue(assistant_task.payload["inventory_posted"])
         self.assertTrue(assistant_task.payload["credit_amount_recorded"])
 
+        from sales.services.order_receivable_service import factory_account_context
+        context = factory_account_context(
+            factory_organization_id=account_case.upper_organization_id,
+            merchant_organization_id=account_case.lower_organization_id,
+        )
+        self.assertEqual(str(context["balance_amount"]), "-800.00")
+        self.assertEqual(format(context["return_credit_amount"], ".2f"), "800.00")
+        self.assertEqual(str(context["received_amount"]), "0.00")
+
+        # Simulate a return posted before the cumulative ledger existed.
+        import json
+        from io import StringIO
+        from django.core.management import call_command
+        from sales.models import FactoryAccountFunding
+
+        FactoryAccountFunding.objects.get(return_credit=account_case).delete()
+        def batch(apply=False):
+            output = StringIO()
+            call_command("backfill_factory_return_credits", factory_id=account_case.upper_organization_id,
+                         apply=apply, stdout=output)
+            return json.loads(output.getvalue())
+
+        self.assertEqual(batch()["total"], "800.00")
+        self.assertFalse(FactoryAccountFunding.objects.filter(return_credit=account_case).exists())
+        self.assertEqual(batch(apply=True)["total"], "800.00")
+        self.assertEqual(batch(apply=True)["count"], 0)
+
     def test_factory_return_credit_amount_can_be_recorded_before_inventory_posting(self):
         device = self.devices[0]
         self.set_owner(device, self.parent)
@@ -1793,14 +1822,10 @@ class GoodsTransferApiTests(TestCase):
         )
         self.assertEqual(requirement.material_id, self.fault_material.pk)
         self.assertEqual(requirement.supplier_id, self.supplier.pk)
-        self.assertEqual(requirement.trace_source, "PRODUCTION_BATCH")
+        # This legacy fixture has no matching production consumption or confirmed BOM row.
+        self.assertEqual(requirement.trace_source, "BOM_INFERRED")
 
-        # 原订单没有匹配责任销售经理时，只通知供应商负责人，不能阻断
-        # 配套经理完成处置，也不能临时随意匹配其他销售经理。
-        SupplierSalesResponsibility.objects.filter(
-            supplier=self.supplier,
-            material=self.fault_material,
-        ).delete()
+        # Devices without an order snapshot use the current supplier audience.
         matching_plan = self.client.post(
             f"{self.endpoint}{flow['id']}/factory-return/items/"
             f"{second_repair['id']}/matching/",
@@ -1821,12 +1846,10 @@ class GoodsTransferApiTests(TestCase):
         )
         self.assertEqual(
             set(repair_supplier_task.user_tasks.values_list("to_openid", flat=True)),
-            {self.supplier_owner.wx_openid},
+            {self.supplier_owner.wx_openid, self.supplier_sales.wx_openid},
         )
-        self.assertEqual(
-            repair_supplier_task.payload["unassigned_sales_material_ids"],
-            [self.fault_material.pk],
-        )
+        self.assertEqual(repair_supplier_task.payload["responsibility_source"], "CURRENT_FALLBACK")
+        self.assertEqual(repair_supplier_task.payload["unassigned_sales_material_ids"], [])
         supplier_view = self.client.get(
             "/pldp/api/lifecycle/supplier-warranty-lists/",
             **self.auth(self.supplier_owner),
@@ -1837,19 +1860,10 @@ class GoodsTransferApiTests(TestCase):
         self.assertEqual(repair_rows[0]["material_id"], self.fault_material.pk)
         self.assertEqual(
             repair_rows[0]["trace_source"],
-            "PRODUCTION_BATCH",
+            "BOM_INFERRED",
         )
         repair_matching.refresh_from_db()
         self.assertEqual(repair_matching.status, "DONE")
-
-        # 后续拆机三包分支继续覆盖“已配置责任销售经理则同步通知”。
-        SupplierSalesResponsibility.objects.create(
-            supplier=self.supplier,
-            sales_identity=self.supplier_sales.organization_identity,
-            scope_type=SupplierResponsibilityScope.MATERIAL,
-            material=self.fault_material,
-            assigned_by=self.supplier_owner,
-        )
 
         for item in (first_repair, second_repair):
             completed = self.client.post(
@@ -1884,9 +1898,9 @@ class GoodsTransferApiTests(TestCase):
         returned_material = Material.objects.create(
             code="FLOW-RETURNED-NON-FAULT",
             name="流转测试非故障关键件",
-            product_category=self.product_model.category,
             is_key_part=True,
         )
+        returned_material.product_categories.add(self.product_model.category)
         returned_spec = MaterialSpec.objects.create(
             material=returned_material,
             code="FLOW-RETURNED-NON-FAULT-SPEC",
@@ -1956,7 +1970,7 @@ class GoodsTransferApiTests(TestCase):
         self.assertEqual(fault.material_id, self.fault_material.pk)
         self.assertEqual(fault.supplier_id, self.supplier.pk)
         self.assertEqual(fault.trace_source, "BOM_INFERRED")
-        self.assertEqual(fault.schema_version, 1)
+        self.assertEqual(fault.schema_version, 2)
         self.assertTrue(fault.is_warranty_candidate)
         self.assertEqual(fault.material_name_snapshot, "流转测试控制模块")
         self.assertEqual(fault.supplier_name_snapshot, "流转测试配套供应商")
@@ -2068,11 +2082,9 @@ class GoodsTransferApiTests(TestCase):
             len(supplier_lists.json()["data"]["return_materials"]),
             2,
         )
-        # 修复需求推送时未给该销售经理分配责任，后来新增责任
-        # 也不得让其继承这条历史清单。
         self.assertEqual(
-            supplier_lists.json()["data"]["repair_material_requests"],
-            [],
+            [row["material_id"] for row in supplier_lists.json()["data"]["repair_material_requests"]],
+            [self.fault_material.pk],
         )
         self.assertEqual(
             supplier_lists.json()["data"]["fault_materials"][0]["id"],
@@ -2169,7 +2181,7 @@ class GoodsTransferApiTests(TestCase):
         self.assertEqual(response.json()["code"], 0, response.json())
         return response.json()["data"]
 
-    def test_return_credit_is_manually_confirmed_and_offsets_vertical_receivable(self):
+    def test_merchant_return_does_not_create_credit_against_document_only_shipment(self):
         device = self.devices[0]
         self.set_owner(device, self.parent)
         shipment = self.create_flow(
@@ -2211,61 +2223,18 @@ class GoodsTransferApiTests(TestCase):
             **self.auth(self.child_b_owner),
         ).json()
         self.assertEqual(child_view["code"], 0, child_view)
-        self.assertEqual(len(child_view["data"]["cases"]), 1)
-        self.assertEqual(
-            child_view["data"]["cases"][0]["case_type"],
-            "RETURN_CREDIT",
-        )
-
-        submitted = self.client.post(
+        self.assertEqual(child_view["data"]["cases"], [])
+        self.assertFalse(child_view["data"]["merchant_accounts_enabled"])
+        attempted = self.client.post(
             f"{accounts_url}RETURN_CREDIT/submit/",
-            {"amount": "300.00", "remark": "关联退货批次"},
+            {"amount": "300.00"},
             **self.auth(self.child_b_owner),
-        )
-        self.assertEqual(submitted.json()["code"], 0, submitted.json())
-        case = submitted.json()["data"]["cases"][0]
-        self.assertEqual(case["status"], "PENDING_CONFIRM")
+        ).json()
+        self.assertEqual(attempted["code"], 1, attempted)
+        self.assertFalse(GoodsTransferAccountCase.objects.filter(transfer_id=return_flow["id"]).exists())
+        self.assertFalse(GoodsTransferCreditAllocation.objects.exists())
 
-        confirmed = self.client.post(
-            f"{accounts_url}{case['id']}/confirm/",
-            {"action": "CONFIRM"},
-            content_type="application/json",
-            **self.auth(self.parent_owner),
-        )
-        self.assertEqual(confirmed.json()["code"], 0, confirmed.json())
-        parent_case = confirmed.json()["data"]["cases"][0]
-        self.assertEqual(parent_case["confirmed_amount"], "300.00")
-        self.assertEqual(parent_case["available_credit_amount"], "300.00")
-        candidate = next(
-            row
-            for row in parent_case["allocation_candidates"]
-            if row["flow_no"] == shipment["flow_no"]
-        )
-
-        allocated = self.client.post(
-            f"{accounts_url}{case['id']}/allocations/",
-            {
-                "target_kind": candidate["target_kind"],
-                "target_id": candidate["target_id"],
-                "amount": "300.00",
-            },
-            content_type="application/json",
-            **self.auth(self.parent_sales),
-        )
-        self.assertEqual(allocated.json()["code"], 0, allocated.json())
-        allocated_case = allocated.json()["data"]["cases"][0]
-        self.assertEqual(allocated_case["available_credit_amount"], "0.00")
-        self.assertEqual(GoodsTransferCreditAllocation.objects.count(), 1)
-
-        settlement_detail = self.client.get(
-            f"{self.endpoint}{shipment['id']}/settlement/",
-            **self.auth(self.parent_owner),
-        ).json()["data"]
-        self.assertEqual(settlement_detail["confirmed_credit_amount"], "300.00")
-        self.assertEqual(settlement_detail["outstanding_amount"], "700.00")
-        self.assertFalse(WorkItem.objects.filter(type__icontains="REFUND").exists())
-
-    def test_transfer_creates_two_vertical_cases_and_never_sibling_account(self):
+    def test_merchant_directed_transfer_moves_device_without_creating_accounts(self):
         device = self.devices[1]
         self.set_owner(device, self.child_b)
         flow = self.create_flow(
@@ -2279,125 +2248,22 @@ class GoodsTransferApiTests(TestCase):
         )
         completed = self.scan_and_submit(self.parent_sales, flow["id"], device)
         self.assertEqual(completed["status"], "COMPLETED")
-        cases = GoodsTransferAccountCase.objects.filter(transfer_id=flow["id"])
-        self.assertEqual(cases.count(), 2)
-        self.assertSetEqual(
-            set(cases.values_list("case_type", flat=True)),
-            {"TRANSFER_OUT_CREDIT", "TRANSFER_IN_RECEIVABLE"},
-        )
-        self.assertFalse(
-            cases.filter(
-                upper_organization=self.child_b,
-                lower_organization=self.child_c,
-            ).exists()
-        )
-        for case in cases:
-            self.assertEqual(case.upper_organization, self.parent)
-
+        self.assertEqual(OrganizationDevice.objects.get(device=device).organization, self.child_c)
+        self.assertFalse(GoodsTransferAccountCase.objects.filter(transfer_id=flow["id"]).exists())
         accounts_url = f"{self.endpoint}{flow['id']}/accounts/"
-        parent_data = self.client.get(
-            accounts_url,
-            **self.auth(self.parent_owner),
-        ).json()["data"]
-        self.assertEqual(len(parent_data["cases"]), 2)
-        b_data = self.client.get(
-            accounts_url,
-            **self.auth(self.child_b_owner),
-        ).json()["data"]
-        c_data = self.client.get(
-            accounts_url,
-            **self.auth(self.child_c_owner),
-        ).json()["data"]
-        self.assertEqual(
-            [row["case_type"] for row in b_data["cases"]],
-            ["TRANSFER_OUT_CREDIT"],
-        )
-        self.assertEqual(
-            [row["case_type"] for row in c_data["cases"]],
-            ["TRANSFER_IN_RECEIVABLE"],
-        )
-
-        out_submit = self.client.post(
-            f"{accounts_url}TRANSFER_OUT_CREDIT/submit/",
-            {"amount": "200.00"},
-            **self.auth(self.parent_owner),
-        ).json()
-        self.assertEqual(out_submit["code"], 0, out_submit)
-        out_case = next(
-            row
-            for row in out_submit["data"]["cases"]
-            if row["case_type"] == "TRANSFER_OUT_CREDIT"
-        )
-        in_submit = self.client.post(
+        for user in (self.parent_owner, self.child_b_owner, self.child_c_owner):
+            with self.subTest(user_id=user.pk):
+                response = self.client.get(accounts_url, **self.auth(user)).json()
+                self.assertEqual(response["code"], 0, response)
+                self.assertEqual(response["data"]["cases"], [])
+                self.assertFalse(response["data"]["merchant_accounts_enabled"])
+        attempted = self.client.post(
             f"{accounts_url}TRANSFER_IN_RECEIVABLE/submit/",
             {"amount": "350.00"},
-            **self.auth(self.parent_sales),
+            **self.auth(self.parent_owner),
         ).json()
-        self.assertEqual(in_submit["code"], 0, in_submit)
-        in_case = next(
-            row
-            for row in in_submit["data"]["cases"]
-            if row["case_type"] == "TRANSFER_IN_RECEIVABLE"
-        )
-
-        b_confirm = self.client.post(
-            f"{accounts_url}{out_case['id']}/confirm/",
-            {"action": "CONFIRM"},
-            content_type="application/json",
-            **self.auth(self.child_b_owner),
-        )
-        self.assertEqual(b_confirm.json()["code"], 0, b_confirm.json())
-        c_confirm = self.client.post(
-            f"{accounts_url}{in_case['id']}/confirm/",
-            {"action": "CONFIRM"},
-            content_type="application/json",
-            **self.auth(self.child_c_owner),
-        )
-        self.assertEqual(c_confirm.json()["code"], 0, c_confirm.json())
-
-        c_case = c_confirm.json()["data"]["cases"][0]
-        self.assertTrue(c_case["actions"]["can_upload_payment"])
-        voucher = self.client.post(
-            f"{accounts_url}{in_case['id']}/payments/",
-            {
-                "client_request_id": "transfer-account-payment-1",
-                "voucher_image": self.image_file("transfer-payment.png"),
-            },
-            **self.auth(self.child_c_stock),
-        )
-        self.assertEqual(voucher.json()["code"], 0, voucher.json())
-        payment = voucher.json()["data"]["cases"][0]["payments"][0]
-        payment_confirm = self.client.post(
-            f"{accounts_url}{in_case['id']}/payments/{payment['id']}/confirm/",
-            {"confirmed_amount": "100.00"},
-            content_type="application/json",
-            **self.auth(self.parent_stock),
-        )
-        self.assertEqual(
-            payment_confirm.json()["code"],
-            0,
-            payment_confirm.json(),
-        )
-        paid_case = next(
-            row
-            for row in payment_confirm.json()["data"]["cases"]
-            if row["case_type"] == "TRANSFER_IN_RECEIVABLE"
-        )
-        self.assertEqual(paid_case["outstanding_amount"], "250.00")
-
-        forbidden = self.client.post(
-            f"{accounts_url}{in_case['id']}/confirm/",
-            {"action": "CONFIRM"},
-            content_type="application/json",
-            **self.auth(self.child_b_owner),
-        )
-        self.assertEqual(forbidden.json()["code"], 1)
-        self.assertFalse(
-            GoodsTransferAccountCase.objects.filter(
-                creditor_organization=self.child_b,
-                debtor_organization=self.child_c,
-            ).exists()
-        )
+        self.assertEqual(attempted["code"], 1, attempted)
+        self.assertFalse(GoodsTransferAccountCase.objects.filter(transfer_id=flow["id"]).exists())
 
     def image_file(self, name="proof.png"):
         return SimpleUploadedFile(
@@ -2406,7 +2272,7 @@ class GoodsTransferApiTests(TestCase):
             content_type="image/png",
         )
 
-    def test_shipment_documents_payment_and_receivable_are_independent_of_receipt(self):
+    def test_merchant_shipment_documents_and_physical_receipt_are_independent(self):
         device = self.devices[0]
         self.set_owner(device, self.parent)
         flow = self.create_flow(
@@ -2442,21 +2308,10 @@ class GoodsTransferApiTests(TestCase):
             **self.auth(self.parent_owner),
         )
         self.assertEqual(statement.json()["code"], 0, statement.json())
-        self.assertEqual(statement.json()["data"]["receivable_amount"], "1000.00")
+        self.assertIsNone(statement.json()["data"]["receivable_amount"])
+        self.assertFalse(statement.json()["data"]["financial_enabled"])
         documents_task.refresh_from_db()
         self.assertEqual(documents_task.status, "OPEN")
-
-        payment_task = WorkItem.objects.get(
-            type="GOODS_TRANSFER_PAYMENT_UPLOAD",
-            uniq_key=f"lifecycle:goods-transfer:{flow['id']}:payment-upload:1",
-        )
-        self.assertSetEqual(
-            set(payment_task.user_tasks.values_list("to_openid", flat=True)),
-            {
-                self.child_b_owner.wx_openid,
-                self.child_b_stock.wx_openid,
-            },
-        )
 
         logistics = self.client.post(
             f"{self.endpoint}{flow['id']}/settlement/logistics-documents/",
@@ -2471,73 +2326,27 @@ class GoodsTransferApiTests(TestCase):
         documents_task.refresh_from_db()
         self.assertEqual(documents_task.status, "DONE")
 
-        # 实物收货可以先于付款完成，物权转移不结清应收货款。
         receipt = self.client.post(
-            f"{self.endpoint}{flow['id']}/receipt/",
-            {},
-            **self.auth(self.child_b_stock),
+            f"{self.endpoint}{flow['id']}/receipt/", {}, **self.auth(self.child_b_stock),
         )
         self.assertEqual(receipt.json()["code"], 0, receipt.json())
-        self.assertEqual(
-            OrganizationDevice.objects.get(device=device).organization,
-            self.child_b,
-        )
-        detail_before_payment = self.client.get(
-            f"{self.endpoint}{flow['id']}/settlement/",
-            **self.auth(self.child_b_owner),
-        ).json()["data"]
-        self.assertEqual(detail_before_payment["physical_status"], "COMPLETED")
-        self.assertEqual(detail_before_payment["state"], "WAITING_PAYMENT")
-        self.assertEqual(detail_before_payment["outstanding_amount"], "1000.00")
+        self.assertEqual(OrganizationDevice.objects.get(device=device).organization, self.child_b)
+        settlement_url = f"{self.endpoint}{flow['id']}/settlement/"
+        detail = self.client.get(settlement_url, **self.auth(self.child_b_owner)).json()["data"]
+        self.assertEqual(detail["physical_status"], "COMPLETED")
+        self.assertEqual(detail["state"], "DOCUMENTS_COMPLETE")
+        self.assertIsNone(detail["outstanding_amount"])
+        self.assertEqual(detail["payments"], [])
 
-        first_voucher = self.client.post(
-            f"{self.endpoint}{flow['id']}/settlement/payments/",
-            {
-                "client_request_id": "settlement-payment-1",
-                "voucher_image": self.image_file("payment-1.png"),
-            },
+        attempt = self.client.post(
+            f"{settlement_url}payments/",
+            {"client_request_id": "obsolete-payment", "voucher_image": self.image_file("payment.png")},
             **self.auth(self.child_b_owner),
-        )
-        self.assertEqual(first_voucher.json()["code"], 0, first_voucher.json())
-        first_payment = first_voucher.json()["data"]["payments"][0]
-        confirm_first = self.client.post(
-            f"{self.endpoint}{flow['id']}/settlement/payments/{first_payment['id']}/confirm/",
-            {"confirmed_amount": "400.00"},
-            content_type="application/json",
-            **self.auth(self.parent_sales),
-        )
-        self.assertEqual(confirm_first.json()["code"], 0, confirm_first.json())
-        self.assertEqual(confirm_first.json()["data"]["confirmed_received_amount"], "400.00")
-        self.assertEqual(confirm_first.json()["data"]["outstanding_amount"], "600.00")
-        self.assertEqual(confirm_first.json()["data"]["state"], "PARTIALLY_RECEIVED")
-        self.assertTrue(
-            WorkItem.objects.filter(
-                type="GOODS_TRANSFER_PAYMENT_UPLOAD",
-                uniq_key=f"lifecycle:goods-transfer:{flow['id']}:payment-upload:2",
-                status="OPEN",
-            ).exists()
-        )
-
-        second_voucher = self.client.post(
-            f"{self.endpoint}{flow['id']}/settlement/payments/",
-            {
-                "client_request_id": "settlement-payment-2",
-                "voucher_image": self.image_file("payment-2.png"),
-            },
-            **self.auth(self.child_b_stock),
-        )
-        self.assertEqual(second_voucher.json()["code"], 0, second_voucher.json())
-        second_payment = second_voucher.json()["data"]["payments"][1]
-        confirm_second = self.client.post(
-            f"{self.endpoint}{flow['id']}/settlement/payments/{second_payment['id']}/confirm/",
-            {"confirmed_amount": "600.00"},
-            content_type="application/json",
-            **self.auth(self.parent_owner),
-        )
-        self.assertEqual(confirm_second.json()["code"], 0, confirm_second.json())
-        self.assertEqual(confirm_second.json()["data"]["confirmed_received_amount"], "1000.00")
-        self.assertEqual(confirm_second.json()["data"]["outstanding_amount"], "0.00")
-        self.assertEqual(confirm_second.json()["data"]["state"], "FULLY_RECEIVED")
+        ).json()
+        self.assertEqual(attempt["code"], 1, attempt)
+        self.assertFalse(WorkItem.objects.filter(
+            biz_ref=f"lifecycle.GoodsTransfer:{flow['id']}", type__startswith="GOODS_TRANSFER_PAYMENT_",
+        ).exists())
 
     def test_goods_transfer_settlement_rejects_non_participant_and_non_shipment(self):
         device = self.devices[1]

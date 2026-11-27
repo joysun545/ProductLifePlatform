@@ -52,6 +52,20 @@ class PortalTests(TestCase):
             else:
                 with self.assertRaises(Exception):principal_for(u)
         self.assertEqual(principal_for(self.admin)['modules'],['admin','users'])
+    def test_only_manager_delegated_to_sales_assistant_can_open_merchant_accounts(self):
+        from account.models import SeniorManagerProfile
+
+        manager = self.users["factory_senior_manager"]
+        self.assertEqual(self.approve(self.begin(), manager).status_code, 403)
+        profile = SeniorManagerProfile.objects.create(identity=manager.organization_identity)
+        profile.managed_roles.add(self.users["factory_sales_assistant"].organization_identity.role)
+        self.signin(manager)
+        address = MODULES["merchant_accounts"][1]
+        self.assertContains(self.client.get(address), "直属商家往来账")
+        self.assertContains(self.client.get(address + "?section=prices"), "产品型号价格")
+        profile.managed_roles.clear()
+        self.assertEqual(self.client.get(address).status_code, 403)
+
     def test_no_csrf_cannot_start(self):
         self.assertEqual(self.client.post('/pldp/web/portal/api/start/').status_code,403)
     def test_cookie_not_bearer_cannot_approve(self):
@@ -117,8 +131,16 @@ class PortalTests(TestCase):
             self.assertFalse(info['logged_in'])
             self.assertRedirects(browser.get(page_url), '/?login=1', fetch_redirect_response=False)
             self.assertEqual(browser.get(page_url + 'api/batches/').status_code, 403)
-    def test_tourist_cannot_authorize(self):
-        self.assertEqual(self.approve(self.begin(),self.tourist).status_code,403)
+    def test_eligible_tourist_is_offered_trial_without_authorizing_browser(self):
+        challenge = self.begin()
+        response = self.approve(challenge, self.tourist)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data"]["status"], "trial_required")
+        challenge.refresh_from_db()
+        self.assertIsNone(challenge.approved_at)
+        self.assertIsNone(challenge.consumed_at)
+        self.assertEqual(self.post("status").json()["data"]["status"], "pending")
+        self.assertNotIn(GRANT, self.client.session)
     def test_superuser_without_wechat_denied(self):
         self.admin.wx_openid='';self.admin.save()
         with self.assertRaises(Exception):principal_for(self.admin)

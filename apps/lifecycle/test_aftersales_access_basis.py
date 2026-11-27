@@ -78,11 +78,10 @@ class AfterSalesAccessBasisTests(TestCase):
         self.assertFalse(visible_cases(self.fm).exists())
         profile.managed_roles.add(OrganizationRole.objects.get(organization_type=self.factory.organization_type,code='factory_aftersales'))
         self.assertTrue(visible_cases(self.fm).filter(pk=self.case.pk).exists())
-    def test_merchant_manager_manages_specific_employees(self):
-        profile=SeniorManagerProfile.objects.create(identity=self.manager_i)
-        profile.managed_roles.add(self.sales_i.role)
+    def test_senior_manager_covers_allocated_station_role_regardless_of_inviter(self):
+        profile = SeniorManagerProfile.objects.create(identity=self.manager_i)
         self.assertFalse(visible_cases(self.manager).exists())
-        self.sales_i.inviter=self.manager;self.sales_i.save(update_fields=['inviter'])
+        profile.managed_roles.add(self.sales_i.role)
         self.assertTrue(visible_cases(self.manager).filter(pk=self.case.pk).exists())
         profile.managed_roles.clear()
         self.assertFalse(visible_cases(self.manager).exists())
@@ -97,6 +96,56 @@ class AfterSalesAccessBasisTests(TestCase):
         binding.is_active=False;binding.save(update_fields=['is_active'])
         self.assertFalse(AfterSalesService.can_view_application(application=self.case,user=self.driver))
         self.assertEqual(build_dashboard(get_statistics_identity(self.driver))['modules'],['AFTERSALES'])
+    def test_customer_and_shared_driver_get_case_updates_without_sharing_applicant_action(self):
+        from workflow.models import UserTask
+        from workflow.services.task_action import open_task, TaskActionError
+        from workflow.services.task_query import get_task_summary
+
+        vehicle = CustomerVehicle.objects.create(
+            customer_organization=self.customer, vehicle_no="Shared", normalized_vehicle_no="SHARED",
+        )
+        other_vehicle = CustomerVehicle.objects.create(
+            customer_organization=self.customer, vehicle_no="Other", normalized_vehicle_no="OTHER",
+        )
+        CustomerDeviceBinding.objects.create(
+            device=self.device, customer_organization=self.customer, source_organization=self.merchant,
+            vehicle=vehicle, status="ACTIVE",
+        )
+        grant = DriverVehicleBinding.objects.create(vehicle=vehicle, driver=self.driver, is_active=True)
+        other, _ = self.user("other-driver", self.customer, "driver")
+        DriverVehicleBinding.objects.create(vehicle=other_vehicle, driver=other, is_active=True)
+
+        def publish():
+            AfterSalesService._publish_applicant_workorder(
+                self.case, topic="customer_confirmation", title="待联系", summary="已修复", need_action=True,
+            )
+
+        publish()
+        notice = UserTask.objects.get(to_openid=self.driver.wx_openid)
+        self.assertFalse(notice.need_action)
+        self.assertTrue(UserTask.objects.get(to_openid=self.customer_owner.wx_openid).need_action)
+        self.assertFalse(UserTask.objects.filter(to_openid=other.wx_openid).exists())
+
+        grant.is_active = False
+        grant.save(update_fields=["is_active"])
+        self.assertEqual(get_task_summary(self.driver.wx_openid)["attention_count"], 0)
+        with self.assertRaises(TaskActionError):
+            open_task(self.driver.wx_openid, notice.pk)
+
+        grant.is_active = True
+        grant.save(update_fields=["is_active"])
+        self.case.applicant = self.driver
+        self.case.save(update_fields=["applicant"])
+        publish()
+        self.assertTrue(UserTask.objects.filter(
+            to_openid=self.driver.wx_openid, workitem__uniq_key=AfterSalesService._applicant_workorder_key(self.case),
+            need_action=True,
+        ).exists())
+        self.assertTrue(UserTask.objects.filter(
+            to_openid=self.customer_owner.wx_openid, workitem__type="AFTERSALES_CUSTOMER_COLLABORATION_NOTICE",
+            need_action=False,
+        ).exists())
+
     def completed(self,app=None,quantity=2):
         app=app or self.case;now=timezone.now()
         app.repair_completed_at=now;app.repair_completed_by=self.sales;app.repair_material_replaced=True

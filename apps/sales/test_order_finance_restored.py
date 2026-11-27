@@ -165,8 +165,8 @@ class OrderFinanceRestoredTests(V2OrderPlanFixture):
     def test_authenticated_multipart_json_and_private_document_routes(self):
         response = self.client.post(self.base_url + "statement/", {"file": self.image(), "receivable_amount": "100.00"},
                                     HTTP_AUTHORIZATION=self.factory_assistant_1_authorization)
-        self.assertEqual(response.json()["code"], 0, response.content)
-        statement_url = response.json()["data"]["statement_url"]
+        self.assertEqual(response.status_code, 410)
+        statement_url = self.statement()["statement_url"]
         self.assertEqual(self.client.get(statement_url).status_code, 401)
         denied = self.client.get(statement_url, HTTP_AUTHORIZATION=self.merchant_sales_authorization)
         self.assertEqual(denied.status_code, 403)
@@ -177,8 +177,8 @@ class OrderFinanceRestoredTests(V2OrderPlanFixture):
         self.assertTrue(b"".join(allowed.streaming_content).startswith(b"\x89PNG"))
         response = self.client.post(self.base_url + "payments/", {"file": self.image(), "client_request_id": "api-pay-1"},
                                     HTTP_AUTHORIZATION=self.merchant_owner_authorization)
-        self.assertEqual(response.json()["code"], 0)
-        payment_id = response.json()["data"]["payments"][0]["id"]
+        self.assertEqual(response.status_code, 410)
+        payment_id = self.payment("legacy-pending")["payments"][0]["id"]
         response = self.client.post(self.base_url + f"payments/{payment_id}/confirm/", json.dumps({"confirmed_amount": "75.12"}),
                                     content_type="application/json", HTTP_AUTHORIZATION=self.factory_assistant_1_authorization)
         self.assertEqual(response.json()["code"], 0)

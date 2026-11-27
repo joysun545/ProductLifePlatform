@@ -132,7 +132,8 @@ class RecallScopePolicyTests(RecallEvidenceUploadMixin, TestCase):
             with self.assertRaises(QualityCaseError):
                 launch_recall_campaign(user=user, campaign_id=self.campaign.pk)
             tasks = UserTask.objects.filter(to_openid=user.wx_openid, workitem__biz_id=str(self.campaign.pk))
-            self.assertTrue(tasks.filter(workitem__type='QUALITY_RECALL_OBSERVER_NOTICE').exists())
+            self.assertEqual(tasks.filter(workitem__type='QUALITY_RECALL_OBSERVER_NOTICE').exists(),
+                             user == self.factory_users['factory_admin'])
             self.assertFalse(tasks.filter(need_action=True).exists())
 
     def test_policy_backfill_is_idempotent_preserves_movements_and_does_not_close_chiefs_task(self):

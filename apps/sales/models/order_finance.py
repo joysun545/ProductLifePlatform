@@ -6,6 +6,8 @@ from sales.private_storage import order_finance_private_storage
 
 
 class OrderPlanFinance(models.Model):
+    priced_lines = models.JSONField(default=list, blank=True)
+    pricing_version = models.CharField(max_length=8, blank=True, default="")
     """Independent receivable ledger for one order plan."""
 
     order_plan = models.OneToOneField(
@@ -225,4 +227,69 @@ class OrderPlanPaymentAllocation(models.Model):
                 name="sales_active_payment_invoice",
             ),
             models.CheckConstraint(condition=Q(amount__gt=0), name="sales_allocation_positive"),
+        ]
+
+
+class FactoryAccountFunding(models.Model):
+    """A standalone receipt or a posted factory return credit."""
+
+    account = models.ForeignKey(OrderPlanReceivableAccount, on_delete=models.PROTECT, related_name="funding")
+    request_id = models.CharField(max_length=64)
+    return_credit = models.OneToOneField(
+        "lifecycle.GoodsTransferAccountCase", on_delete=models.PROTECT, null=True, blank=True,
+    )
+    voucher = models.FileField(storage=order_finance_private_storage, upload_to="factory_payments/%Y/%m/", blank=True)
+    submitted_by = models.ForeignKey("account.User", on_delete=models.PROTECT, related_name="+")
+    confirmed_by = models.ForeignKey("account.User", on_delete=models.PROTECT, related_name="+", null=True)
+    amount = models.DecimalField(max_digits=14, decimal_places=2, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    confirmed_at = models.DateTimeField(null=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=("account", "request_id"), name="sales_factory_funding_request"),
+            models.CheckConstraint(condition=Q(amount__isnull=True) | Q(amount__gt=0), name="sales_factory_funding_amount"),
+        ]
+
+
+class FactoryAccountAllocation(models.Model):
+    funding = models.ForeignKey(FactoryAccountFunding, on_delete=models.PROTECT, related_name="allocations")
+    finance = models.ForeignKey(OrderPlanFinance, on_delete=models.PROTECT, related_name="factory_account_allocations")
+    amount = models.DecimalField(max_digits=14, decimal_places=2)
+    released_at = models.DateTimeField(null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=("funding", "finance"), condition=Q(released_at__isnull=True),
+                                    name="sales_factory_funding_live_allocation"),
+            models.CheckConstraint(condition=Q(amount__gt=0), name="sales_factory_allocation_amount"),
+        ]
+
+
+class FactoryProductPrice(models.Model):
+    factory = models.ForeignKey("account.Organization", on_delete=models.PROTECT)
+    product_model = models.ForeignKey("product.ProductModel", on_delete=models.PROTECT)
+    prices = models.JSONField(default=dict)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=("factory", "product_model"), name="sales_unique_factory_product_price"),
+        ]
+
+
+class MerchantPricePolicy(models.Model):
+    account = models.OneToOneField(OrderPlanReceivableAccount, on_delete=models.PROTECT, related_name="price_policy")
+    tier = models.CharField(max_length=1, choices=[(value, value) for value in "ABC"])
+    overrides = models.JSONField(default=dict)
+
+
+class FactoryAccessoryPrice(models.Model):
+    factory = models.ForeignKey("account.Organization", on_delete=models.PROTECT)
+    material_spec = models.ForeignKey("supply_chain.MaterialSpec", on_delete=models.PROTECT)
+    prices = models.JSONField(default=dict)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=("factory", "material_spec"), name="sales_unique_factory_accessory_price"),
         ]

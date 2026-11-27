@@ -68,7 +68,7 @@ class PlatformAdministratorIdentityTests(TestCase):
 
     def test_moved_wechat_login_returns_existing_admin_and_new_role_over_http(self):
         before_users = User.objects.count()
-        with patch('account.api.views._wx_code_to_openid', return_value=REAL):
+        with patch('apps.account.api.views._wx_code_to_openid', return_value=REAL):
             response = self.client.post('/pldp/api/account/login/', {'code': 'wechat-test-code'})
         self.assertEqual(response.status_code, 200)
         data = response.json()

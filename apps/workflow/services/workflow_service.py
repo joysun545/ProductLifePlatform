@@ -6,7 +6,10 @@ from typing import Iterable, Optional, Dict, Any
 from django.db import transaction
 from django.utils import timezone
 
-from account.models import SeniorManagerProfile, UserOrganization
+from account.models import UserOrganization
+from account.services.retired_roles import RETIRED_ROLE_CODES
+from account.services.role_delegation_service import VacantRoleRecipient
+from workflow.services.role_delivery import record_role_delivery, refresh_role_delivery
 from workflow.models import WorkItem, UserTask
 
 
@@ -23,55 +26,6 @@ def get_role_snapshot(openid):
         .first()
     )
     return identity.role.code if identity else ""
-
-
-def _add_delegated_senior_manager_recipients(receivers):
-    """Copy a role task to active senior managers of that same organization."""
-
-    expanded = list(receivers)
-    seen = set(expanded)
-    role_recipients = list(
-        UserOrganization.objects.select_related("organization", "role")
-        .filter(
-            user__wx_openid__in=receivers,
-            user__is_active=True,
-            is_active=True,
-            organization__is_active=True,
-            role__is_active=True,
-        )
-    )
-    for recipient in role_recipients:
-        # The senior manager invited the role holder whose task is being
-        # copied.  This prevents one manager from receiving a peer manager's
-        # tasks merely because both were assigned the same role code.
-        if not recipient.inviter_id:
-            continue
-        if recipient.role.code in {
-            "factory_senior_manager",
-            "merchant_senior_manager",
-        }:
-            continue
-        managers = SeniorManagerProfile.objects.filter(
-            identity__user_id=recipient.inviter_id,
-            identity__organization_id=recipient.organization_id,
-            identity__organization__is_active=True,
-            identity__is_active=True,
-            identity__role__is_active=True,
-            identity__role__code__in=(
-                "factory_senior_manager",
-                "merchant_senior_manager",
-            ),
-            identity__user__is_active=True,
-            identity__user__wx_openid__isnull=False,
-            managed_roles=recipient.role,
-        ).values_list("identity__user__wx_openid", flat=True)
-        for openid in managers:
-            openid = (openid or "").strip()
-            if openid and openid not in seen:
-                seen.add(openid)
-                expanded.append(openid)
-    return expanded
-
 
 
 @transaction.atomic
@@ -159,6 +113,8 @@ def publish_workitem(
 
 
 
+    reopen_completed_actions = need_action and workitem.status == "DONE"
+
     if not created:
 
 
@@ -192,11 +148,14 @@ def publish_workitem(
     receivers = []
 
     seen = set()
-
+    fallback_recipients = []
 
     for oid in recipients_openids:
 
 
+        if isinstance(oid, VacantRoleRecipient):
+            fallback_recipients.append(oid)
+            continue
         oid = (oid or "").strip()
 
 
@@ -206,7 +165,12 @@ def publish_workitem(
 
             receivers.append(oid)
 
-    receivers = _add_delegated_senior_manager_recipients(receivers)
+    retired = set(UserOrganization.objects.filter(
+        user__wx_openid__in=receivers, role__code__in=RETIRED_ROLE_CODES, is_active=True,
+    ).values_list("user__wx_openid", flat=True))
+    existing = set(workitem.user_tasks.filter(to_openid__in=retired).values_list("to_openid", flat=True))
+    receivers = [openid for openid in receivers if openid not in retired or openid in existing]
+    record_role_delivery(workitem, receivers, need_action, fallback_recipients)
 
 
 
@@ -272,6 +236,8 @@ def publish_workitem(
         )
 
 
+
+    refresh_role_delivery(workitem, reopen_completed_actions=reopen_completed_actions)
 
     # ==========================
     # 4. 通知型任务自动完成母单

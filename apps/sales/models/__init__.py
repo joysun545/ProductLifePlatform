@@ -10,6 +10,8 @@ from .order_plan import (
     OrderPlanReturnInventoryAllocation,
 )
 from .order_finance import (
+    FactoryAccessoryPrice, FactoryProductPrice, MerchantPricePolicy,
+    FactoryAccountFunding, FactoryAccountAllocation,
     OrderPlanFinance, OrderPlanPayment, OrderPlanReceivableAccount, OrderPlanPaymentAllocation,
 )
 from .order_logistics import OrderPlanLogisticsDocument
@@ -47,6 +49,11 @@ __all__ = (
     "OrderPlanItemBOMConfirmation",
     "OrderPlanItemMaterialBatch",
     "OrderPlanReturnInventoryAllocation",
+    "FactoryAccountFunding",
+    "FactoryProductPrice",
+    "FactoryAccessoryPrice",
+    "MerchantPricePolicy",
+    "FactoryAccountAllocation",
     "OrderPlanFinance",
     "OrderPlanPayment",
     "OrderPlanReceivableAccount",

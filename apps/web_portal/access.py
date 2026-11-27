@@ -14,13 +14,15 @@ MODULES={
  'device_codes':('厂家设备编码发行','/pldp/web/device-codes/'),
  'print':('成品打印中心','/pldp/web/print/'),
  'quality':('质量追溯控制台','/pldp/web/quality-trace/'),
+ 'merchant_accounts':('直属商家往来账','/pldp/web/portal/merchant-accounts/'),
 }
 ROLE_MODULES={
- 'factory_admin':('product','causes','materials','device_codes','print','quality'),
+ 'factory_admin':('product','causes','materials','device_codes','print','quality','merchant_accounts'),
  'factory_production':('product','device_codes'),
  'factory_aftersales':('causes',),
  'factory_matching':('materials',),
  'factory_stock':('print',),
+ 'factory_sales_assistant':('merchant_accounts',),
  'factory_chief_engineer':('quality',),
 }
 
@@ -33,7 +35,9 @@ def identity_can_access_module(identity, module):
         and org.get_factory_root() and org.get_factory_root().pk==org.pk
         and (module in ROLE_MODULES.get(role.code,())
             or (module=='print' and role.code=='factory_senior_manager'
-                and identity_has_role(identity,'factory_stock'))))
+                and identity_has_role(identity,'factory_stock'))
+            or (module=='merchant_accounts' and role.code=='factory_senior_manager'
+                and identity_has_role(identity,'factory_sales_assistant'))))
 
 def principal_for(user):
     if not user or not user.is_active or not user.wx_openid:

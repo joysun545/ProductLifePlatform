@@ -120,7 +120,7 @@ def get_order_plan_list(user, status="", limit=50):
         plans = plans.filter(factory_organization=identity.organization)
         if roles := effective_role_codes(identity):
             # A senior manager assigned only the sales role sees the plans
-            # created by factory-sales users they directly invited. A second
+            # created by factory-sales users in the managed organization. A second
             # delegated factory role keeps its normal organization-wide scope.
             other_factory_roles = FACTORY_ROLES - {"factory_sales"}
             if "factory_sales" in roles and not (roles & other_factory_roles):

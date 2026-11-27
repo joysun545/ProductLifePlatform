@@ -8,14 +8,15 @@ from django.utils import timezone
 
 
 class ShipmentUpgradeMigrationTests(TransactionTestCase):
-    serialized_rollback = True
-
     def test_0020_upgrade_preserves_history_and_reuses_pending_task(self):
         executor = MigrationExecutor(connection)
         latest = executor.loader.graph.leaf_nodes()
         old_target = [('sales', '0020_make_material_stock_v2_the_only_new_order_flow')]
         executor.migrate(old_target)
-        old = executor.loader.project_state(old_target).apps
+        # The downgrade targets only this domain. Account and workflow tables
+        # keep their current shape, so fixtures must use those model states.
+        retained = [target for target in latest if target[0] in {"account", "workflow"}]
+        old = executor.loader.project_state([*old_target, *retained]).apps
         self.addCleanup(lambda: MigrationExecutor(connection).migrate(latest))
 
         def model(app, name):

@@ -112,6 +112,8 @@ class UserTask(models.Model):
 
         ("OTHER_ACTION", "他人操作导致完成"),
 
+        ("ROLE_REASSIGNED", "岗位分管调整"),
+
     ]
 
 

@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>直属商家往来账</title>
+<style>
+body{margin:0;background:#f4f6f9;color:#17243a;font:16px system-ui,sans-serif}
+main{max-width:1100px;margin:auto;padding:24px}nav{display:flex;gap:18px;margin-bottom:20px}
+section,details{background:white;border:1px solid #dce4ee;border-radius:10px;padding:16px;margin-bottom:12px}
+summary{cursor:pointer;font-weight:650}table{width:100%;border-collapse:collapse}
+td,th{text-align:left;padding:10px;border-bottom:1px solid #e4e9ef}
+input,select,button{font:inherit;padding:6px;max-width:100%}input{width:110px}
+button{cursor:pointer}.error{color:#a12622}.table-wrap{overflow:auto}
+</style>
+</head>
+<body><main>
+<h1>直属商家往来账</h1>
+<nav><a href="?">客户列表</a><a href="?section=prices">基础价目表</a><a href="/pldp/web/portal/">返回工作台</a></nav>
+{% for message in messages %}<p role="status">{{ message }}</p>{% endfor %}
+{% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+{% if section == "prices" %}
+<section><h2>产品型号价格与配件价格</h2><div class="table-wrap"><table>
+<thead><tr><th>品类</th><th>产品型号</th><th>A 档</th><th>B 档</th><th>C 档</th><th>操作</th></tr></thead>
+<tbody>{% for row in catalog %}
+<tr><td>{{ row.category }}</td><td>{{ row.name }}</td>
+<td><input aria-label="{{ row.name }} A 档" form="model-{{ row.price_key }}" name="A" value="{{ row.prices.A }}" inputmode="decimal" required></td>
+<td><input aria-label="{{ row.name }} B 档" form="model-{{ row.price_key }}" name="B" value="{{ row.prices.B }}" inputmode="decimal" required></td>
+<td><input aria-label="{{ row.name }} C 档" form="model-{{ row.price_key }}" name="C" value="{{ row.prices.C }}" inputmode="decimal" required></td>
+<td><form id="model-{{ row.price_key }}" method="post">{% csrf_token %}<input type="hidden" name="action" value="catalog"><input type="hidden" name="model" value="{{ row.price_key }}"><button>保存</button></form></td></tr>
+{% empty %}<tr><td colspan="6">暂无产品型号</td></tr>{% endfor %}</tbody>
+</table></div></section>
+{% elif merchant_prices %}
+<section><h2>{{ merchant_prices.merchant.name }} · 价格档位</h2>
+{% if not merchant_prices.tier %}
+<form method="post">{% csrf_token %}<input type="hidden" name="action" value="merchant_tier">
+<label>基础档位 <select name="tier" required><option value="">请选择</option>{% for tier in tiers %}<option>{{ tier }}</option>{% endfor %}</select></label>
+<button>确认基础档位</button></form>
+{% else %}
+<p>当前档位 {{ merchant_prices.version }}。未设置专用单价的型号跟随最新基础价。</p>
+<div class="table-wrap"><table><thead><tr><th>品类</th><th>产品型号</th><th>最新基础价</th><th>专用单价</th></tr></thead><tbody>
+{% for row in merchant_prices.rows %}<tr><td>{{ row.category }}</td><td>{{ row.name }}</td><td>{{ row.base|default:"—" }}</td><td>
+<form method="post">{% csrf_token %}<input type="hidden" name="action" value="merchant_price"><input type="hidden" name="tier" value="{{ merchant_prices.tier }}"><input type="hidden" name="model" value="{{ row.price_key }}">
+<input aria-label="{{ row.name }} 专用单价" name="price" inputmode="decimal" value="{{ row.override }}" required><button>保存</button>
+</form></td></tr>{% endfor %}
+</tbody></table></div>
+{% endif %}</section>
+{% elif order %}
+{% if quote %}<section><h2>订单清单</h2>
+{% if quote.confirmed %}
+{% if quote.device_subtotal != None %}<p>设备应收 ¥{{ quote.device_subtotal }} · 配件应收 ¥{{ quote.accessory_subtotal }}</p>{% endif %}
+<p>已确认应收 ¥{{ quote.total }} {% if quote.version %} · {{ quote.version }}{% endif %}</p>
+{% for row in quote.lines %}<p>{{ row.name }} × {{ row.quantity }}{{ row.unit }} · 单价 ¥{{ row.unit_price }} · 小计 ¥{{ row.subtotal }}</p>{% endfor %}
+{% else %}
+{% if not quote.tier_locked %}
+<form method="get"><input type="hidden" name="order" value="{{ order }}"><label>首次计价档位
+<select name="tier" required><option value="">请选择</option>{% for tier in tiers %}<option{% if tier == quote.tier %} selected{% endif %}>{{ tier }}</option>{% endfor %}</select></label> <button>加载单价</button></form>
+{% endif %}
+{% if quote.tier %}
+<form method="post" id="pricing-form">{% csrf_token %}
+<input type="hidden" name="action" value="pricing"><input type="hidden" name="tier" value="{{ quote.tier }}">
+<h3>{{ quote.version }} 档订单明细</h3>
+<table><thead><tr><th>产品型号</th><th>数量</th><th>本单单价</th><th>小计</th></tr></thead>
+<tbody>{% for row in quote.lines %}<tr><td>{{ row.name }}</td><td>{{ row.quantity }}{{ row.unit }}</td>
+<td><input type="hidden" name="expected_{{ row.price_key }}" value="{{ row.unit_price|default_if_none:'' }}">
+<input aria-label="{{ row.name }} 单价" name="price_{{ row.price_key }}" required inputmode="decimal" value="{{ row.unit_price|default_if_none:'' }}" data-kind="{{ row.kind }}" data-quantity="{{ row.quantity }}" data-amount="line-{{ row.line_key }}">
+{% if row.unit_price == None %}<small>请先维护基础价</small>{% endif %}</td><td id="line-{{ row.line_key }}">{{ row.subtotal|default_if_none:'—' }}</td></tr>{% endfor %}</tbody>
+</table>
+<p>设备应收 ¥<output id="pricing-device">—</output> · 配件应收 ¥<output id="pricing-accessory">—</output> · 本单合计 ¥<output id="pricing-total">—</output></p><p>修改的型号单价会成为该商家后续订单的默认单价。</p>
+{% if quote.blocked_reason %}<p class="error">{{ quote.blocked_reason }}</p>{% elif can_operate %}<button>确认清单并登记应收</button>{% endif %}</form>
+{% endif %}
+{% endif %}</section>{% endif %}
+{% else %}
+{% for account in accounts %}
+<details{% if request.GET.merchant == account.merchant_id|stringformat:"s" %} open{% endif %}>
+<summary>{{ account.merchant_name }} · {{ account.order_count }} 单 · 应收总额 ¥{{ account.receivable_amount }}</summary>
+<p><a href="?merchant_prices={{ account.merchant_id }}">维护商家档位与专用价格</a></p>
+<p>累计设备应收 ¥{{ account.device_receivable }} · 累计配件应收 ¥{{ account.accessory_receivable }}{% if account.unclassified_receivable != "0.00" %} · 历史未拆分应收 ¥{{ account.unclassified_receivable }}{% endif %}</p>
+<p>已确认收款 ¥{{ account.received_amount }} · 退货冲抵 ¥{{ account.return_credit_amount }} · 往来余额 ¥{{ account.balance_amount }}</p>
+<div class="table-wrap"><table><thead><tr><th>订单</th><th>状态</th><th>本单应收</th><th>已分配收款</th><th>退货冲抵</th><th>未收</th><th>计价</th></tr></thead>
+<tbody>{% for row in account.orders %}<tr><td>{{ row.code }}</td><td>{{ row.status }}</td><td>{{ row.receivable|default_if_none:"待确认" }}{% if row.device_subtotal != None %}<br><small>设备 {{ row.device_subtotal }} · 配件 {{ row.accessory_subtotal }}</small>{% endif %}</td><td>{{ row.received|default_if_none:"—" }}</td><td>{{ row.credit|default_if_none:"—" }}</td><td>{{ row.outstanding|default_if_none:"—" }}</td><td>{% if row.can_price %}<a href="?order={{ row.id }}">确认订单清单</a>{% elif row.can_view_quote and row.receivable != None %}<a href="?order={{ row.id }}">查看清单</a>{% endif %}</td></tr>
+{% empty %}<tr><td colspan="7">暂无订单</td></tr>{% endfor %}</tbody></table></div>
+<h3>付款与冲抵记录</h3>
+{% for payment in account.order_payments %}<p>原订单付款 · {{ payment.order_code }} · {{ payment.amount|default_if_none:"待确认" }}</p>{% endfor %}
+{% for payment in account.payments %}
+<p>{{ payment.is_credit|yesno:"退货冲抵,商家付款" }} · {{ payment.amount|default_if_none:"待确认" }}
+{% if can_operate and payment.voucher_url %}<a href="?voucher={{ payment.id }}">查看凭证</a>{% endif %}</p>
+{% if payment.can_confirm %}<form method="post">{% csrf_token %}<input type="hidden" name="action" value="receipt"><input type="hidden" name="payment" value="{{ payment.id }}"><label>实际到账金额 <input name="amount" inputmode="decimal" required></label> <button>确认到账</button></form>{% endif %}
+{% empty %}<p>暂无记录</p>{% endfor %}
+</details>
+{% empty %}<p>暂无直属商家</p>{% endfor %}
+{% endif %}
+</main>
+<script>
+const form = document.querySelector('#pricing-form');
+if (form) {
+  function units(value, places) {
+    const parts = value.split('.');
+    return BigInt(parts[0]) * (10n ** BigInt(places)) + BigInt((parts[1] || '').padEnd(places, '0'));
+  }
+
+  function money(cents) {
+    return (cents / 100n) + '.' + String(cents % 100n).padStart(2, '0');
+  }
+
+  function total() {
+    const subtotals = { DEVICE: 0n, ACCESSORY: 0n };
+    const incomplete = new Set();
+    for (const field of form.querySelectorAll('[data-quantity]')) {
+      const value = field.value.trim();
+      const kind = field.dataset.kind;
+      const valid = /^[0-9]{1,12}(?:\.[0-9]{1,2})?$/.test(value);
+      const cents = valid ? (units(value, 2) * units(field.dataset.quantity, 3) + 500n) / 1000n : 0n;
+      if (!valid) incomplete.add(kind);
+      subtotals[kind] += cents;
+      document.getElementById(field.dataset.amount).textContent = valid ? money(cents) : '—';
+    }
+    document.getElementById('pricing-device').textContent = incomplete.has('DEVICE') ? '—' : money(subtotals.DEVICE);
+    document.getElementById('pricing-accessory').textContent = incomplete.has('ACCESSORY') ? '—' : money(subtotals.ACCESSORY);
+    document.getElementById('pricing-total').textContent = incomplete.size ? '—' : money(subtotals.DEVICE + subtotals.ACCESSORY);
+  }
+  form.addEventListener('input', total);
+  total();
+}
+</script>
+</body></html>

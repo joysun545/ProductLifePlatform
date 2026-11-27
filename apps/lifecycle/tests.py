@@ -178,20 +178,26 @@ class ScanOwnershipAndInstallationTests(TestCase):
             organization_type=merchant_type,
             region="重庆市渝北区",
         )
+        outside_factory = Organization.objects.create(
+            name="其他厂家", code="FACTORY-OUTSIDE", organization_type=owner_type,
+        )
         cls.outside_merchant = Organization.objects.create(
-            name="无关商家",
-            code="MERCHANT-OUTSIDE",
-            organization_type=merchant_type,
-            region="四川省",
+            name="无关商家", code="MERCHANT-OUTSIDE", organization_type=merchant_type,
+            region="四川省", factory_root=outside_factory,
         )
         cls.supplier = Organization.objects.create(
             name="测试供应商",
             code="SUPPLIER-TEST",
             organization_type=supplier_type,
+            factory_root=cls.factory,
         )
 
         cls.factory_user = cls._user_identity(
             "factory", cls.factory, cls.factory_admin_role
+        )
+        cls.quality_chief = cls._user_identity(
+            "quality-chief", cls.factory,
+            OrganizationRole.objects.get(organization_type=owner_type, code="factory_chief_engineer"),
         )
         cls.regional_owner_user = cls._user_identity(
             "regional_owner", cls.regional_merchant, cls.merchant_owner_role
@@ -403,7 +409,7 @@ class ScanOwnershipAndInstallationTests(TestCase):
             trace_evidence_snapshot={"is_fault": True},
         )
         action = place_temporary_hold(
-            user=self.factory_user,
+            user=self.quality_chief,
             case_id=quality_case.pk,
             reason="验证商品流转拦截和事务外审计",
             duration_hours=1,
@@ -605,7 +611,7 @@ class ScanOwnershipAndInstallationTests(TestCase):
         transfer = GoodsTransfer.objects.get(pk=result["id"])
         self.assertEqual(transfer.initiated_by_id, manager.pk)
 
-    def test_stock_senior_manager_can_confirm_receipt_without_task_and_replaces_owner(self):
+    def test_stock_senior_manager_receives_collaboration_task_and_replaces_owner(self):
         self._exercise_stock_senior_manager_receipt(staffed=True)
 
     def test_vacant_stock_role_creates_actionable_receipt_for_senior_manager(self):
@@ -653,13 +659,9 @@ class ScanOwnershipAndInstallationTests(TestCase):
             type="GOODS_TRANSFER_RECEIPT_CONFIRM",
             uniq_key=f"lifecycle:goods-transfer:{transfer.pk}:receipt",
         )
-        self.assertEqual(
-            receipt_workitem.user_tasks.filter(
-                to_openid=manager.wx_openid,
-                need_action=True,
-            ).exists(),
-            not staffed,
-        )
+        self.assertTrue(receipt_workitem.user_tasks.filter(
+            to_openid=manager.wx_openid, need_action=True,
+        ).exists())
 
         with self.assertRaises(GoodsTransferError):
             confirm_goods_transfer_receipt(
@@ -1138,7 +1140,7 @@ class ScanOwnershipAndInstallationTests(TestCase):
             trace_evidence_snapshot={"is_fault": True},
         )
         action = place_temporary_hold(
-            user=self.factory_user,
+            user=self.quality_chief,
             case_id=quality_case.pk,
             reason="验证激活入口阻断和事务外审计",
             duration_hours=1,
@@ -1232,7 +1234,7 @@ class ScanOwnershipAndInstallationTests(TestCase):
         self.assertEqual(decision.context_snapshot["source"], "GOODS_TRANSFER_SUBMIT")
 
         revoke_temporary_hold(
-            user=self.factory_user,
+            user=self.quality_chief,
             action_id=action.pk,
             reason="提交二次门禁回归完成",
         )
@@ -1331,7 +1333,7 @@ class ScanOwnershipAndInstallationTests(TestCase):
         self.assertEqual(decision.context_snapshot["source"], "GOODS_TRANSFER_SUBMIT")
 
         revoke_temporary_hold(
-            user=self.factory_user,
+            user=self.quality_chief,
             action_id=action.pk,
             reason="发货提交二次门禁回归完成",
         )
@@ -1919,22 +1921,56 @@ class ScanOwnershipAndInstallationTests(TestCase):
         )
         self.assertEqual(duplicated.status_code, 409)
 
-        remote = self.client.post(
-            f"/pldp/api/lifecycle/after-sales/applications/{application_id}/triage/",
+        triage_url = f"/pldp/api/lifecycle/after-sales/applications/{application_id}/triage/"
+        triage_payload = {
+            "preliminary_fault_type": "INSTALLATION_OR_WIRING",
+            "diagnosis_note": "根据故障视频判断为接线端子松动。",
+            "repair_plan": "检查接线端子后重新启动测试。",
+        }
+        review = self.client.get(
+            f"/pldp/api/lifecycle/after-sales/applications/{application_id}/",
+            **self.auth(factory_actor),
+        ).json()["data"]
+        self.assertEqual(
+            [option["value"] for option in review["triage_options"]["routes"]],
+            ["ORIGINAL_INSTALLER", "SERVICE_STATION", "FACTORY_AFTERSALES"],
+        )
+        for route in ("REMOTE", "THIRD_PARTY", "MERCHANT_ELECTRICIAN"):
+            with self.subTest(route=route):
+                response = self.client.post(
+                    triage_url,
+                    {**triage_payload, "dispatch_route": route},
+                    content_type="application/json",
+                    **self.auth(factory_actor),
+                )
+                self.assertEqual(response.status_code, 409, response.json())
+                self.assertEqual(response.json()["msg"], "请选择有效的售后处理路径")
+        application.refresh_from_db()
+        self.assertEqual(application.status, AfterSalesApplication.Status.SUBMITTED)
+        self.assertEqual(application.dispatch_route, "")
+        senior_task.refresh_from_db()
+        self.assertTrue(senior_task.need_action)
+        self.assertNotEqual(senior_task.state, "DONE")
+        legacy_sales_task.refresh_from_db()
+        self.assertNotEqual(legacy_sales_task.state, "DONE")
+
+        # Start at final attribution to exercise remote guidance as a closing result.
+        application.dispatch_route = AfterSalesApplication.DispatchRoute.FACTORY_AFTERSALES
+        application.status = AfterSalesApplication.Status.PENDING_FACTORY_CLOSE
+        application.execution_stage = AfterSalesApplication.ExecutionStage.FINAL_DIAGNOSIS
+        application.save(update_fields=("dispatch_route", "status", "execution_stage"))
+        closed = self.client.post(
+            f"/pldp/api/lifecycle/after-sales/applications/{application_id}/factory-close/",
             {
-                "preliminary_fault_type": "INSTALLATION_OR_WIRING",
-                "diagnosis_note": "根据故障视频判断为接线端子松动。",
-                "repair_plan": "远程指导复紧接线端子后重新启动测试。",
-                "dispatch_route": "REMOTE",
                 "final_fault_type": "INSTALLATION_OR_WIRING",
                 "final_fault_materials": [],
                 "final_solution_type": "REMOTE_GUIDANCE",
-                "final_solution_note": "已远程指导完成复紧和启动测试，设备恢复正常。",
+                "final_solution_note": "已远程指导复紧接线端子，设备恢复正常。",
             },
             content_type="application/json",
             **self.auth(factory_actor),
         )
-        self.assertEqual(remote.status_code, 200, remote.json())
+        self.assertEqual(closed.status_code, 200, closed.json())
         senior_task.refresh_from_db()
         self.assertEqual(senior_task.state, "DONE")
         self.assertEqual(senior_task.done_reason, "OTHER_ACTION" if staffed else "SELF_ACTION")
@@ -1963,7 +1999,7 @@ class ScanOwnershipAndInstallationTests(TestCase):
         self.assertEqual(application.status, AfterSalesApplication.Status.CLOSED)
         self.assertTrue(
             application.events.filter(
-                event_type="REMOTE_RESOLVED_AND_CLOSED"
+                event_type="FACTORY_CLOSED"
             ).exists()
         )
         closed_detail = self.client.get(

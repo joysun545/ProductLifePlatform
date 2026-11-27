@@ -17,7 +17,7 @@ from lifecycle.models import (
     GoodsTransferCreditAllocation,
 )
 from lifecycle.services.goods_transfer_account_service import FACTORY_ACCOUNT_ROLES
-from sales.models import OrderPlanFinance, OrderPlanPayment, OrderPlanPaymentAllocation
+from sales.models import FactoryAccountAllocation, FactoryAccountFunding, OrderPlanFinance, OrderPlanPayment, OrderPlanPaymentAllocation
 from sales.services.order_receivable_service import PENDING_CANCELLATIONS
 
 
@@ -189,6 +189,9 @@ def _order_accounts(identity, root, caps):
         finance__order_plan__merchant_organization__factory_root_id=root["id"],
     )
     allocated = _sums(live_allocations.filter(finance_id__in=ids), "finance_id", "amount")
+    extra = FactoryAccountAllocation.objects.filter(finance_id__in=ids, released_at__isnull=True)
+    extra_cash = _sums(extra.filter(funding__return_credit__isnull=True), "finance_id", "amount")
+    extra_credit = _sums(extra.filter(funding__return_credit__isnull=False), "finance_id", "amount")
     payments = list(OrderPlanPayment.objects.filter(finance_id__in=ids,
                     status=OrderPlanPayment.Status.CONFIRMED))
     used = _sums(live_allocations.filter(payment_id__in=[p.pk for p in payments]), "payment_id", "amount")
@@ -201,11 +204,13 @@ def _order_accounts(identity, root, caps):
         pair = (plan.factory_organization_id, plan.merchant_organization_id)
         account = accounts.setdefault(pair, _new_account(
             "ORDER_PLAN", plan.factory_organization, plan.merchant_organization, org_id, root))
-        allocation = allocated.get(finance.pk) or ZERO
+        allocation = (allocated.get(finance.pk) or ZERO) + (extra_cash.get(finance.pk) or ZERO)
+        credit = extra_credit.get(finance.pk) or ZERO
+        account["credit_amount"] += credit
         account["document_count"] += 1
         account["receivable_amount"] += finance.receivable_amount
         account["received_amount"] += allocation + unused[finance.pk]
-        account["outstanding_amount"] += max(finance.receivable_amount - allocation, ZERO)
+        account["outstanding_amount"] += max(finance.receivable_amount - allocation - credit, ZERO)
         account["overpaid_amount"] += unused[finance.pk]
         account["entry_id"] = plan.pk if caps["can_open_order_detail"] else None
         account["can_open"] = caps["can_open_order_detail"]
@@ -226,9 +231,27 @@ def _order_accounts(identity, root, caps):
                          .exclude(payment__finance_id__in=ids), "finance_id", "amount")
         for finance_id, amount in retained.items():
             pair_cash[finance_pairs[finance_id]] += amount or ZERO
+        funding_rows = FactoryAccountFunding.objects.filter(
+            account__factory_organization_id=root["id"],
+            account__merchant_organization_id__in=_direct_merchant_ids(root["id"]),
+            amount__isnull=False,
+        ).select_related("account__factory_organization", "account__merchant_organization")
+        if org_id != root["id"]:
+            funding_rows = funding_rows.filter(account__merchant_organization_id=org_id)
+        pair_credit = defaultdict(lambda: ZERO)
+        for funding in funding_rows:
+            seller = funding.account.factory_organization
+            buyer = funding.account.merchant_organization
+            pair = (seller.pk, buyer.pk)
+            accounts.setdefault(pair, _new_account("ORDER_PLAN", seller, buyer, org_id, root))
+            if funding.return_credit_id:
+                pair_credit[pair] += funding.amount
+            else:
+                pair_cash[pair] += funding.amount
         for pair, account in accounts.items():
             account["received_amount"] = pair_cash[pair]
-            balance = account["receivable_amount"] - account["received_amount"]
+            account["credit_amount"] = pair_credit[pair]
+            balance = account["receivable_amount"] - account["received_amount"] - account["credit_amount"]
             account["outstanding_amount"], account["overpaid_amount"] = max(balance, ZERO), max(-balance, ZERO)
     return list(accounts.values())
 
@@ -263,6 +286,7 @@ def build_financial_statistics(identity, requested_root=None):
         note += "厂家订单仅统计本人创建的有效订单。"
     money_keys = ("receivable_amount", "received_amount", "credit_amount", "outstanding_amount", "overpaid_amount")
     for account in accounts:
+        account["balance_amount"] = _money(account["outstanding_amount"] - account["overpaid_amount"])
         for key in money_keys:
             account[key] = _money(account[key])
     accounts.sort(key=lambda row: (row["side"] != "RECEIVABLE", row["source_kind"], row["counterparty_id"]))

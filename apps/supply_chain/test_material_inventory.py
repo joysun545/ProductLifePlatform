@@ -287,6 +287,9 @@ class MaterialInventoryTests(TestCase):
 
 class MaterialInventoryConcurrencyTests(TransactionTestCase):
     def test_concurrent_retries_and_returns_conserve_inventory(self):
+        from account.test_reference import restore_account_test_reference
+
+        restore_account_test_reference()
         factory = Organization.objects.create(code="MI-RACE-F", name="并发厂家", organization_type=OrganizationType.objects.get(code="OWNER"))
         supplier = Organization.objects.create(code="MI-RACE-S", name="并发供应商", organization_type=OrganizationType.objects.get(code="SUPPLIER"))
         OrganizationRelation.objects.create(source_organization=factory, target_organization=supplier, relation_type="SUPPLY")

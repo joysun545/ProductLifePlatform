@@ -15,7 +15,7 @@ from account.models import (
 from account.services.auth_service import issue_access_token
 from lifecycle.models import PhysicalDeviceCode
 from lifecycle.services.physical_device_code_service import identity_can_issue_device_codes
-from lifecycle.web.device_code_registry.views import LOGIN_SCOPE
+from web_portal.access import GRANT
 
 
 class DeviceCodeRegistryWebTests(TestCase):
@@ -58,22 +58,24 @@ class DeviceCodeRegistryWebTests(TestCase):
         return reverse(f"pldp:web:device_code_registry:{name}", kwargs=kwargs or None)
 
     def _logged_in_browser(self, user):
+        from web_portal.tests import PortalTests
+
         browser = Client()
-        started = browser.post(self._url("login_start"), data="{}", content_type="application/json")
+        started = browser.post("/pldp/web/portal/api/start/", data="{}", content_type="application/json")
         self.assertEqual(started.status_code, 200, started.content)
-        qr_text = started.json()["data"]["qr_text"]
-        token = qr_text.split("|", 1)[1]
-        approved = browser.post(
-            self._url("login_approve"),
-            data={"token": token},
-            content_type="application/json",
-            HTTP_AUTHORIZATION=f"Bearer {issue_access_token(user)}",
-        )
+        from web_portal.views import CHALLENGE
+        from web_portal.models import WebLoginChallenge
+
+        challenge = WebLoginChallenge.objects.get(pk=browser.session[CHALLENGE])
+        approved = PortalTests.approve(self, challenge, user)
         return browser, approved
 
     def test_web_route_is_separate_and_uses_the_mid_web_router(self):
-        response = Client().get("/pldp/web/device-codes/")
-        self.assertEqual(response.status_code, 200)
+        self.assertRedirects(Client().get(self._url("page")), "/?login=1", fetch_redirect_response=False)
+        browser, approved = self._logged_in_browser(self.users["factory_production"])
+        self.assertEqual(approved.status_code, 200, approved.content)
+        browser.post("/pldp/web/portal/api/status/", data="{}", content_type="application/json")
+        response = browser.get(self._url("page"))
         self.assertContains(response, "厂家设备编码发行")
         self.assertNotContains(response, "打印中心")
 
@@ -91,14 +93,15 @@ class DeviceCodeRegistryWebTests(TestCase):
         self.assertTrue(identity_can_issue_device_codes(senior))
         self.assertFalse(identity_can_issue_device_codes(self.identities["factory_sales"]))
 
-    def test_web_qr_challenge_authenticates_scanner_and_uses_separate_session_scope(self):
+    def test_web_qr_challenge_grants_device_codes_without_print_access(self):
         browser, approved = self._logged_in_browser(self.users["factory_production"])
         self.assertEqual(approved.status_code, 200, approved.content)
-        status = browser.post(self._url("login_status"), data="{}", content_type="application/json")
+        status = browser.post("/pldp/web/portal/api/status/", data="{}", content_type="application/json")
         self.assertEqual(status.status_code, 200, status.content)
         self.assertEqual(status.json()["data"]["status"], "ready")
-        self.assertEqual(browser.session["pldp_device_code_registry_gate"]["scope"], LOGIN_SCOPE)
-        self.assertNotIn("pldp_print_gate", browser.session)
+        self.assertIn("device_codes", browser.session[GRANT]["principal"]["modules"])
+        self.assertNotIn("print", browser.session[GRANT]["principal"]["modules"])
+        self.assertEqual(browser.get("/pldp/web/print/").status_code, 403)
 
     def test_unauthorized_role_cannot_approve_and_code_download_has_no_qr_images(self):
         browser, approved = self._logged_in_browser(self.users["factory_sales"])
@@ -106,7 +109,7 @@ class DeviceCodeRegistryWebTests(TestCase):
 
         browser, approved = self._logged_in_browser(self.users["factory_production"])
         self.assertEqual(approved.status_code, 200)
-        browser.post(self._url("login_status"), data="{}", content_type="application/json")
+        browser.post("/pldp/web/portal/api/status/", data="{}", content_type="application/json")
 
         generated = browser.post(
             self._url("generate_batch"),

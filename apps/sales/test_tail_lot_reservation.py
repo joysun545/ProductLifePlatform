@@ -340,7 +340,11 @@ class TailLotReservationTests(TailLotFixture, TestCase):
 
 
 class TailLotConcurrentReservationTests(TailLotFixture, TransactionTestCase):
-    serialized_rollback = True
+    def setUp(self):
+        from account.test_reference import restore_account_test_reference
+
+        restore_account_test_reference()
+        super().setUp()
 
     def test_two_sqlite_requests_reserve_shared_tail_once_and_retry_without_orphans(self):
         old = self.receive(5, label="RACE-TAIL-5")

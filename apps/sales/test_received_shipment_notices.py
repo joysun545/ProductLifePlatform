@@ -69,8 +69,13 @@ class ReceivedShipmentNoticeTests(V2OrderPlanFixture):
         return {model._meta.label: list(model.objects.order_by("pk").values())
                 for model in models}
 
+    def _assert_task_summary(self, user, expected):
+        summary = get_task_summary(user.wx_openid)
+        self.assertRegex(summary.pop("revision"), r"^[a-f0-9]{64}$")
+        self.assertEqual(summary, expected)
+
     def _assert_no_attention(self, user):
-        self.assertEqual(get_task_summary(user.wx_openid), {
+        self._assert_task_summary(user, {
             "unread_count": 0, "action_pending_count": 0, "attention_count": 0,
         })
 
@@ -137,7 +142,7 @@ class ReceivedShipmentNoticeTests(V2OrderPlanFixture):
                 if user == self.merchant_sales
                 else {"unread_count": 1, "action_pending_count": 1, "attention_count": 1}
             )
-            self.assertEqual(get_task_summary(user.wx_openid), expected_summary)
+            self._assert_task_summary(user, expected_summary)
         self.assertFalse(WorkItem.objects.filter(type="ORDER_PLAN_V2_ACCOUNTING_CONFIRM").exists())
         with self.assertRaises(flow.OrderPlanMaterialFlowError):
             flow.confirm_material_flow_accounting(user=self.factory_assistant_1, plan_id=plan.pk)
@@ -186,7 +191,7 @@ class ReceivedShipmentNoticeTests(V2OrderPlanFixture):
         self.assertEqual(payment_work.status, "OPEN")
         for user in (self.merchant_sales, self.merchant_stock_1, self.merchant_stock_2):
             self._assert_no_attention(user)
-        self.assertEqual(get_task_summary(self.merchant_owner.wx_openid), {
+        self._assert_task_summary(self.merchant_owner, {
             "unread_count": 0, "action_pending_count": 1, "attention_count": 1,
         })
         card = get_task_list(self.merchant_owner.wx_openid)["items"][0]

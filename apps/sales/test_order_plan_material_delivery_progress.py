@@ -103,17 +103,16 @@ class OrderPlanMaterialDeliveryProgressTests(TestCase):
         )
 
     def test_confirmation_persists_line_amounts_and_receipts_only_count_new_lot_delta(self):
-        """4 old reserved + 2 new receipt must show 2, never the old 4 too."""
+        """Require one traceable lot and attribute only stock from the receipt."""
 
-        # This stock existed before the order and is reserved at creation.  A
-        # later supplier delivery therefore covers only the six-unit gap.
+        # Four units cannot supply a ten-unit requirement using one lot.
         self._create_primary_lot(4_000, "OLD")
         plan = self._create_v2_plan("delivery-progress-delta")
         material_plan = OrderPlanMaterialPlan.objects.get(order_plan=plan)
         warehouse_review_material_plan(user=self.factory_material_stock, plan_id=plan.pk)
         delivery = OrderPlanSupplyDelivery.objects.get(material_plan=material_plan)
         line = delivery.lines.get(material_spec=self.primary_spec)
-        self.assertEqual(line.requested_milli, 6_000)
+        self.assertEqual(line.requested_milli, 10_000)
         self.assertEqual(line.confirmed_milli, 0)
 
         dispatch_due_supply_deliveries(force=True)
@@ -131,7 +130,7 @@ class OrderPlanMaterialDeliveryProgressTests(TestCase):
         delivery.refresh_from_db()
         line.refresh_from_db()
         self.assertEqual(delivery.status, OrderPlanSupplyDelivery.Status.SUPPLIER_CONFIRMED)
-        self.assertEqual(line.confirmed_milli, 6_000)
+        self.assertEqual(line.confirmed_milli, 10_000)
         self.assertEqual(line.received_milli, 0)
         first_confirmed_at = delivery.supplier_confirmed_at
         first_confirmed_by = delivery.supplier_confirmed_by
@@ -149,26 +148,25 @@ class OrderPlanMaterialDeliveryProgressTests(TestCase):
             "DONE",
         )
 
-        # The independent material-warehouse page creates a new lot and its
-        # hook receives that exact lot.  It must not count the four units that
-        # had already been allocated before this supplier confirmation.
+        # The smaller receipt stays in stock and is not attributed to the
+        # delivery until a single lot can satisfy the requirement.
         self._independent_receipt(2, "NEW-2")
         delivery.refresh_from_db()
         line.refresh_from_db()
-        self.assertEqual(delivery.status, OrderPlanSupplyDelivery.Status.RECEIVING)
-        self.assertEqual(line.received_milli, 2_000)
+        self.assertEqual(delivery.status, OrderPlanSupplyDelivery.Status.SUPPLIER_CONFIRMED)
+        self.assertEqual(line.received_milli, 0)
         requirement = OrderPlanMaterialRequirement.objects.get(
             production_subplan_item__production_subplan__material_plan=material_plan,
             material_spec=self.primary_spec,
         )
-        self.assertEqual(requirement.reserved_milli, 6_000)
+        self.assertEqual(requirement.reserved_milli, 0)
 
-        self._independent_receipt(4, "NEW-4")
+        self._independent_receipt(10, "NEW-COMPLETE")
         delivery.refresh_from_db()
         line.refresh_from_db()
         requirement.refresh_from_db()
         self.assertEqual(delivery.status, OrderPlanSupplyDelivery.Status.SATISFIED)
-        self.assertEqual(line.received_milli, 6_000)
+        self.assertEqual(line.received_milli, 10_000)
         self.assertEqual(requirement.reserved_milli, requirement.required_milli)
 
     def test_one_supplier_delivery_can_finish_while_another_supplier_is_still_short(self):
@@ -222,7 +220,7 @@ class OrderPlanMaterialDeliveryProgressTests(TestCase):
 
         dispatch_due_supply_deliveries(force=True)
         confirm_supplier_material_delivery(user=self.supplier_owner, plan_id=plan.pk)
-        self._independent_receipt(6, "MULTI-NEW")
+        self._independent_receipt(10, "MULTI-NEW")
 
         primary_delivery.refresh_from_db()
         secondary_delivery.refresh_from_db()
@@ -296,10 +294,11 @@ class OrderPlanMaterialDeliveryProgressTests(TestCase):
         configured_delivery = deliveries[self.supplier.pk]
         blocked_delivery = deliveries[unconfigured_supplier.pk]
 
+        # Warehouse review already dispatched the reachable supplier.
         result = dispatch_due_supply_deliveries(force=True)
         configured_delivery.refresh_from_db()
         blocked_delivery.refresh_from_db()
-        self.assertEqual(result["dispatched"], 1)
+        self.assertEqual(result["dispatched"], 0)
         self.assertEqual(result["skipped"], 1)
         self.assertEqual(
             result["errors"],

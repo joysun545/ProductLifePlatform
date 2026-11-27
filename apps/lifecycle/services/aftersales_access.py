@@ -139,7 +139,7 @@ def capabilities(user):
     manager_station = False
     if role == "merchant_senior_manager" and codes:
         manager_station = AfterSalesServiceStationLiaison.objects.filter(
-            identity__inviter_id=user.pk, identity__organization=identity.organization,
+            identity__organization=identity.organization,
             identity__role__code__in=codes, identity__role__is_active=True,
             identity__is_active=True, identity__user__is_active=True,
             application__organization=identity.organization, application__status="APPROVED",

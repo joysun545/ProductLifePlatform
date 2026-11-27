@@ -24,7 +24,9 @@ def installer_row(service, application):
         return None, '装车组织与本售后厂家链路不一致'
     if not identity or not user.is_active or not user.wx_openid:
         return None, '原装车操作账号或当前岗位无效'
-    if not identity.role.is_owner_role and not identity_has_role(identity, {'merchant_electrician', 'service_electrician'}):
+    if identity.organization.organization_type.code == 'SERVICE':
+        return None, '服务商已停止接收新的维修派工，请选择其他维修路径'
+    if not identity.role.is_owner_role and not identity_has_role(identity, 'merchant_electrician'):
         return None, '原装车账号当前不再具备装车操作岗位或相应分管授权'
     if identity.organization_id != installation.organization_id:
         return None, '原装车操作账号当前组织与装车记录不一致，请另选维修路径'

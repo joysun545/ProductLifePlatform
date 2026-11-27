@@ -212,7 +212,7 @@ class RootTrialApiTests(RootTrialApiFixture, TestCase):
             self.assertEqual(response.status_code, 200, getattr(response, "content", b""))
             self.assertEqual(response["X-Content-Type-Options"], "nosniff")
             self.assertIn("no-store", response["Cache-Control"])
-            response.close()
+            self.assertTrue(b"".join(response.streaming_content).startswith(b"\x89PNG\r\n\x1a\n"))
         self.assertEqual(self.api("get", path, self.other).status_code, 404)
         self.assertEqual(self.api("get", path, self.owner).status_code, 404)
 

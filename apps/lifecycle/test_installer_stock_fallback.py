@@ -199,12 +199,28 @@ class InstallerStockFallbackTests(TestCase):
         self.installer_identity.save(update_fields=['is_active','role'])
         self.assertEqual(self.preview()[0]['status'],'INSTALLER_UNAVAILABLE')
 
+    def test_existing_service_provider_installation_is_not_a_new_repair_candidate(self):
+        service = Organization.objects.create(
+            code="RETIRED-INSTALL-SERVICE", name="原安装服务商",
+            organization_type=OrganizationType.objects.get(code="SERVICE"),
+            factory_root=self.factory,
+        )
+        installer, _ = self.user("retired-service-installer", service, "service_electrician")
+        self.installation.organization = service
+        self.installation.operator = installer
+        self.installation.save(update_fields=["organization", "operator"])
+        self.case.refresh_from_db()
+        candidate, reason = installer_row(AfterSalesService, self.case)
+        self.assertIsNone(candidate)
+        self.assertIn("停止接收新的维修派工", reason)
+        self.assertEqual(self.installation.operator, installer)
+
     def test_different_factory_installation_record_is_blocked(self):
         self.installation.organization=self.other_factory;self.installation.save(update_fields=['organization'])
         self.case=AfterSalesApplication.objects.get(pk=self.case.pk)
         self.assertEqual(self.preview()[0]['status'],'INSTALLER_UNAVAILABLE')
 
-    def test_manager_workload_counts_actual_managed_executor_only(self):
+    def test_manager_workload_uses_allocated_role_even_if_someone_else_invited_executor(self):
         from account.models import SeniorManagerProfile
         profile=SeniorManagerProfile.objects.create(identity=self.manager_i)
         profile.managed_roles.add(self.sales_i.role)
@@ -213,8 +229,6 @@ class InstallerStockFallbackTests(TestCase):
         app=self.completed();app.repair_completed_by=self.plain;app.repair_settlement_basis=make_basis(app);app.save()
         from lifecycle.services.aftersales_access import visible_cases
         self.assertTrue(visible_cases(self.manager).filter(pk=app.pk).exists())
-        self.assertEqual(summary(self.manager)['repair_basis_visits'],0)
-        self.plain_i.inviter=self.manager;self.plain_i.save(update_fields=['inviter'])
         self.assertEqual(summary(self.manager)['repair_basis_visits'],1)
         profile.managed_roles.clear()
         self.assertEqual(summary(self.manager)['repair_basis_visits'],0)

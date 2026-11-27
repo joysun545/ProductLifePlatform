@@ -11,6 +11,7 @@ from account.models import (
     UserOrganization,
 )
 from account.services.auth_service import get_active_identity
+from account.services.role_delegation_service import SENIOR_MANAGER_ROLE_CODES, delegated_role_codes
 from channel.models import MerchantProductCategoryScope
 
 
@@ -215,6 +216,17 @@ def get_direct_subordinates(user):
         # Owners manage all active staff identities in their own organization,
         # including legacy slots whose invitation event was never recorded.
         membership_scope |= Q(organization=identity.organization)
+    elif identity.role.code in SENIOR_MANAGER_ROLE_CODES:
+        managed_codes = delegated_role_codes(identity)
+        membership_scope = Q(
+            organization_id=identity.organization_id, role__code__in=managed_codes,
+        )
+        items = [
+            item for item in items
+            if item["organization"]["id"] == identity.organization_id
+            and item["role"]["code"] in managed_codes
+        ]
+        seen_user_ids = {item["user"]["id"] for item in items}
 
     memberships = (
         UserOrganization.objects.select_related(

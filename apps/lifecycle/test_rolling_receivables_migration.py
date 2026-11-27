@@ -10,15 +10,16 @@ from django.utils import timezone
 
 
 class RollingReceivablesMigrationTests(TransactionTestCase):
-    serialized_rollback = True
-
     def test_backfill_preserves_original_payment_invoice_and_all_audit_facts(self):
         executor = MigrationExecutor(connection)
         latest = executor.loader.graph.leaf_nodes()
         old_target = [("lifecycle", "0021_aftersales_application_workflow")]
         executor.migrate(old_target)
         self.addCleanup(lambda: MigrationExecutor(connection).migrate(latest))
-        old = executor.loader.project_state(old_target).apps
+        # The downgrade targets only this domain. Account and workflow tables
+        # keep their current shape, so fixtures must use those model states.
+        retained = [target for target in latest if target[0] in {"account", "workflow"}]
+        old = executor.loader.project_state([*old_target, *retained]).apps
         now = timezone.now()
         OrgType = old.get_model("account", "OrganizationType")
         Organization = old.get_model("account", "Organization")

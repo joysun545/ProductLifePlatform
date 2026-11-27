@@ -6,7 +6,6 @@ from django.test import TestCase
 from product.models import BOMItem
 from sales.models import OrderPlan, OrderPlanMaterialPlan
 from sales.services.order_plan_material_flow_service import (
-    OrderPlanMaterialFlowError,
     create_material_flow_order_plan,
     get_material_flow_bom_detail,
     get_material_flow_options,
@@ -85,82 +84,34 @@ class OrderPlanMaterialSplitAlgorithmTests(TestCase):
         self.assertEqual(len(subplans), 1)
         self.assertEqual(subplans[0].planned_total_quantity, 10)
 
-    def test_forced_large_order_split_keeps_both_children_within_five_to_fifty(self):
-        """A 51--100 unit production remainder must not form a 51+ child."""
-
-        for stock, suffix in (
-            (self.primary_stock, "BOUND-PRIMARY"),
-            (self.extra_stock, "BOUND-EXTRA"),
-        ):
-            FactoryMaterialLot.objects.create(
-                stock=stock,
-                batch_code=f"V2-ALGORITHM-{suffix}",
-                supplier_batch_code=f"SUP-ALGORITHM-{suffix}",
-                received_milli=75_000,
-                on_hand_milli=75_000,
-                received_by=self.material_keeper,
-            )
-
+    def _assert_unsplit_production(self, quantity):
         result, created = create_material_flow_order_plan(
             user=self.sales_user,
             merchant_id=self.merchant.pk,
-            client_request_id="v2-algorithm-child-bound",
-            items=[
-                {
-                    "category_id": self.generator_category.pk,
-                    "product_model_id": self.generator.pk,
-                    "quantity": 75,
-                    "use_return_inventory": False,
-                    "source_bom_id": self.bom.pk,
-                }
-            ],
+            client_request_id=f"v2-algorithm-normal-production-{quantity}",
+            items=[{
+                "category_id": self.generator_category.pk,
+                "product_model_id": self.generator.pk,
+                "quantity": quantity,
+                "use_return_inventory": False,
+                "source_bom_id": self.bom.pk,
+            }],
         )
         self.assertTrue(created)
-        material_plan = OrderPlanMaterialPlan.objects.get(
-            order_plan_id=result["plan"]["id"]
+        material_plan = OrderPlanMaterialPlan.objects.get(order_plan_id=result["plan"]["id"])
+        self.assertEqual(
+            list(material_plan.production_subplans.values_list("planned_total_quantity", flat=True)),
+            [quantity],
         )
-        quantities = list(
-            material_plan.production_subplans.order_by("sequence_no").values_list(
-                "planned_total_quantity", flat=True
-            )
-        )
-        self.assertEqual(len(quantities), 2)
-        self.assertEqual(sum(quantities), 75)
-        self.assertTrue(all(5 <= quantity <= 50 for quantity in quantities))
 
-    def test_production_remainder_above_two_fifty_unit_children_is_rejected(self):
-        with self.assertRaisesMessage(OrderPlanMaterialFlowError, "超过当前两个子计划"):
-            create_material_flow_order_plan(
-                user=self.sales_user,
-                merchant_id=self.merchant.pk,
-                client_request_id="v2-algorithm-over-child-bound",
-                items=[
-                    {
-                        "category_id": self.generator_category.pk,
-                        "product_model_id": self.generator.pk,
-                        "quantity": 101,
-                        "use_return_inventory": False,
-                        "source_bom_id": self.bom.pk,
-                    }
-                ],
-            )
+    def test_no_tail_clearance_keeps_seventy_five_units_as_one_plan(self):
+        self._assert_unsplit_production(75)
 
-    def test_production_remainder_below_five_is_rejected(self):
-        with self.assertRaisesMessage(OrderPlanMaterialFlowError, "不足5台"):
-            create_material_flow_order_plan(
-                user=self.sales_user,
-                merchant_id=self.merchant.pk,
-                client_request_id="v2-algorithm-under-child-bound",
-                items=[
-                    {
-                        "category_id": self.generator_category.pk,
-                        "product_model_id": self.generator.pk,
-                        "quantity": 4,
-                        "use_return_inventory": False,
-                        "source_bom_id": self.bom.pk,
-                    }
-                ],
-            )
+    def test_main_plan_can_exceed_two_fifty_unit_tail_limit(self):
+        self._assert_unsplit_production(101)
+
+    def test_small_normal_production_is_allowed_below_tail_split_minimum(self):
+        self._assert_unsplit_production(4)
 
     def test_sales_creation_bom_endpoint_defaults_to_the_same_merchant_previous_v2_choice(self):
         """The pre-plan editor needs both a safe default and editable rows."""

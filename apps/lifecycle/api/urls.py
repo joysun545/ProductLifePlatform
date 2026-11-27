@@ -428,6 +428,12 @@ urlpatterns = [
     ),
 
     path(
+        "customer/vehicles/<int:vehicle_id>/drivers/<int:driver_id>/revoke/",
+        views.DriverVehicleShareRevokeAPI.as_view(),
+        name="driver_vehicle_share_revoke",
+    ),
+
+    path(
         "customer/driver-invitations/<uuid:token>/",
         views.DriverVehicleInvitationDetailAPI.as_view(),
         name="driver_vehicle_invitation_detail",

@@ -259,7 +259,7 @@ def _action_role_openids(organization, role_codes):
         _role_openids(organization, role_codes)
         + vacant_role_manager_openids(organization, role_codes)
     )
-    return list(dict.fromkeys(openid.strip() for openid in recipients if openid.strip()))
+    return list(dict.fromkeys(openid for openid in recipients if openid.strip()))
 
 
 def _factory_identity(user, role_codes, *, message):
@@ -297,7 +297,7 @@ def _sales_identity(user):
 
 
 def _sales_task_identity(user):
-    """Allow a delegated senior manager to handle its invited sales task."""
+    """Allow a senior manager assigned to the factory sales role."""
 
     return _factory_identity(
         user,
@@ -2096,18 +2096,6 @@ def _create_material_flow_order_plan(
             payload={"material_plan_id": material_plan.pk},
             actor_openid=_actor_openid(user),
         )
-        _new_workitem(
-            plan=plan,
-            work_type="ORDER_PLAN_MATERIAL_CREATED_NOTICE",
-            stage_key="material-created:matching",
-            title="订单物料计划已生成",
-            summary="物料库管将核对库存和供应配送计划。",
-            recipients=_role_openids(plan.factory_organization, {"factory_matching"}),
-            need_action=False,
-            payload={"material_plan_id": material_plan.pk},
-            actor_openid=_actor_openid(user),
-            done_immediately=True,
-        )
     else:
         # No material production is required.  The later V2 shipment bridge can
         # operate directly on the reserved finished-goods allocations.
@@ -2126,6 +2114,20 @@ def _create_material_flow_order_plan(
             done_immediately=True,
         )
 
+    if accessory_entries or any(row["bom_lines"] for row in production_rows):
+        _new_workitem(
+            plan=plan,
+            work_type="ORDER_PLAN_MATERIAL_CREATED_NOTICE",
+            stage_key="material-created:matching",
+            title="新订单涉及物料",
+            summary="请查看订单的生产用料及配件明细。",
+            recipients=_role_openids(plan.factory_organization, {"factory_matching"}),
+            need_action=False,
+            payload={"material_plan_id": material_plan.pk},
+            actor_openid=_actor_openid(user),
+            done_immediately=True,
+        )
+
     # Finished goods are a first-class source in V2.  They may be dispatched
     # before the production remainder completes, so their shipment is created
     # independently instead of being forced into a later production subplan.
@@ -2134,6 +2136,17 @@ def _create_material_flow_order_plan(
         actor_openid=_actor_openid(user),
     )
 
+    _new_workitem(
+        plan=plan,
+        work_type="ORDER_PLAN_MERCHANT_CREATED_NOTICE",
+        stage_key="merchant-created-notice",
+        title="新订单计划已创建",
+        summary="厂家已创建订单计划，请在订单详情查看进度。",
+        recipients=_role_openids(plan.merchant_organization, {"merchant_owner", "merchant_sales", "merchant_stock"}),
+        need_action=False,
+        done_immediately=True,
+        actor_openid=_actor_openid(user),
+    )
     initialize_order_finance(plan, user=user)
     from sales.services.replacement_supply_service import auto_attach
     auto_attach(plan,user)
@@ -2302,7 +2315,16 @@ def _attach_accessories_to_first_shipment(*, plan, shipment):
 
 
 def _publish_shipment_authorization_task(*, plan, shipment, actor_openid):
-    sales_openid = _sales_openid_for_plan(plan)
+    creator = get_active_identity(plan.created_by)
+    if (
+        creator and creator.organization_id == plan.factory_organization_id
+        and creator.role.code == "factory_sales" and _actor_openid(plan.created_by)
+    ):
+        recipients = [_actor_openid(plan.created_by)]
+    else:
+        recipients = _action_role_openids(plan.factory_organization, {"factory_sales"})
+    if not recipients:
+        raise OrderPlanMaterialFlowError("未找到可以接管该订单发货授权的本厂销售岗位。")
     payload = _shipment_payload(shipment)
     return _new_workitem(
         plan=plan,
@@ -2313,7 +2335,7 @@ def _publish_shipment_authorization_task(*, plan, shipment, actor_openid):
             f"{plan.merchant_organization.name}｜{payload['quantity']}台{payload.get('accessory_summary', '')}；"
             "授权后由厂家成品库管打码贴包，物流经理确认出库，再由成品库管确认发货。"
         ),
-        recipients=(sales_openid,),
+        recipients=recipients,
         need_action=True,
         action_mode="ANYONE_DO",
         payload=payload,
@@ -4244,10 +4266,13 @@ def _refresh_subplan_progress(*, plan, now):
 def authorize_material_flow_shipment(*, user, plan_id, shipment_id):
     identity = _sales_task_identity(user)
     plan = _v2_plan_for_factory(identity, plan_id, lock=True)
-    if plan.created_by_id not in _sales_actor_user_ids(identity):
-        raise OrderPlanMaterialFlowError("只有创建该订单的厂家销售经理可以确认发货。")
     _assert_shipment_path_open(plan)
     shipment = _shipment_for_plan(plan=plan, shipment_id=shipment_id, lock=True)
+    if plan.created_by_id not in _sales_actor_user_ids(identity) and not _has_open_shipment_task(
+        plan=plan, shipment=shipment, identity=identity,
+        work_type="ORDER_PLAN_V2_SHIPMENT_AUTHORIZATION", stage_key="authorization",
+    ):
+        raise OrderPlanMaterialFlowError("只有订单销售负责人或本批发货授权任务接收人可以确认发货。")
     if shipment.status in {
         OrderPlanShipment.Status.AUTHORIZED,
         OrderPlanShipment.Status.OUTBOUNDED,
@@ -4898,6 +4923,17 @@ def confirm_material_flow_shipment_outbound(*, user, plan_id, shipment_id):
         for item in plan.items.all():
             item.status = OrderPlan.Status.SHIPPED
             item.save(update_fields=("status", "updated_at"))
+    UserTask.objects.filter(
+        workitem__uniq_key=f"sales:order-plan:{plan.pk}:merchant-created-notice",
+        need_action=False,
+        state__in=("NEW", "READ"),
+    ).update(
+        state="DONE",
+        done_at=now,
+        done_reason="OTHER_ACTION",
+        display_subtitle_snapshot="订单已有批次发货，请查看发货提醒",
+        updated_at=now,
+    )
     _publish_shipment_shipped_notice(plan=plan, shipment=shipment, actor_openid=_actor_openid(user))
     _publish_shipment_merchant_receipt_task(
         plan=plan,
@@ -5647,7 +5683,12 @@ def _can_view_plan(identity, plan, *, supplier_sales_scope=None):
                 if identity.role.code in {"factory_senior_manager", "merchant_senior_manager"}
                 else {identity.user_id}
             )
-            return plan.created_by_id in sales_user_ids
+            return plan.created_by_id in sales_user_ids or UserTask.objects.filter(
+                to_openid=_actor_openid(identity.user), need_action=True,
+                state__in=("NEW", "READ"), workitem__status="OPEN",
+                workitem__biz_ref=f"sales.OrderPlan:{plan.pk}",
+                workitem__type="ORDER_PLAN_V2_SHIPMENT_AUTHORIZATION",
+            ).exists()
         return True
     if identity.organization.organization_type.code == "SUPPLIER" and roles & {"supplier_owner", "supplier_sales"}:
         if not supplier_can_supply(plan.factory_organization_id, org_id):
@@ -5753,7 +5794,7 @@ def _viewer_timeline_active_codes(*, plan, identity, available_actions):
     return active_codes
 
 
-def _timeline(plan, material_plan, *, viewer_active_codes=()):
+def _timeline(plan, material_plan, *, viewer_active_codes=(), show_current_progress=False):
     status = material_plan.status
     shipment_rows = OrderPlanShipment.objects.filter(order_plan=plan)
     delivery_statuses = list(
@@ -5868,6 +5909,7 @@ def _timeline(plan, material_plan, *, viewer_active_codes=()):
             "state": state,
             "completed": completed[code],
             "current": code == current,
+            "state_label": "当前进度" if show_current_progress and state == "CURRENT" else "",
             "active": active,
         })
     return rows
@@ -6095,16 +6137,10 @@ def _shipment_actions(plan, shipment, identity):
         return []
 
     roles = effective_role_codes(identity)
-    sales_actor_ids = (
-        delegated_role_user_ids(identity, "factory_sales")
-        if identity.role.code in {"factory_senior_manager", "merchant_senior_manager"}
-        else {identity.user_id} if "factory_sales" in roles else set()
-    )
     actions = []
     if (
         "factory_sales" in roles
         and identity.organization_id == plan.factory_organization_id
-        and plan.created_by_id in sales_actor_ids
         and shipment.status == OrderPlanShipment.Status.PLANNED
         and _has_open_shipment_task(
             plan=plan,
@@ -6118,7 +6154,7 @@ def _shipment_actions(plan, shipment, identity):
         # The action carries the exact shipment identity, so a page holding
         # several planned residual batches cannot accidentally split the first
         # one returned by a broad query.
-        if _shipment_quantity(shipment) > 1:
+        if _shipment_quantity(shipment) > 1 and plan.created_by_id in _sales_actor_user_ids(identity):
             actions.append(
                 {
                     "code": "shipment-create",
@@ -6709,6 +6745,7 @@ def get_material_flow_detail(*, user, plan_id):
             plan,
             material_plan,
             viewer_active_codes=viewer_active_codes,
+            show_current_progress=identity.organization_id == plan.merchant_organization_id,
         ),
         "finished_inventory": _serialize_finished_inventory(plan),
         "bom_selections": _serialize_bom_selections(

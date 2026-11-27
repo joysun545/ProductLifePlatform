@@ -1,8 +1,10 @@
 """Scope-checked permissions for factory and merchant senior managers."""
 
+from django.db import transaction
 from django.db.models.functions import Trim
 
-from account.models import SeniorManagerProfile, UserOrganization
+from account.models import Organization, OrganizationRole, SeniorManagerProfile, UserOrganization
+from account.services.retired_roles import RETIRED_ROLE_CODES
 
 
 SENIOR_MANAGER_ROLE_CODES = frozenset({
@@ -57,19 +59,18 @@ def delegated_role_codes(identity):
             organization_type_id=identity.role.organization_type_id,
             organization_type__is_active=True,
             is_owner_role=False,
-        ).exclude(code__in=SENIOR_MANAGER_ROLE_CODES).values_list("code", flat=True)
+        ).exclude(code__in=SENIOR_MANAGER_ROLE_CODES | RETIRED_ROLE_CODES).values_list("code", flat=True)
     )
 
 
 def delegated_role_user_ids(identity, role_code):
-    """IDs of active, directly invited role holders under this manager."""
+    """IDs of active role holders in the organization managed by this manager."""
 
     if not identity or role_code not in delegated_role_codes(identity):
         return frozenset()
 
     return frozenset(
         UserOrganization.objects.filter(
-            inviter_id=identity.user_id,
             organization_id=identity.organization_id,
             role__code=role_code,
             role__is_active=True,
@@ -112,10 +113,21 @@ def identity_has_role(identity, role_codes):
     return bool(delegated_role_codes(identity) & role_codes)
 
 
+class VacantRoleRecipient(str):
+    """An OpenID carrying the role scopes used to grant its fallback task."""
+
+    def __new__(cls, openid, organization_id, role_ids):
+        value = super().__new__(cls, openid)
+        value.organization_id = organization_id
+        value.role_ids = frozenset(role_ids)
+        return value
+
+
 def vacant_role_manager_openids(organization, role_codes):
     """Find authorized managers for unstaffed action roles in this organization."""
 
     requested = {role_codes} if isinstance(role_codes, str) else set(role_codes or ())
+    requested -= RETIRED_ROLE_CODES
     if not organization or not requested:
         return []
 
@@ -147,8 +159,15 @@ def vacant_role_manager_openids(organization, role_codes):
         senior_manager_profile__managed_roles__is_active=True,
         senior_manager_profile__managed_roles__is_owner_role=False,
         senior_manager_profile__managed_roles__organization_type_id=organization.organization_type_id,
-    ).values_list("user__wx_openid", flat=True)
-    return sorted({openid.strip() for openid in openids if openid.strip()})
+    ).values_list("user__wx_openid", "senior_manager_profile__managed_roles")
+    roles_by_openid = {}
+    for openid, role_id in openids:
+        if openid.strip():
+            roles_by_openid.setdefault(openid.strip(), set()).add(role_id)
+    return [
+        VacantRoleRecipient(openid, organization.pk, roles)
+        for openid, roles in sorted(roles_by_openid.items())
+    ]
 
 
 def senior_manager_can_proactively_perform(identity, operation):
@@ -310,7 +329,7 @@ def available_managed_role_options(identity):
             target_role__organization_type__is_active=True,
             target_role__is_owner_role=False,
         )
-        .exclude(target_role__code__in=SENIOR_MANAGER_ROLE_CODES)
+        .exclude(target_role__code__in=SENIOR_MANAGER_ROLE_CODES | RETIRED_ROLE_CODES)
         .select_related("target_role")
         .order_by("target_role__id")
     )
@@ -318,3 +337,70 @@ def available_managed_role_options(identity):
         {"code": row.target_role.code, "name": row.target_role.name}
         for row in rows
     ]
+
+
+class ManagedRoleConflict(ValueError):
+    """A role is already allocated to another manager in this organization."""
+
+
+def lock_managed_roles(organization_id):
+    Organization.objects.select_for_update().get(pk=organization_id)
+
+
+def check_managed_role_conflicts(organization_id, role_ids, *, profile_id=None):
+    conflicts = SeniorManagerProfile.objects.filter(
+        identity__organization_id=organization_id, managed_roles__in=role_ids,
+        identity__is_active=True, identity__user__is_active=True,
+        identity__role__is_active=True, identity__role__code__in=SENIOR_MANAGER_ROLE_CODES,
+    ).exclude(pk=profile_id)
+    if conflicts.exists():
+        raise ManagedRoleConflict("本组织已有高级经理分管所选岗位，请先解除原分管关系")
+
+
+def managed_role_settings(owner, manager_id):
+    from account.services.auth_service import get_active_identity
+
+    identity = get_active_identity(owner)
+    if not identity or identity.role.code not in {"factory_admin", "merchant_owner"}:
+        raise ManagedRoleConflict("只有本组织负责人可以设置高级经理分管岗位")
+    if type(manager_id) is not int or not 0 < manager_id < 2**63:
+        raise ManagedRoleConflict("高级经理账号无效")
+    profile = SeniorManagerProfile.objects.filter(
+        identity__user_id=manager_id, identity__organization_id=identity.organization_id,
+        identity__is_active=True, identity__user__is_active=True,
+        identity__role__is_active=True, identity__role__code__in=SENIOR_MANAGER_ROLE_CODES,
+    ).first()
+    if profile is None:
+        raise ManagedRoleConflict("未找到本组织有效的高级经理")
+    return identity, profile
+
+
+def read_managed_roles(owner, manager_id):
+    identity, profile = managed_role_settings(owner, manager_id)
+    reserved = set(SeniorManagerProfile.objects.filter(
+        identity__organization=identity.organization,
+        identity__is_active=True, identity__user__is_active=True,
+        identity__role__is_active=True, identity__role__code__in=SENIOR_MANAGER_ROLE_CODES,
+    ).exclude(pk=profile.pk).values_list("managed_roles__code", flat=True))
+    selected = delegated_role_codes(profile.identity)
+    return [
+        {**row, "selected": row["code"] in selected, "reserved": row["code"] in reserved}
+        for row in available_managed_role_options(identity)
+    ]
+
+
+@transaction.atomic
+def update_managed_roles(owner, manager_id, codes):
+    identity, profile = managed_role_settings(owner, manager_id)
+    if not isinstance(codes, list) or any(not isinstance(code, str) for code in codes):
+        raise ManagedRoleConflict("分管岗位格式无效")
+    lock_managed_roles(identity.organization_id)
+    options = {row["code"] for row in available_managed_role_options(identity)}
+    if len(codes) != len(set(codes)) or not set(codes) <= options:
+        raise ManagedRoleConflict("请选择本组织有效且不重复的分管岗位")
+    roles = OrganizationRole.objects.filter(
+        organization_type_id=identity.role.organization_type_id, code__in=codes,
+    )
+    check_managed_role_conflicts(identity.organization_id, roles, profile_id=profile.pk)
+    profile.managed_roles.set(roles)
+    return sorted(codes)

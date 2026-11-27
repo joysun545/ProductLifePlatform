@@ -14,8 +14,9 @@ from sales.services.order_plan_material_flow_service import (
     OrderPlanMaterialFlowError, authorize_material_flow_shipment,
     get_material_flow_detail, prepare_material_flow_shipment_qrcodes,
 )
-from print.models import PrintLoginChallenge
-from print.views import GATE_SESSION_KEY, CHALLENGE_SESSION_KEY, SESSION_SCOPE
+from web_portal.access import GRANT
+from web_portal.models import WebLoginChallenge
+from web_portal.views import CHALLENGE, digest
 
 
 class PrintCenterSecurityTests(TestCase):
@@ -35,9 +36,8 @@ class PrintCenterSecurityTests(TestCase):
     def browser(self):
         browser = Client(enforce_csrf_checks=True)
         response = browser.get(self.url("center"))
-        self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "扫一扫")
-        self.assertIn("no-store", response.headers["Cache-Control"])
+        self.assertRedirects(response, "/?login=1", fetch_redirect_response=False)
+        browser.get("/pldp/web/portal/api/session/")
         return browser
 
     def post(self, browser, name, payload=None):
@@ -46,16 +46,26 @@ class PrintCenterSecurityTests(TestCase):
             HTTP_X_CSRFTOKEN=browser.cookies["csrftoken"].value,
         )
 
+    def portal_post(self, browser, name, payload=None):
+        return browser.post(
+            f"/pldp/web/portal/api/{name}/",
+            data=json.dumps({} if payload is None else payload), content_type="application/json",
+            HTTP_X_CSRFTOKEN=browser.cookies["csrftoken"].value,
+        )
+
     def start(self, browser):
-        response = self.post(browser, "login_start")
+        response = self.portal_post(browser, "start")
         self.assertEqual(response.status_code, 200, response.content)
-        data = response.json()["data"]
-        self.assertTrue(data["qr_image"].startswith("data:image/png;base64,"))
-        return data["qr_text"].split("|")[1]
+        self.assertTrue(response.json()["data"]["qr_image"].startswith("data:image/png;base64,"))
+        challenge = WebLoginChallenge.objects.get(pk=browser.session[CHALLENGE])
+        token = f"{challenge.pk:064x}"
+        challenge.token_digest = digest(token)
+        challenge.save(update_fields=["token_digest"])
+        return token
 
     def approve(self, token, user=None):
         return Client(enforce_csrf_checks=True).post(
-            self.url("login_approve"), data=json.dumps({"token": token}),
+            "/pldp/web/portal/api/approve/", data=json.dumps({"token": token}),
             content_type="application/json",
             HTTP_AUTHORIZATION="Bearer " + issue_access_token(user or self.factory_stock),
         )
@@ -64,9 +74,9 @@ class PrintCenterSecurityTests(TestCase):
         token = self.start(browser)
         self.assertEqual(self.approve(token).status_code, 200)
         before = browser.session.session_key
-        self.assertEqual(self.post(browser, "login_status").json()["data"]["status"], "ready")
+        self.assertEqual(self.portal_post(browser, "status").json()["data"]["status"], "ready")
         self.assertNotEqual(before, browser.session.session_key)
-        self.assertEqual(browser.session[GATE_SESSION_KEY]["scope"], SESSION_SCOPE)
+        self.assertIn("print", browser.session[GRANT]["principal"]["modules"])
         return token
 
     def shipment(self):
@@ -78,7 +88,7 @@ class PrintCenterSecurityTests(TestCase):
         plan, shipment = self.shipment()
         browser = self.browser()
         response = browser.get(self.url("center"), {"access_token": issue_access_token(self.factory_stock)})
-        self.assertNotContains(response, plan.plan_code)
+        self.assertRedirects(response, "/?login=1", fetch_redirect_response=False)
         for endpoint in ("prepare", "confirm"):
             response = self.post(browser, endpoint, {"shipment_id": shipment.pk})
             self.assertEqual(response.status_code, 403)
@@ -89,15 +99,16 @@ class PrintCenterSecurityTests(TestCase):
     def test_django_login_alone_is_not_a_print_grant(self):
         browser = self.browser()
         browser.force_login(self.factory_stock)
-        self.assertContains(browser.get(self.url("center")), "扫一扫")
+        self.assertEqual(browser.get(self.url("center")).status_code, 403)
         self.assertEqual(self.post(browser, "prepare", {"shipment_id": 1}).status_code, 403)
 
     def test_browser_mutations_require_csrf(self):
         browser = self.browser()
-        for endpoint in ("login_start", "login_status", "logout", "prepare", "confirm"):
+        for endpoint in ("start", "status"):
+            self.assertEqual(browser.post(f"/pldp/web/portal/api/{endpoint}/", data="{}", content_type="application/json").status_code, 403)
+        self.login(browser)
+        for endpoint in ("logout", "prepare", "confirm"):
             self.assertEqual(browser.post(self.url(endpoint), data="{}", content_type="application/json").status_code, 403)
-        token = self.start(browser)
-        self.assertEqual(self.approve(token).status_code, 200)
 
     def test_only_bearer_factory_stock_can_approve(self):
         browser = self.browser()
@@ -105,43 +116,44 @@ class PrintCenterSecurityTests(TestCase):
         self.assertEqual(self.approve(token, self.sales_user).status_code, 403)
         self.assertEqual(self.approve(token, self.material_keeper).status_code, 403)
         response = Client().post(
-            self.url("login_approve") + "?access_token=" + issue_access_token(self.factory_stock),
+            "/pldp/web/portal/api/approve/?access_token=" + issue_access_token(self.factory_stock),
             data=json.dumps({"token": token}), content_type="application/json",
         )
         self.assertEqual(response.status_code, 401)
-        self.assertEqual(self.post(browser, "login_status").json()["data"]["status"], "pending")
+        self.assertEqual(self.portal_post(browser, "status").json()["data"]["status"], "pending")
 
     def test_approval_is_single_use_and_bound_to_original_browser(self):
         browser = self.browser()
         token = self.start(browser)
         self.assertEqual(self.approve(token).status_code, 200)
-        self.assertEqual(self.approve(token).status_code, 400)
+        self.assertEqual(self.approve(token).status_code, 410)
         other_browser = self.browser()
-        self.assertEqual(self.post(other_browser, "login_status", {"token": token}).status_code, 400)
-        self.assertEqual(self.post(browser, "login_status").json()["data"]["status"], "ready")
-        self.assertIsNotNone(PrintLoginChallenge.objects.get().consumed_at)
-        self.assertEqual(self.approve(token).status_code, 400)
+        self.assertEqual(self.portal_post(other_browser, "status", {"token": token}).status_code, 410)
+        self.assertEqual(self.portal_post(browser, "status").json()["data"]["status"], "ready")
+        self.assertIsNotNone(WebLoginChallenge.objects.get().consumed_at)
+        self.assertEqual(self.approve(token).status_code, 410)
         self.assertContains(browser.get(self.url("center")), self.factory.name)
         self.post(browser, "logout")
-        self.assertContains(browser.get(self.url("center")), "扫一扫")
-        self.assertEqual(self.post(browser, "login_status", {"token": token}).status_code, 400)
+        self.assertRedirects(browser.get(self.url("center")), "/?login=1", fetch_redirect_response=False)
+        browser.get("/pldp/web/portal/api/session/")
+        self.assertEqual(self.portal_post(browser, "status", {"token": token}).status_code, 410)
 
     def test_expired_or_refreshed_qr_cannot_be_replayed(self):
         browser = self.browser()
         old_token = self.start(browser)
         token = self.start(browser)
-        self.assertEqual(self.approve(old_token).status_code, 400)
-        PrintLoginChallenge.objects.update(expires_at=timezone.now()-timedelta(seconds=1))
-        self.assertEqual(self.approve(token).status_code, 400)
-        self.assertEqual(self.post(browser, "login_status").status_code, 400)
+        self.assertEqual(self.approve(old_token).status_code, 410)
+        WebLoginChallenge.objects.update(expires_at=timezone.now()-timedelta(seconds=1))
+        self.assertEqual(self.approve(token).status_code, 410)
+        self.assertEqual(self.portal_post(browser, "status").status_code, 410)
 
     def test_identity_change_between_approval_and_consumption_is_rejected(self):
         browser = self.browser()
         token = self.start(browser)
         self.assertEqual(self.approve(token).status_code, 200)
         UserOrganization.objects.filter(user=self.factory_stock).update(role=self.factory_sales_role)
-        self.assertEqual(self.post(browser, "login_status").status_code, 403)
-        self.assertNotIn(GATE_SESSION_KEY, browser.session)
+        self.assertEqual(self.portal_post(browser, "status").status_code, 403)
+        self.assertNotIn(GRANT, browser.session)
 
     def test_existing_grant_rechecks_active_identity_and_absolute_expiry(self):
         browser = self.browser()
@@ -150,12 +162,12 @@ class PrintCenterSecurityTests(TestCase):
         self.assertEqual(self.post(browser, "prepare", {"shipment_id": 1}).status_code, 403)
         UserOrganization.objects.filter(user=self.factory_stock).update(is_active=True)
         session = browser.session
-        grant = session[GATE_SESSION_KEY]
+        grant = session[GRANT]
         grant["expires_at"] = (timezone.now()-timedelta(seconds=1)).timestamp()
-        session[GATE_SESSION_KEY] = grant
+        session[GRANT] = grant
         session.save()
         self.assertEqual(self.post(browser, "prepare", {"shipment_id": 1}).status_code, 403)
-        self.assertContains(browser.get(self.url("center")), "扫一扫")
+        self.assertEqual(browser.get(self.url("center")).status_code, 403)
 
     def test_existing_grant_is_revoked_by_role_or_organization_change(self):
         browser = self.browser()

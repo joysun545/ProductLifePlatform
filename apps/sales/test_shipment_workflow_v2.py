@@ -14,7 +14,7 @@ from django.core.files.storage import FileSystemStorage
 from django.core.files.uploadedfile import SimpleUploadedFile
 from PIL import Image
 
-from account.models import Organization, OrganizationType
+from account.models import Organization, OrganizationRole, OrganizationType, SeniorManagerProfile
 from account.services.auth_service import issue_access_token
 from lifecycle.models import DeviceState, LifecycleEvent, OrganizationDevice
 from quality_trace.models import BatchQualityAffectedDevice, BatchQualityCase
@@ -31,6 +31,27 @@ class ShipmentWorkflowV2Tests(V2OrderPlanFixture):
     _create_lot = fixture_module.OrderPlanMaterialFlowTests._create_lot
     _create_v2_plan = fixture_module.OrderPlanMaterialFlowTests._create_v2_plan
     _ready_production_shipment = fixture_module.OrderPlanMaterialFlowTests._ready_production_shipment
+
+    def test_pending_shipment_authorization_can_be_handled_after_sales_holder_leaves(self):
+        plan, _, shipment = self._ready_production_shipment(
+            request_id="shipment-sales-vacancy", quantity=5,
+        )
+        sales_identity = self.sales_user.organization_identity
+        manager = self._user_with_identity(
+            "shipment-sales-manager", "shipment-sales-manager-openid", self.factory,
+            OrganizationRole.objects.get(code="factory_senior_manager"),
+        )
+        profile = SeniorManagerProfile.objects.create(identity=manager.organization_identity)
+        profile.managed_roles.add(sales_identity.role)
+        sales_identity.is_active = False
+        sales_identity.save(update_fields=["is_active"])
+
+        _, changed = flow.authorize_material_flow_shipment(
+            user=manager, plan_id=plan.pk, shipment_id=shipment.pk,
+        )
+        self.assertTrue(changed)
+        shipment.refresh_from_db()
+        self.assertEqual(shipment.shipment_authorized_by, manager)
 
     def _printed_shipment(self, request_id="shipment-v2", quantity=5):
         plan, subplan, shipment = self._ready_production_shipment(
@@ -165,7 +186,31 @@ class ShipmentWorkflowV2Tests(V2OrderPlanFixture):
 
     def test_shipped_notice_and_receipt_action_have_correct_distinct_recipients(self):
         plan, _, shipment = self._printed_shipment()
+        merchant_users = (self.merchant_owner, self.merchant_sales, self.merchant_stock_1, self.merchant_stock_2)
+        merchant_openids = {user.wx_openid for user in merchant_users}
+        created_notice = WorkItem.objects.get(
+            uniq_key=f"sales:order-plan:{plan.pk}:merchant-created-notice",
+        )
+        self.assertSetEqual(
+            set(created_notice.user_tasks.values_list("to_openid", flat=True)),
+            merchant_openids,
+        )
+        self.assertFalse(created_notice.user_tasks.filter(need_action=True).exists())
+
+        def assert_detail(user, shipment_status, can_receive):
+            detail = flow.get_material_flow_detail(user=user, plan_id=plan.pk)
+            batch = next(row for row in detail["shipments"] if row["id"] == shipment.pk)
+            self.assertEqual(batch["status"], shipment_status)
+            actions = {action["code"] for action in batch["available_actions"]}
+            self.assertEqual("shipment-receipt" in actions, can_receive)
+            current = next(row for row in detail["timeline"] if row["current"])
+            self.assertEqual(current["state_label"], "当前进度")
+
+        for user in merchant_users:
+            assert_detail(user, "AUTHORIZED", False)
         self._logistics(plan, shipment)
+        for user in merchant_users:
+            assert_detail(user, "OUTBOUNDED", False)
         assistant_tasks_before = set(UserTask.objects.filter(
             to_openid__in=[self.factory_assistant_1.wx_openid, self.factory_assistant_2.wx_openid],
             workitem__biz_ref=f"sales.OrderPlan:{plan.pk}", need_action=True,
@@ -173,11 +218,9 @@ class ShipmentWorkflowV2Tests(V2OrderPlanFixture):
         self._ship(plan, shipment)
         notice = self._workitem(plan, shipment, "shipped-notice")
         self.assertEqual(notice.type, "ORDER_PLAN_V2_SHIPPED_NOTICE")
-        merchant_openids = {
-            user.wx_openid for user in (
-                self.merchant_owner, self.merchant_sales, self.merchant_stock_1, self.merchant_stock_2
-            )
-        }
+        self.assertFalse(created_notice.user_tasks.exclude(state="DONE").exists())
+        for user in merchant_users:
+            assert_detail(user, "SHIPPED", user != self.merchant_sales)
         merchant_receipt_openids = {
             user.wx_openid for user in (
                 self.merchant_owner, self.merchant_stock_1, self.merchant_stock_2

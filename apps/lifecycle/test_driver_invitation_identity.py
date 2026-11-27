@@ -216,6 +216,26 @@ class DriverInvitationIdentityTests(DriverInvitationFixture, TestCase):
                 self.assertTrue(detail["accepted_by_me"])
                 type(target).objects.filter(pk=target.pk).update(**{field: previous})
 
+    def test_only_owner_can_revoke_and_neither_old_share_link_restores_access(self):
+        self.assertEqual(self.accept().status_code, 201)
+        pending = self.share()
+        url = f"/pldp/api/lifecycle/customer/vehicles/{self.vehicle.pk}/drivers/{self.viewer.pk}/revoke/"
+        self.assertEqual(self.client.post(url, **self.auth(self.viewer)).status_code, 403)
+        _, other_owner, _ = self.other_customer()
+        self.assertEqual(self.client.post(url, **self.auth(other_owner)).status_code, 409)
+
+        response = self.client.post(url, **self.auth(self.owner))
+        self.assertEqual(response.status_code, 200, response.json())
+        self.assertTrue(response.json()["data"]["changed"])
+        self.assertFalse(DriverVehicleBinding.objects.get(driver=self.viewer, vehicle=self.vehicle).is_active)
+        self.assertNotEqual(self.accept().status_code, 201)
+        self.assertNotEqual(self.accept(invitation=pending).status_code, 201)
+
+        new = self.share()
+        repeat = self.client.post(url, **self.auth(self.owner))
+        self.assertFalse(repeat.json()["data"]["changed"])
+        self.assertEqual(self.accept(invitation=new).status_code, 201)
+
     def test_new_explicit_share_can_regrant_binding_but_never_inactive_identity(self):
         self.assertEqual(self.accept().status_code, 201)
         binding = DriverVehicleBinding.objects.get(driver=self.viewer)

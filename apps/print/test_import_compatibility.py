@@ -23,11 +23,9 @@ class PrintImportCompatibilityTests(SimpleTestCase):
         self.assertEqual(canonical.PrintLoginChallenge.__module__, 'print.models')
 
     @override_settings(ROOT_URLCONF=__name__)
-    def test_production_nested_url_tree_resolves_and_renders_login(self):
+    def test_production_nested_url_tree_resolves_and_redirects_to_portal(self):
         url = reverse('pldp:web:print:center')
         self.assertEqual(url, '/pldp/web/print/')
         self.assertIs(resolve(url).func, import_module('print.views').print_center)
         response = self.client.get(url)
-        self.assertEqual(response.status_code, 200)
-        self.assertContains(response, '扫一扫')
-        self.assertIn('no-store', response.headers['Cache-Control'])
+        self.assertRedirects(response, '/?login=1', fetch_redirect_response=False)

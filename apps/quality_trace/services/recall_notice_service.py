@@ -1,6 +1,7 @@
 """Policy notices; never rebuild launch snapshots or move physical devices."""
 from django.db import transaction
 from account.models import UserOrganization
+from account.services.retired_roles import RETIRED_ROLE_CODES
 from workflow.models import UserTask, WorkItem
 from workflow.services.workflow_service import publish_workitem
 from .recall_access_service import (
@@ -44,7 +45,11 @@ def _notice(campaign, *, key, title, summary, recipients, payload, actor=None, k
 @transaction.atomic
 def sync_recall_policy_notices(*, campaign, actor=None):
     campaign = recall_campaign_queryset().get(pk=campaign.pk)
-    observers = [identity.user.wx_openid for identity in _identities(campaign, FACTORY_RECALL_OBSERVER_ROLES)]
+    observer_identities = _identities(campaign, FACTORY_RECALL_OBSERVER_ROLES)
+    observers = list(observer_identities.values_list("user__wx_openid", flat=True))
+    current_observers = list(observer_identities.exclude(
+        role__code__in=RETIRED_ROLE_CODES,
+    ).values_list("user__wx_openid", flat=True))
     # An old shared work item may also contain a chief's executable task. Only
     # remove the observer's action requirement, never finish the shared work item.
     corrected = UserTask.objects.filter(
@@ -55,7 +60,7 @@ def sync_recall_policy_notices(*, campaign, actor=None):
         campaign, key=f"quality-recall:{campaign.pk}:factory-observers",
         title=f"召回知晓：{campaign.recall_no}",
         summary="请知晓本厂家已发布召回事项。本岗位无需办理召回操作。",
-        recipients=observers, payload={"recall_campaign_id": campaign.pk, "observer_only": True}, actor=actor,
+        recipients=current_observers, payload={"recall_campaign_id": campaign.pk, "observer_only": True}, actor=actor,
     )
     for identity in _identities(campaign, {"factory_sales"}):
         viewer = RecallViewer(identity.user)

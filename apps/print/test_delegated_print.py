@@ -47,10 +47,9 @@ class DelegatedPrintCenterTests(TestCase):
         task = WorkItem.objects.get(uniq_key=_shipment_task_key(plan.pk, shipment.pk, "qrcode-print"))
         return plan, shipment, task
 
-    def test_staffed_delegation_only_exposes_the_managers_open_print_task(self):
-        other_plan, other_shipment, _ = self._shipment("print-no-manager-task")
+    def test_staffed_delegation_includes_open_tasks_from_before_allocation(self):
+        prior_plan, _, prior_task = self._shipment("print-before-manager-allocation")
         manager, _ = self._manager()
-        UserOrganization.objects.filter(user=self.factory_stock).update(inviter=manager)
         plan, shipment, task = self._shipment("print-manager-task")
         self.assertTrue(task.user_tasks.filter(to_openid=manager.wx_openid, need_action=True).exists())
 
@@ -58,10 +57,8 @@ class DelegatedPrintCenterTests(TestCase):
         self.assertEqual(principal_for(manager)["modules"], ["print"])
         page = self.client.get(self.url("center"))
         self.assertContains(page, plan.plan_code)
-        self.assertNotContains(page, other_plan.plan_code)
-        forbidden = self.print_post(self.client, "prepare", {"shipment_id": other_shipment.pk})
-        self.assertEqual(forbidden.status_code, 403, forbidden.content)
-        self.assertFalse(OrderPlanShipmentDevice.objects.filter(shipment=other_shipment).exists())
+        self.assertContains(page, prior_plan.plan_code)
+        self.assertTrue(prior_task.user_tasks.filter(to_openid=manager.wx_openid, need_action=True).exists())
 
         payload = {"shipment_id": shipment.pk}
         self.assertEqual(self.print_post(self.client, "confirm", payload).status_code, 400)

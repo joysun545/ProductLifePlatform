@@ -18,10 +18,13 @@ from account.models import (
     SeniorManagerProfile,
     UserOrganization,
 )
+from account.services.retired_roles import RETIRED_ROLE_CODES
 from account.services.auth_service import build_user_payload, get_active_identity
 from account.services.role_delegation_service import (
     SENIOR_MANAGER_ROLE_CODES,
+    ManagedRoleConflict,
     available_managed_role_options,
+    check_managed_role_conflicts,
     delegated_role_codes,
     manager_may_invite_role,
 )
@@ -66,6 +69,8 @@ def _get_inviter_identity(user):
     identity = get_active_identity(user)
     if not identity:
         raise InvitationError("游客没有组织邀请资格")
+    if identity.role.code in RETIRED_ROLE_CODES:
+        raise InvitationError("该岗位已退出新增邀请")
     return identity
 
 
@@ -138,6 +143,7 @@ def get_available_invitation_roles(user):
             target_role__is_active=True,
             target_role__organization_type__is_active=True,
         )
+        .exclude(target_role__code__in=RETIRED_ROLE_CODES)
         .order_by("scope", "target_role__name", "id")
     )
 
@@ -198,6 +204,7 @@ def create_staff_invitation(
             target_role__is_active=True,
             target_role__organization_type__is_active=True,
         )
+        .exclude(target_role__code__in=RETIRED_ROLE_CODES)
         .first()
     )
     if not rule:
@@ -237,6 +244,13 @@ def create_staff_invitation(
             raise InvitationError("请至少选择一个高级经理分管的系统岗位")
         if set(normalized_manager_role_codes) - allowed_codes:
             raise InvitationError("分管岗位必须来自本组织负责人可邀请的系统岗位")
+        try:
+            check_managed_role_conflicts(identity.organization_id, OrganizationRole.objects.filter(
+                organization_type_id=identity.role.organization_type_id,
+                code__in=normalized_manager_role_codes,
+            ))
+        except ManagedRoleConflict as exc:
+            raise InvitationError(str(exc)) from exc
     elif manager_job_title or normalized_manager_role_codes:
         raise InvitationError("只有邀请高级经理时才能填写分管信息")
 
@@ -564,6 +578,8 @@ def _generate_organization_code(organization_type_code):
 
 
 def _validate_invitation_still_authorized(invitation):
+    if invitation.target_role.code in RETIRED_ROLE_CODES or invitation.inviter_role.code in RETIRED_ROLE_CODES:
+        raise InvitationError("该岗位已退出新增邀请")
     if not invitation.inviter.is_active:
         raise InvitationError("邀请人的账号已经停用")
     if not invitation.target_role.is_active or not invitation.target_role.organization_type.is_active:
@@ -602,7 +618,7 @@ def _validate_invitation_still_authorized(invitation):
                 is_active=True,
                 is_owner_role=False,
             )
-            .exclude(code__in=SENIOR_MANAGER_ROLE_CODES)
+            .exclude(code__in=SENIOR_MANAGER_ROLE_CODES | RETIRED_ROLE_CODES)
             .values_list("code", flat=True)
         )
         if not selected_codes or valid_codes != selected_codes:
@@ -721,14 +737,17 @@ def accept_staff_invitation(
             identity=identity,
             job_title=invitation.senior_manager_job_title or "",
         )
-        manager_profile.managed_roles.set(
-            OrganizationRole.objects.filter(
-                organization_type_id=target_role.organization_type_id,
-                code__in=invitation.senior_manager_managed_role_codes or [],
-                is_active=True,
-                is_owner_role=False,
-            ).exclude(code__in=SENIOR_MANAGER_ROLE_CODES)
-        )
+        try:
+            manager_profile.managed_roles.set(
+                OrganizationRole.objects.filter(
+                    organization_type_id=target_role.organization_type_id,
+                    code__in=invitation.senior_manager_managed_role_codes or [],
+                    is_active=True,
+                    is_owner_role=False,
+                ).exclude(code__in=SENIOR_MANAGER_ROLE_CODES)
+            )
+        except ManagedRoleConflict as exc:
+            raise InvitationError(str(exc)) from exc
 
     invitation.target_organization = organization
     invitation.invitee = invitee

@@ -43,7 +43,6 @@ class RootTrialEndToEndTests(RootTrialApiFixture, TestCase):
         self.assertEqual(evidence.status_code, 200)
         self.assertEqual(evidence["Content-Type"], "image/png")
         self.assertTrue(b"".join(evidence.streaming_content).startswith(b"\x89PNG\r\n\x1a\n"))
-        evidence.close()
 
         approved = admin_browser.post(review_url, {"decision": "APPROVE", "reason": "组织名称与营业执照已核验"},
                                       HTTP_X_CSRFTOKEN=admin_browser.cookies["csrftoken"].value)

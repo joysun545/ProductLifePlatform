@@ -189,6 +189,10 @@ def open_task(openid, usertask_id):
         raise TaskActionError("任务不存在或无权操作") from exc
 
 
+    from lifecycle.services.customer_task_scope import filter_aftersales_customer_tasks
+    if not filter_aftersales_customer_tasks([task], openid):
+        raise TaskActionError("任务不存在或无权操作")
+
     now = timezone.now()
     goods_result = _open_goods_transfer_group(task, now)
     if goods_result is not None:
