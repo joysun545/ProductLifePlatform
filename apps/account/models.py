@@ -25,11 +25,16 @@ class OrganizationRelationType(models.TextChoices):
 
 
 class UIColorScheme(models.TextChoices):
-    """The three operator-selectable brand colour systems."""
+    """Operator-selectable mini-program palettes."""
 
-    JADE = "jade", "翡翠绿"
-    OCEAN = "ocean", "深海蓝"
-    AMBER = "amber", "琥珀金"
+    AMETHYST = "amethyst", "晶石紫＋米白"
+    MARS = "mars", "火星橙＋米白"
+    ASH = "ash", "星灰绿＋米白"
+    SPLASHED = "splashed", "洒蓝＋米白"
+    NAVY_ORANGE = "navy_orange", "深蓝＋爱马仕橙"
+    TEAL_ROSE = "teal_rose", "马尔斯绿＋玫瑰粉"
+    PRUSSIAN_MIST = "prussian_mist", "普鲁士蓝＋雾灰"
+    KLEIN_YELLOW = "klein_yellow", "克莱因蓝＋松花黄"
 
 
 class UIStyleScheme(models.TextChoices):
@@ -181,7 +186,7 @@ class Organization(models.Model):
         blank=True,
         default="",
         verbose_name="小程序全局色系",
-        help_text="仅系统运营业主设置；留空时使用翡翠绿。",
+        help_text="仅系统运营业主设置；留空时使用星灰绿＋米白。",
     )
     ui_style_scheme = models.CharField(
         max_length=16,

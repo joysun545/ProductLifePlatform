@@ -5,13 +5,18 @@ from account.models import (
 )
 
 
-DEFAULT_COLOR_SCHEME = UIColorScheme.JADE
+DEFAULT_COLOR_SCHEME = UIColorScheme.ASH
 DEFAULT_STYLE_SCHEME = UIStyleScheme.FLOW
 MAX_UPSTREAM_DEPTH = 32
 COLOR_DESCRIPTIONS = {
-    UIColorScheme.JADE: "稳健、生命力、适合制造与全生命周期管理",
-    UIColorScheme.OCEAN: "理性、精密、适合工业与技术型品牌",
-    UIColorScheme.AMBER: "温暖、品质感、适合强调服务与品牌价值",
+    UIColorScheme.AMETHYST: "紫色强调与暖米白底",
+    UIColorScheme.MARS: "暖橙强调与暖米白底",
+    UIColorScheme.ASH: "深绿强调与暖米白底",
+    UIColorScheme.SPLASHED: "洒蓝强调与暖米白底",
+    UIColorScheme.NAVY_ORANGE: "深蓝前景与亮橙底",
+    UIColorScheme.TEAL_ROSE: "深青绿前景与玫瑰粉底",
+    UIColorScheme.PRUSSIAN_MIST: "普鲁士蓝前景与雾灰底",
+    UIColorScheme.KLEIN_YELLOW: "克莱因蓝前景与松花黄底",
 }
 STYLE_DESCRIPTIONS = {
     UIStyleScheme.FLOW: "大圆角、柔和渐变和轻盈卡片",

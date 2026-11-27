@@ -22,7 +22,7 @@ class UIAppearanceTests(TestCase):
             name="主题厂家",
             code="THEME-FACTORY",
             organization_type=self.owner_type,
-            ui_color_scheme="ocean",
+            ui_color_scheme="splashed",
             ui_style_scheme="order",
         )
         self.merchant = Organization.objects.create(
@@ -64,14 +64,14 @@ class UIAppearanceTests(TestCase):
 
     def test_downstream_login_payload_inherits_operator_appearance(self):
         appearance = build_user_payload(self.merchant_user)["appearance"]
-        self.assertEqual(appearance["option_code"], "ocean-order")
+        self.assertEqual(appearance["option_code"], "splashed-order")
         self.assertEqual(appearance["owner_organization_id"], self.factory.pk)
 
     def test_owner_can_update_one_global_selection(self):
         response = Client().post(
             "/pldp/api/account/appearance/",
             data=json.dumps(
-                {"color_scheme": "amber", "style_scheme": "layer"}
+                {"color_scheme": "mars", "style_scheme": "layer"}
             ),
             content_type="application/json",
             **self._headers(self.owner_user),
@@ -79,11 +79,11 @@ class UIAppearanceTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["code"], 0)
         self.factory.refresh_from_db()
-        self.assertEqual(self.factory.ui_color_scheme, "amber")
+        self.assertEqual(self.factory.ui_color_scheme, "mars")
         self.assertEqual(self.factory.ui_style_scheme, "layer")
         self.assertEqual(
             build_user_payload(self.merchant_user)["appearance"]["option_code"],
-            "amber-layer",
+            "mars-layer",
         )
 
     def test_options_expose_all_nine_named_combinations(self):
@@ -91,7 +91,7 @@ class UIAppearanceTests(TestCase):
             "/pldp/api/account/appearance/", **self._headers(self.owner_user)
         )
         data = response.json()["data"]
-        self.assertEqual(len(data["options"]["colors"]), 3)
+        self.assertEqual(len(data["options"]["colors"]), 8)
         self.assertEqual(len(data["options"]["styles"]), 3)
         self.assertTrue(
             all(item["description"] for item in data["options"]["colors"])
@@ -103,16 +103,16 @@ class UIAppearanceTests(TestCase):
     def test_non_owner_role_cannot_change_global_selection(self):
         response = Client().post(
             "/pldp/api/account/appearance/",
-            {"color_scheme": "jade", "style_scheme": "flow"},
+            {"color_scheme": "ash", "style_scheme": "flow"},
             **self._headers(self.sales_user),
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["code"], 1)
         self.factory.refresh_from_db()
-        self.assertEqual(self.factory.ui_color_scheme, "ocean")
+        self.assertEqual(self.factory.ui_color_scheme, "splashed")
 
     @patch("apps.account.api.views._wx_code_to_openid", return_value="openid-theme-owner")
     def test_login_response_contains_resolved_appearance(self, _mock_openid):
         response = Client().post("/pldp/api/account/login/", {"code": "wx-code"})
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["appearance"]["option_code"], "ocean-order")
+        self.assertEqual(response.json()["appearance"]["option_code"], "splashed-order")
